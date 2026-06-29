@@ -47,6 +47,7 @@
 #include <memory>
 #include <vector>
 #include <string>
+#include <functional>
 #include <unordered_map>
 #include <utility>
 #include <cmath>
@@ -123,7 +124,12 @@ struct LoadedModel {
   ModelDesc modelDesc;
   LoadedModel(const string& fileName, const string& expectedSha256) {
     ModelDesc::loadFromFileMaybeGZipped(fileName, modelDesc, expectedSha256);
-    modelDesc.applyScale8ToReduceActivations();
+    // NB: do NOT applyScale8ToReduceActivations() here. That rescale only matters
+    // for fp16 numerical range; we compute in fp32, and our WGSL activate() handles
+    // plain mish/silu directly. Crucially, this LoadedModel/ModelDesc is SHARED with
+    // the Eigen CPU fallback in the single dual-backend binary, and Eigen asserts on
+    // scaled activations (eigenbackend.cpp: "Eigen does not use scaled mish"). When
+    // the fp16 GPU path is properly validated, apply the rescale to a per-handle copy.
   }
   LoadedModel() = delete;
   LoadedModel(const LoadedModel&) = delete;
@@ -564,25 +570,27 @@ static void assertSupportedArchitectureOrThrow(const ModelDesc& desc) {
     throw StringError(
       "WebGPU backend (scaffold): this net uses transformer blocks, which are not "
       "ported yet. Use the OpenCL/CUDA/Eigen backend for now. See WEBGPU_STATUS.md.");
+  // Ordinary / global-pooling / nested-bottleneck are supported. Transformer
+  // blocks (incl. ones nested inside nbt) are rejected by hasAnyTransformerBlocks
+  // above, so any remaining block kind here is one of the three we handle.
   for(const auto& kindAndBlock : desc.trunk.blocks) {
     int kind = kindAndBlock.first;
-    if(kind == NESTED_BOTTLENECK_BLOCK_KIND)
+    if(kind != ORDINARY_BLOCK_KIND && kind != GLOBAL_POOLING_BLOCK_KIND &&
+       kind != NESTED_BOTTLENECK_BLOCK_KIND)
       throw StringError(
-        "WebGPU backend (scaffold): nested-bottleneck blocks are not ported yet. "
-        "See WEBGPU_STATUS.md.");
-    if(kind != ORDINARY_BLOCK_KIND && kind != GLOBAL_POOLING_BLOCK_KIND)
-      throw StringError(
-        "WebGPU backend (scaffold): unsupported trunk block kind " +
+        "WebGPU backend: unsupported trunk block kind " +
         Global::intToString(kind) + ". See WEBGPU_STATUS.md.");
   }
   if(desc.trunk.trunkNormKind != TRUNK_NORM_KIND_STANDARD)
     throw StringError(
       "WebGPU backend (scaffold): RMSNorm trunk not ported yet (only standard BN). "
       "See WEBGPU_STATUS.md.");
-  if(desc.numPolicyChannels != 1)
+  // numPolicyChannels: 1 (pre-v12) or 2 (optimism policy, modelVersion >= 12).
+  // For optimism nets we evaluate the standard policy (channel 0, policyOptimism=0).
+  if(desc.numPolicyChannels != 1 && desc.numPolicyChannels != 2)
     throw StringError(
-      "WebGPU backend (scaffold): policy optimism (numPolicyChannels != 1, i.e. "
-      "modelVersion >= 12) not ported yet. See WEBGPU_STATUS.md.");
+      "WebGPU backend: numPolicyChannels=" + Global::intToString(desc.numPolicyChannels) +
+      " not supported (only 1, or 2 with optimism). See WEBGPU_STATUS.md.");
 }
 
 struct ComputeHandle {
@@ -847,37 +855,57 @@ void NeuralNet::getOutput(
                               trunk.initialMatMul.weights, nullptr, ACTIVATION_IDENTITY);
   addChanBias(x, gbias, trunkC);
 
-  for(const auto& kindAndBlock : trunk.blocks) {
-    if(kindAndBlock.first == ORDINARY_BLOCK_KIND) {
-      const ResidualBlockDesc* b = (const ResidualBlockDesc*)kindAndBlock.second.get();
-      int midC = b->regularConv.outChannels;
-      wgpu::Buffer s1 = bnAct(x, trunkC, b->preBN, b->preActivation.activation);
-      wgpu::Buffer mid = conv(s1, trunkC, midC, b->regularConv);
-      wgpu::Buffer s2 = bnAct(mid, midC, b->midBN, b->midActivation.activation);
-      wgpu::Buffer fin = conv(s2, midC, trunkC, b->finalConv);
-      addInPlace(x, fin, (size_t)batchSize*trunkC*hw);
+  // Process a block list operating at channel width C, mutating buffer `bx` in
+  // place. Recursive so nested-bottleneck sub-blocks reuse the same code at the
+  // bottleneck width. (Transformer blocks are rejected at load.)
+  std::function<void(const std::vector<std::pair<int,unique_ptr_void>>&, wgpu::Buffer, int)> applyBlocks =
+    [&](const std::vector<std::pair<int,unique_ptr_void>>& blocks, wgpu::Buffer bx, int C) {
+    for(const auto& kindAndBlock : blocks) {
+      if(kindAndBlock.first == ORDINARY_BLOCK_KIND) {
+        const ResidualBlockDesc* b = (const ResidualBlockDesc*)kindAndBlock.second.get();
+        int midC = b->regularConv.outChannels;
+        wgpu::Buffer s1 = bnAct(bx, C, b->preBN, b->preActivation.activation);
+        wgpu::Buffer mid = conv(s1, C, midC, b->regularConv);
+        wgpu::Buffer s2 = bnAct(mid, midC, b->midBN, b->midActivation.activation);
+        wgpu::Buffer fin = conv(s2, midC, C, b->finalConv);
+        addInPlace(bx, fin, (size_t)batchSize*C*hw);
+      }
+      else if(kindAndBlock.first == GLOBAL_POOLING_BLOCK_KIND) {
+        const GlobalPoolingResidualBlockDesc* b = (const GlobalPoolingResidualBlockDesc*)kindAndBlock.second.get();
+        int regularC = b->regularConv.outChannels, gpoolC = b->gpoolConv.outChannels;
+        wgpu::Buffer ts = bnAct(bx, C, b->preBN, b->preActivation.activation);
+        wgpu::Buffer reg = conv(ts, C, regularC, b->regularConv);
+        wgpu::Buffer gp = conv(ts, C, gpoolC, b->gpoolConv);
+        wgpu::Buffer gp2 = bnAct(gp, gpoolC, b->gpoolBN, b->gpoolActivation.activation);
+        wgpu::Buffer cat = gpool("globalPoolMeanMax", gp2, gpoolC);
+        wgpu::Buffer bias = matmul(cat, batchSize, 3*gpoolC, regularC, b->gpoolToBiasMul.weights, nullptr, ACTIVATION_IDENTITY);
+        addChanBias(reg, bias, regularC);
+        wgpu::Buffer s2 = bnAct(reg, regularC, b->midBN, b->midActivation.activation);
+        wgpu::Buffer fin = conv(s2, regularC, C, b->finalConv);
+        addInPlace(bx, fin, (size_t)batchSize*C*hw);
+      }
+      else {  // NESTED_BOTTLENECK_BLOCK_KIND
+        const NestedBottleneckResidualBlockDesc* b = (const NestedBottleneckResidualBlockDesc*)kindAndBlock.second.get();
+        int bottleC = b->preConv.outChannels;
+        // m = preConv(preAct(preBN(x)))      -- project down to bottleneck width
+        wgpu::Buffer pre = bnAct(bx, C, b->preBN, b->preActivation.activation);
+        wgpu::Buffer mid = conv(pre, C, bottleC, b->preConv);
+        // sub-blocks at bottleneck width, in place on mid
+        applyBlocks(b->blocks, mid, bottleC);
+        // x += postConv(postAct(postBN(m)))  -- project up, residual to x
+        wgpu::Buffer post = bnAct(mid, bottleC, b->postBN, b->postActivation.activation);
+        wgpu::Buffer fin = conv(post, bottleC, C, b->postConv);
+        addInPlace(bx, fin, (size_t)batchSize*C*hw);
+      }
     }
-    else {  // GLOBAL_POOLING_BLOCK_KIND
-      const GlobalPoolingResidualBlockDesc* b = (const GlobalPoolingResidualBlockDesc*)kindAndBlock.second.get();
-      int regularC = b->regularConv.outChannels, gpoolC = b->gpoolConv.outChannels;
-      wgpu::Buffer ts = bnAct(x, trunkC, b->preBN, b->preActivation.activation);
-      wgpu::Buffer reg = conv(ts, trunkC, regularC, b->regularConv);
-      wgpu::Buffer gp = conv(ts, trunkC, gpoolC, b->gpoolConv);
-      wgpu::Buffer gp2 = bnAct(gp, gpoolC, b->gpoolBN, b->gpoolActivation.activation);
-      wgpu::Buffer cat = gpool("globalPoolMeanMax", gp2, gpoolC);
-      wgpu::Buffer bias = matmul(cat, batchSize, 3*gpoolC, regularC, b->gpoolToBiasMul.weights, nullptr, ACTIVATION_IDENTITY);
-      addChanBias(reg, bias, regularC);
-      wgpu::Buffer s2 = bnAct(reg, regularC, b->midBN, b->midActivation.activation);
-      wgpu::Buffer fin = conv(s2, regularC, trunkC, b->finalConv);
-      addInPlace(x, fin, (size_t)batchSize*trunkC*hw);
-    }
-  }
+  };
+  applyBlocks(trunk.blocks, x, trunkC);
   wgpu::Buffer trunkOut = bnAct(x, trunkC, trunk.trunkTipBN, trunk.trunkTipActivation.activation);
 
   // ---- Policy head ----
   const PolicyHeadDesc& ph = md.policyHead;
   int p1C = ph.p1Conv.outChannels, g1C = ph.g1Conv.outChannels;
-  int numPolicyChannels = md.numPolicyChannels;  // == 1 (guarded above)
+  int numPolicyChannels = md.numPolicyChannels;  // 1, or 2 with optimism (use ch.0)
   wgpu::Buffer p1 = conv(trunkOut, trunkC, p1C, ph.p1Conv);
   wgpu::Buffer g1 = conv(trunkOut, trunkC, g1C, ph.g1Conv);
   wgpu::Buffer g1b = bnAct(g1, g1C, ph.g1BN, ph.g1Activation.activation);

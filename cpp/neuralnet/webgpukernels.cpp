@@ -15,7 +15,7 @@
 //   - Spatial tensors are NCHW packed as data[((n*C + c)*H + y)*W + x].
 //   - "mask" is NHW packed as mask[(n*H + y)*W + x], 1.0 on-board else 0.0.
 //   - Activation codes match ACTIVATION_* in activations.h:
-//       0 = identity, 1 = relu, 2 = mish  (others map to identity for now).
+//       0 = identity, 1 = relu, 2 = mish, 3 = silu, 12 = mish_scale8.
 
 namespace KataGoWebGPU {
 
@@ -25,12 +25,21 @@ const char* const WGSL_KERNELS = R"WGSL(
 // ===========================================================================
 
 fn activate(x: f32, kind: u32) -> f32 {
-  // 0 = identity, 1 = relu, 2 = mish
+  // ACTIVATION_*: 0=identity, 1=relu, 2=mish, 3=silu, 12=mish_scale8
   if (kind == 1u) {
     return max(x, 0.0);
   } else if (kind == 2u) {
-    // mish(x) = x * tanh(softplus(x)); use a numerically-stable softplus.
+    // mish(x) = x * tanh(softplus(x)); numerically-stable softplus.
     let sp = select(log(1.0 + exp(x)), x + log(1.0 + exp(-x)), x > 20.0);
+    return x * tanh(sp);
+  } else if (kind == 3u) {
+    // silu(x) = x * sigmoid(x); stable two-sided sigmoid (avoids exp overflow).
+    let s = select(1.0 / (1.0 + exp(-x)), exp(x) / (1.0 + exp(x)), x < 0.0);
+    return x * s;
+  } else if (kind == 12u) {
+    // mish_scale8(x) = x * tanh(softplus(8x)) = mish(8x)/8 (fp16-stability rescale).
+    let z = 8.0 * x;
+    let sp = select(log(1.0 + exp(z)), z + log(1.0 + exp(-z)), z > 20.0);
     return x * tanh(sp);
   }
   return x;

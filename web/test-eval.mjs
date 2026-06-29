@@ -28,7 +28,7 @@ if (!(await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/m.bin.gz', 19]
 
 if (M.ccall('kgeBackendIsGpu', 'number', [], [])) fail('expected CPU backend under Node');
 const ver = M.ccall('kgeModelVersion', 'number', [], []);
-if (ver !== 8) fail('unexpected modelVersion ' + ver);
+if (!(ver >= 3 && ver <= 18)) fail('implausible modelVersion ' + ver);   // v8 (g170) .. v14 (b18nbt)
 
 const HW = 361;
 const sPtr = M._malloc(HW * 4), pPtr = M._malloc((HW + 1) * 4), vPtr = M._malloc(5 * 4);

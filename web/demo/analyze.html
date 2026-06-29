@@ -81,9 +81,10 @@
 
   // --- net selection (all g170, modelVersion 8 = supported), increasing strength ---
   const NETS = {
-    'b6c96':   { file: 'model-b6c96.bin.gz',   label: 'b6c96 · fast (3.8 MB)' },
-    'b10c128': { file: 'model-b10c128.bin.gz', label: 'b10c128 · stronger (11 MB)' },
-    'b20c256': { file: 'model-b20c256.bin.gz', label: 'b20c256 · strongest (87 MB)' },
+    'b6c96':      { file: 'model-b6c96.bin.gz',      label: 'b6c96 · fast (3.8 MB)' },
+    'b10c128':    { file: 'model-b10c128.bin.gz',    label: 'b10c128 · stronger (11 MB)' },
+    'b20c256':    { file: 'model-b20c256.bin.gz',    label: 'b20c256 · strong, g170 (87 MB)' },
+    'b18c384nbt': { file: 'model-b18c384nbt.bin.gz', label: 'b18c384nbt · strongest, nested-bottleneck (94 MB)' },
   };
   const qs = new URLSearchParams(location.search);
   const netKey = NETS[qs.get('net')] ? qs.get('net') : 'b10c128';
@@ -98,7 +99,7 @@
     if (qs.has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
     $('status').textContent = 'fetching ' + netKey + ' net…';
     const resp = await fetch(NETS[netKey].file);
-    if (!resp.ok) { $('status').innerHTML = 'net <b>' + netKey + '</b> not bundled — re-run <span class="mono">build-eval.sh</span>' + (netKey === 'b20c256' ? ' with the 87 MB net available ($B20_NET)' : ''); return; }
+    if (!resp.ok) { $('status').innerHTML = 'net <b>' + netKey + '</b> not bundled — re-run <span class="mono">build-eval.sh</span>' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with the big net available ($B20_NET / $B18_NET)'); return; }
     M.FS.writeFile('/model.bin.gz', new Uint8Array(await resp.arrayBuffer()));
     $('status').textContent = 'initializing engine (WebGPU, else CPU)…';
     const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });

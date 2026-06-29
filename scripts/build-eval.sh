@@ -55,6 +55,8 @@ echo "==> built:"; ls -la "$ROOT/web/demo/kataeval.js" "$ROOT/web/demo/kataeval.
 bundle() { [ -f "$1" ] && { cp "$1" "$ROOT/web/demo/$2"; echo "==> bundled $(basename "$1") -> web/demo/$2"; }; }
 bundle "$ROOT/cpp/tests/models/g170-b6c96-s175395328-d26788732.bin.gz"     model-b6c96.bin.gz
 bundle "$ROOT/cpp/tests/models/g170e-b10c128-s1141046784-d204142634.bin.gz" model-b10c128.bin.gz
-# Stronger net, not committed (87 MB): supply via $B20_NET, else skipped — the
-# selector still offers it and shows a friendly note if it isn't bundled.
+# Stronger nets, not committed: supply via $B20_NET / $B18_NET, else skipped — the
+# selector still offers them and shows a friendly note if not bundled. b20c256 is
+# g170 (plain residual); b18c384nbt is modelVersion 14 (nested-bottleneck + mish8).
 bundle "${B20_NET:-/srv/nfs/fleet/go/models_ref/bin_gz/kata1-b20c256x2-s5303129600-d1228401921.bin.gz}" model-b20c256.bin.gz
+bundle "${B18_NET:-/srv/nfs/fleet/go/models_ref/bin_gz/kata1-b18c384nbt-s9996604416-d4316597426.bin.gz}" model-b18c384nbt.bin.gz
