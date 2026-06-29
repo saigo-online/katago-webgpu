@@ -1836,6 +1836,8 @@ base_config_of_name = {
     "b2c16": b2c16,
     "b4c32": b4c32,
     "b6c96": b6c96,          # Historic katago architecture
+    "b6c96v17": {**b6c96, "version": 17},  # saigo: g170 b6 arch, modelVersion 17 (q-values off -> 2 policy ch), for katago-web wasm
+    "b6c96v17q": {**b6c96, "version": 17, "predict_q_values": True},  # saigo: v17 with q-values on (-> 4 policy ch); needs webgpu guard relaxed
 
     # Tiny convnets
     "b10c128": b10c128,      # Historic katago architecture

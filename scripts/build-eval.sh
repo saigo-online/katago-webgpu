@@ -60,3 +60,6 @@ bundle "$ROOT/cpp/tests/models/g170e-b10c128-s1141046784-d204142634.bin.gz" mode
 # g170 (plain residual); b18c384nbt is modelVersion 14 (nested-bottleneck + mish8).
 bundle "${B20_NET:-/srv/nfs/fleet/go/models_ref/bin_gz/kata1-b20c256x2-s5303129600-d1228401921.bin.gz}" model-b20c256.bin.gz
 bundle "${B18_NET:-/srv/nfs/fleet/go/models_ref/bin_gz/kata1-b18c384nbt-s9996604416-d4316597426.bin.gz}" model-b18c384nbt.bin.gz
+# modelVersion 17 transformer (RMSNorm + attention + SwiGLU) — a small TEST net
+# (random-ish weights, weak play) bundled to prove the browser runs the v17 stack.
+bundle "$ROOT/cpp/tests/models/b4c256h4nbttflrs-fson-silu-rsnh.bin.gz" model-b4c256nbttf.bin.gz

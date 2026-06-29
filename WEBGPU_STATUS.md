@@ -25,12 +25,13 @@ This file is the honest engineering status. The polished overview is in
 - Published as a fork: **`saigo-online/katago-webgpu`** (branched from
   `lightvector/KataGo`), referenced by saigo.online as a submodule.
 
-Supported nets: convolutional trunks through **modelVersion 14** — ordinary,
-global-pooling **and nested-bottleneck** blocks; relu / mish / silu / scaled-mish
-activations; optimism policy (modelVersion ≥ 12). That spans the g170 b6–b40
-family and kata1 **b18c384nbt**. Architectures not yet ported (transformer /
-RMSNorm) are **rejected with a clear error**, never silently mis-evaluated — see
-*Limits* below.
+Supported nets: the **full KataGo architecture through modelVersion 17** —
+ordinary / global-pooling / nested-bottleneck / **transformer** blocks; BatchNorm
+and RMSNorm (per-position + spatial); attention with learnable/fixed RoPE,
+grouped-query attention, SwiGLU FFN; relu / mish / silu / scaled-mish; optimism +
+q-value policy. That spans g170 b6–b40, kata1 **b18c384nbt**, and v17 transformer
+nets. The only pieces still **rejected with a clear error** are the SGF-metadata
+encoder and grouped RMSNorm — see *Limits*.
 
 ## Validation
 
@@ -45,6 +46,8 @@ Done                             # no mismatches
 #   b10c128    : matches within float rounding (Win 73.51c vs 73.52c — CPU↔GPU accumulation)
 #   b20c256x2  : agree exactly (Win 99.93c / Lead 7.86; 23.5M params)
 #   b18c384nbt : agree exactly (Win 96.04c / Lead 15.02; modelVersion 14, nbt + optimism + mish8)
+#   b4c256nbttf: agree exactly (Win 88.80c / Lead -2.40; modelVersion 17, transformer + RMSNorm + SwiGLU)
+#   b7c96 GQA  : agree exactly (modelVersion 17, grouped-query attention + BN + transformer)
 ```
 
 The dual-backend WASM is also cross-checked: the **WebGPU and Eigen-CPU paths
@@ -147,29 +150,28 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
 
 ## Limits
 
-- **Nets**: convolutional trunks through modelVersion 14 (ordinary / global-pooling
-  / nested-bottleneck; optimism policy = channel 0). **Transformer** blocks
-  (attention/FFN, b28-style) and **RMSNorm** trunks are rejected with a clear error.
+- **Nets**: the full architecture through modelVersion 17 is supported. Still
+  rejected with a clear error: the **SGF-metadata encoder** (`metaEncoderVersion ≠ 0`
+  — train without it) and **grouped** RMSNorm (`cgroupSize ≠ 0`).
 - **fp16**: the WebGPU load no longer applies the scale8 mish rescale — it's an
   fp16-only trick and the desc is shared with the Eigen CPU fallback (which asserts
   on scaled mish). When the fp16 GPU path is validated, apply scale8 to a per-handle
   copy instead.
 - **Demo**: single-position analysis — no move history is fed yet, so ko/superko
   and "the actual game" aren't modeled; score is approximate; 19×19, Tromp-Taylor.
-- **Perf**: direct convs (no Winograd yet). The demo's net selector spans b6c96
-  (fast, weak) → b10c128 → b20c256 (g170) → b18c384nbt (modelVersion 14, ~94 MB,
-  strongest, but a big download and slower per eval).
+- **Perf**: direct convs (no Winograd yet); attention is the simple O(seq²) form
+  (one thread per (head, query, key)) — fine at 19×19, not yet tiled. The net
+  selector spans b6c96 → b10c128 → b20c256 → b18c384nbt → a v17 transformer test net.
 
 ## Roadmap
 
-1. **Transformer blocks** (attention + FFN, RoPE, RMSNorm) for b28-style nets —
-   the largest remaining chunk; needs a matmul/softmax/attention kernel set + RMSNorm.
-2. **Winograd 3×3** — the main remaining conv speedup.
+1. **Winograd 3×3** — the main remaining conv speedup; tiled attention for big nets.
+2. **SGF-metadata encoder** + grouped RMSNorm — the last architecture gaps.
 3. **Selective-fp32 heads** + validate the fp16 GPU path on a `shader-f16` adapter
    (then re-introduce the scale8 rescale per-handle for fp16 stability).
 4. **Demo**: feed move history (ko/superko, real games) and ownership/score polish.
-   *(Done: stronger nets b10c128 / b20c256 / b18c384nbt via the selector; nested-
-   bottleneck + optimism + scaled-mish.)*
+   *(Done: conv + nested-bottleneck + the full transformer stack through v17 —
+   RMSNorm, RoPE, grouped-query attention, SwiGLU, optimism/q-value policy.)*
 
 ## Key source references (`cpp/`)
 

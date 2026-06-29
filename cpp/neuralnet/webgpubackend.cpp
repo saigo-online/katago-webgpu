@@ -326,6 +326,17 @@ struct AddParamsHost { uint32_t total, pad0, pad1, pad2; };
 struct GPParamsHost { uint32_t n, c, hw, pad; };
 struct MMParamsHost { uint32_t m, k, o, act, hasBias, pad0, pad1, pad2; };
 struct AddBiasParamsHost { uint32_t n, c, hw, pad; };
+// Transformer / RMSNorm (modelVersion >= 15). Layouts mirror the WGSL uniform
+// structs (all 16-byte multiples).
+struct RMSParamsHost { uint32_t n, c, hw, act; float eps; uint32_t hasBeta, pad0, pad1; };
+struct ProjParamsHost { uint32_t n, inC, outC, hw; };
+struct RopeParamsHost { uint32_t n, numHeads, headDim, numPairs, hw, numKVHeads, learnable, pad0; };
+struct AttnSParamsHost { uint32_t n, numHeads, numKVHeads, headDim, hw, kvGroupSize; float scale; uint32_t pad0; };
+struct AttnSMParamsHost { uint32_t n, numHeads, hw, pad0; };
+struct AttnOParamsHost { uint32_t n, numHeads, numKVHeads, vHeadDim, hw, kvGroupSize, pad0, pad1; };
+struct SwiParamsHost { uint32_t total, pad0, pad1, pad2; };
+struct RMSRParamsHost { uint32_t n, c, hw, pad0; float eps; uint32_t pad1, pad2, pad3; };
+struct RMSAParamsHost { uint32_t n, c, hw, act, hasBeta, pad0, pad1, pad2; };
 
 // Fold batchnorm into per-channel scale/bias, mirroring
 // BatchNormLayerDesc::computeMerged() EXACTLY:
@@ -566,31 +577,40 @@ struct WgRecorder {
 // support a net we cannot evaluate. As blocks are implemented + validated they
 // move out of this list (see WEBGPU_STATUS.md milestones).
 static void assertSupportedArchitectureOrThrow(const ModelDesc& desc) {
-  if(desc.trunk.hasAnyTransformerBlocks())
-    throw StringError(
-      "WebGPU backend (scaffold): this net uses transformer blocks, which are not "
-      "ported yet. Use the OpenCL/CUDA/Eigen backend for now. See WEBGPU_STATUS.md.");
-  // Ordinary / global-pooling / nested-bottleneck are supported. Transformer
-  // blocks (incl. ones nested inside nbt) are rejected by hasAnyTransformerBlocks
-  // above, so any remaining block kind here is one of the three we handle.
-  for(const auto& kindAndBlock : desc.trunk.blocks) {
-    int kind = kindAndBlock.first;
-    if(kind != ORDINARY_BLOCK_KIND && kind != GLOBAL_POOLING_BLOCK_KIND &&
-       kind != NESTED_BOTTLENECK_BLOCK_KIND)
-      throw StringError(
-        "WebGPU backend: unsupported trunk block kind " +
-        Global::intToString(kind) + ". See WEBGPU_STATUS.md.");
-  }
-  if(desc.trunk.trunkNormKind != TRUNK_NORM_KIND_STANDARD)
-    throw StringError(
-      "WebGPU backend (scaffold): RMSNorm trunk not ported yet (only standard BN). "
+  // Supported block kinds (recursing into nested-bottleneck, where transformer
+  // blocks live): ordinary / global-pooling / nbt / transformer-attention / -ffn.
+  std::function<void(const std::vector<std::pair<int,unique_ptr_void>>&)> check =
+    [&](const std::vector<std::pair<int,unique_ptr_void>>& bs){
+    for(const auto& kb : bs) {
+      int kind = kb.first;
+      if(kind == NESTED_BOTTLENECK_BLOCK_KIND)
+        check(((const NestedBottleneckResidualBlockDesc*)kb.second.get())->blocks);
+      else if(kind != ORDINARY_BLOCK_KIND && kind != GLOBAL_POOLING_BLOCK_KIND &&
+              kind != TRANSFORMER_ATTENTION_BLOCK_KIND && kind != TRANSFORMER_FFN_BLOCK_KIND)
+        throw StringError("WebGPU backend: unsupported block kind " +
+          Global::intToString(kind) + ". See WEBGPU_STATUS.md.");
+    }
+  };
+  check(desc.trunk.blocks);
+
+  if(desc.metaEncoderVersion != 0)
+    throw StringError("WebGPU backend: SGF metadata encoder (metaEncoderVersion != 0) "
+      "not ported yet. Train without metadata, or use another backend. See WEBGPU_STATUS.md.");
+  // Trunk norm: standard BatchNorm, or RMSNorm (per-position or spatial). Grouped
+  // RMSNorm (cgroupSize != 0) isn't ported.
+  if(desc.trunk.trunkNormKind == TRUNK_NORM_KIND_RMSNORM && desc.trunk.trunkTipRMSNorm.cgroupSize != 0)
+    throw StringError("WebGPU backend: grouped trunk RMSNorm (cgroupSize != 0) not ported. "
       "See WEBGPU_STATUS.md.");
-  // numPolicyChannels: 1 (pre-v12) or 2 (optimism policy, modelVersion >= 12).
-  // For optimism nets we evaluate the standard policy (channel 0, policyOptimism=0).
-  if(desc.numPolicyChannels != 1 && desc.numPolicyChannels != 2)
-    throw StringError(
-      "WebGPU backend: numPolicyChannels=" + Global::intToString(desc.numPolicyChannels) +
-      " not supported (only 1, or 2 with optimism). See WEBGPU_STATUS.md.");
+  if(desc.trunk.trunkNormKind != TRUNK_NORM_KIND_STANDARD &&
+     desc.trunk.trunkNormKind != TRUNK_NORM_KIND_RMSNORM)
+    throw StringError("WebGPU backend: unsupported trunkNormKind " +
+      Global::intToString(desc.trunk.trunkNormKind) + ". See WEBGPU_STATUS.md.");
+  // numPolicyChannels: 1 (pre-v12), 2 (optimism, v>=12), 4 (+ q-value policy, v>=16).
+  // Readback uses channel 0 (the standard policy), so any width evaluates correctly.
+  const int npc = desc.numPolicyChannels;
+  if(!(npc == 1 || npc == 2 || (npc == 4 && desc.modelVersion >= 16)))
+    throw StringError("WebGPU backend: numPolicyChannels=" + Global::intToString(npc) +
+      " not supported (1, 2, or 4 with modelVersion>=16). See WEBGPU_STATUS.md.");
 }
 
 struct ComputeHandle {
@@ -848,6 +868,65 @@ void NeuralNet::getOutput(
     AddParamsHost p{(uint32_t)elts,0u,0u,0u};
     rec.dispatch("addInPlace", {wgMakeUniform(ctx,p), src, dst}, (uint32_t)((elts+63)/64));
   };
+  // ---- Transformer / RMSNorm primitives (modelVersion >= 15) ----
+  // RMSNorm over channels per position. beta=null -> transformer preLN (weight only).
+  auto rmsNorm = [&](wgpu::Buffer in, int Ch, const std::vector<float>& gamma, const std::vector<float>* beta, int actCode, float eps) {
+    RMSParamsHost p{(uint32_t)batchSize,(uint32_t)Ch,(uint32_t)hw,(uint32_t)actCode, eps, beta?1u:0u, 0u,0u};
+    wgpu::Buffer betaB = beta ? wbuf(*beta) : wgMakeStorage(ctx,nullptr,1,false);
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, (size_t)batchSize*Ch*hw, true);
+    rec.dispatch("rmsNorm", {wgMakeUniform(ctx,p), in, wbuf(gamma), betaB, maskBuf, out},
+                 (uint32_t)(((size_t)batchSize*hw+63)/64));
+    return out;
+  };
+  // Per-position projection with MatMulLayerDesc [inC][outC] weights (bias-free).
+  auto proj = [&](wgpu::Buffer in, int inC, int outC, const std::vector<float>& W) {
+    ProjParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw};
+    size_t outElts = (size_t)batchSize*outC*hw;
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, outElts, true);
+    rec.dispatch("proj1x1", {wgMakeUniform(ctx,p), in, wbuf(W), out}, (uint32_t)((outElts+63)/64));
+    return out;
+  };
+  auto rope = [&](wgpu::Buffer data, int numHeads, int headDim, int numPairs, int numKVHeads, bool learnable, wgpu::Buffer cosB, wgpu::Buffer sinB) {
+    RopeParamsHost p{(uint32_t)batchSize,(uint32_t)numHeads,(uint32_t)headDim,(uint32_t)numPairs,(uint32_t)hw,(uint32_t)numKVHeads,learnable?1u:0u,0u};
+    size_t total = (size_t)batchSize*numHeads*numPairs*hw;
+    rec.dispatch("ropeApply", {wgMakeUniform(ctx,p), data, cosB, sinB}, (uint32_t)((total+63)/64));
+  };
+  auto attnScores = [&](wgpu::Buffer q, wgpu::Buffer k, int nH, int nKV, int headDim, int kvGroup, float scale) {
+    AttnSParamsHost p{(uint32_t)batchSize,(uint32_t)nH,(uint32_t)nKV,(uint32_t)headDim,(uint32_t)hw,(uint32_t)kvGroup, scale, 0u};
+    size_t total = (size_t)batchSize*nH*hw*hw;
+    wgpu::Buffer scores = wgMakeStorage(ctx, nullptr, total, true);
+    rec.dispatch("attnScores", {wgMakeUniform(ctx,p), q, k, scores}, (uint32_t)((total+63)/64));
+    return scores;
+  };
+  auto attnSoftmax = [&](wgpu::Buffer scores, int nH) {
+    AttnSMParamsHost p{(uint32_t)batchSize,(uint32_t)nH,(uint32_t)hw,0u};
+    size_t total = (size_t)batchSize*nH*hw;
+    rec.dispatch("attnSoftmax", {wgMakeUniform(ctx,p), scores, maskBuf}, (uint32_t)((total+63)/64));
+  };
+  auto attnOutput = [&](wgpu::Buffer scores, wgpu::Buffer v, int nH, int nKV, int vHeadDim, int kvGroup) {
+    AttnOParamsHost p{(uint32_t)batchSize,(uint32_t)nH,(uint32_t)nKV,(uint32_t)vHeadDim,(uint32_t)hw,(uint32_t)kvGroup,0u,0u};
+    size_t total = (size_t)batchSize*nH*vHeadDim*hw;
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, total, true);
+    rec.dispatch("attnOutput", {wgMakeUniform(ctx,p), scores, v, out}, (uint32_t)((total+63)/64));
+    return out;
+  };
+  auto swiglu = [&](wgpu::Buffer a, wgpu::Buffer gate, size_t total) {
+    SwiParamsHost p{(uint32_t)total,0u,0u,0u};
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, total, true);
+    rec.dispatch("swigluGate", {wgMakeUniform(ctx,p), a, gate, out}, (uint32_t)((total+63)/64));
+    return out;
+  };
+  // Spatial RMSNorm (trunk tip): reduce one rms per batch element, then apply.
+  auto rmsNormSpatial = [&](wgpu::Buffer in, int Ch, const std::vector<float>& gamma, const std::vector<float>& beta, int actCode, float eps) {
+    RMSRParamsHost pr{(uint32_t)batchSize,(uint32_t)Ch,(uint32_t)hw,0u, eps, 0u,0u,0u};
+    wgpu::Buffer rmsv = wgMakeStorage(ctx, nullptr, batchSize, false);  // f32 [n]
+    rec.dispatch("rmsReduceSpatial", {wgMakeUniform(ctx,pr), in, maskBuf, rmsv}, (uint32_t)((batchSize+63)/64));
+    RMSAParamsHost pa{(uint32_t)batchSize,(uint32_t)Ch,(uint32_t)hw,(uint32_t)actCode, 1u,0u,0u,0u};
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, (size_t)batchSize*Ch*hw, true);
+    rec.dispatch("rmsApplySpatial", {wgMakeUniform(ctx,pa), in, wbuf(gamma), wbuf(beta), maskBuf, rmsv, out},
+                 (uint32_t)(((size_t)batchSize*Ch*hw+63)/64));
+    return out;
+  };
 
   // ---- Trunk ----
   wgpu::Buffer x = conv(inBuf, numSpatialFeatures, trunkC, trunk.initialConv);
@@ -884,7 +963,7 @@ void NeuralNet::getOutput(
         wgpu::Buffer fin = conv(s2, regularC, C, b->finalConv);
         addInPlace(bx, fin, (size_t)batchSize*C*hw);
       }
-      else {  // NESTED_BOTTLENECK_BLOCK_KIND
+      else if(kindAndBlock.first == NESTED_BOTTLENECK_BLOCK_KIND) {
         const NestedBottleneckResidualBlockDesc* b = (const NestedBottleneckResidualBlockDesc*)kindAndBlock.second.get();
         int bottleC = b->preConv.outChannels;
         // m = preConv(preAct(preBN(x)))      -- project down to bottleneck width
@@ -897,10 +976,56 @@ void NeuralNet::getOutput(
         wgpu::Buffer fin = conv(post, bottleC, C, b->postConv);
         addInPlace(bx, fin, (size_t)batchSize*C*hw);
       }
+      else if(kindAndBlock.first == TRANSFORMER_ATTENTION_BLOCK_KIND) {
+        const TransformerAttentionDesc* a = (const TransformerAttentionDesc*)kindAndBlock.second.get();
+        int nH = a->numHeads, nKV = a->numKVHeads, qHD = a->qHeadDim, vHD = a->vHeadDim;
+        int qTot = nH*qHD, kTot = nKV*qHD, vTot = nKV*vHD;
+        // preLN (transformer RMSNorm: weight only, no beta/act), then q/k/v projections.
+        wgpu::Buffer normed = rmsNorm(bx, C, a->preLN.weight, nullptr, ACTIVATION_IDENTITY, a->preLN.epsilon);
+        wgpu::Buffer q = proj(normed, C, qTot, a->qProj.weights);
+        wgpu::Buffer k = proj(normed, C, kTot, a->kProj.weights);
+        wgpu::Buffer v = proj(normed, C, vTot, a->vProj.weights);
+        if(a->useRope) {
+          std::vector<float> cosT, sinT;
+          a->computeRopeCosSin(nnXLen, nnYLen, hw, cosT, sinT);
+          wgpu::Buffer cosB = wgMakeStorage(ctx, cosT.data(), cosT.size(), false, /*pooled=*/false);
+          wgpu::Buffer sinB = wgMakeStorage(ctx, sinT.data(), sinT.size(), false, /*pooled=*/false);
+          int numPairs = qHD/2;
+          rope(q, nH, qHD, numPairs, nKV, a->learnableRope, cosB, sinB);
+          rope(k, nKV, qHD, numPairs, nKV, a->learnableRope, cosB, sinB);
+        }
+        int kvGroup = nH / nKV;
+        wgpu::Buffer scores = attnScores(q, k, nH, nKV, qHD, kvGroup, 1.0f/std::sqrt((float)qHD));
+        attnSoftmax(scores, nH);
+        wgpu::Buffer attnOut = attnOutput(scores, v, nH, nKV, vHD, kvGroup);  // [n, nH*vHD, hw]
+        // outProj input is numHeads*vHeadDim (concatenated heads) — NOT vTot
+        // (numKVHeads*vHeadDim); they differ under grouped-query attention.
+        wgpu::Buffer projOut = proj(attnOut, nH*vHD, C, a->outProj.weights);  // -> trunk width
+        addInPlace(bx, projOut, (size_t)batchSize*C*hw);
+      }
+      else {  // TRANSFORMER_FFN_BLOCK_KIND (SwiGLU)
+        const TransformerFFNDesc* f = (const TransformerFFNDesc*)kindAndBlock.second.get();
+        int ffnC = f->ffnChannels;
+        wgpu::Buffer normed = rmsNorm(bx, C, f->preLN.weight, nullptr, ACTIVATION_IDENTITY, f->preLN.epsilon);
+        wgpu::Buffer a1 = proj(normed, C, ffnC, f->linear1.weights);
+        wgpu::Buffer gate = proj(normed, C, ffnC, f->linearGate.weights);
+        wgpu::Buffer hidden = swiglu(a1, gate, (size_t)batchSize*ffnC*hw);  // silu(a1)*gate
+        wgpu::Buffer out = proj(hidden, ffnC, C, f->linear2.weights);
+        addInPlace(bx, out, (size_t)batchSize*C*hw);
+      }
     }
   };
   applyBlocks(trunk.blocks, x, trunkC);
-  wgpu::Buffer trunkOut = bnAct(x, trunkC, trunk.trunkTipBN, trunk.trunkTipActivation.activation);
+  // Trunk tip: RMSNorm (v15+ RMSNorm nets) or BatchNorm (legacy). RMSNorm may be
+  // spatial (one rms over the whole board) or per-position.
+  wgpu::Buffer trunkOut;
+  if(trunk.trunkNormKind == TRUNK_NORM_KIND_RMSNORM) {
+    const RMSNormLayerDesc& tn = trunk.trunkTipRMSNorm;
+    int act = trunk.trunkTipActivation.activation;
+    trunkOut = tn.spatial ? rmsNormSpatial(x, trunkC, tn.gamma, tn.beta, act, tn.epsilon)
+                          : rmsNorm(x, trunkC, tn.gamma, &tn.beta, act, tn.epsilon);
+  } else
+    trunkOut = bnAct(x, trunkC, trunk.trunkTipBN, trunk.trunkTipActivation.activation);
 
   // ---- Policy head ----
   const PolicyHeadDesc& ph = md.policyHead;
@@ -914,8 +1039,18 @@ void NeuralNet::getOutput(
   addChanBias(p1, g1bias, p1C);
   wgpu::Buffer p1b = bnAct(p1, p1C, ph.p1BN, ph.p1Activation.activation);
   wgpu::Buffer policyBuf = conv(p1b, p1C, numPolicyChannels, ph.p2Conv);
-  // modelVersion < 15: policyPass = gpoolToPassMul(g1cat)
-  wgpu::Buffer policyPassBuf = matmul(g1cat, batchSize, 3*g1C, numPolicyChannels, ph.gpoolToPassMul.weights, nullptr, ACTIVATION_IDENTITY);
+  // Pass logit. v<15: policyPass = gpoolToPassMul(g1cat). v>=15: an extra hidden
+  // layer — passAct(gpoolToPassMul(g1cat) + gpoolToPassBias) then gpoolToPassMul2.
+  wgpu::Buffer policyPassBuf;
+  if(modelVersion >= 15) {
+    int passHidden = ph.gpoolToPassMul.outChannels;
+    wgpu::Buffer h1 = matmul(g1cat, batchSize, 3*g1C, passHidden,
+                             ph.gpoolToPassMul.weights, &ph.gpoolToPassBias.weights, ph.passActivation.activation);
+    policyPassBuf = matmul(h1, batchSize, passHidden, numPolicyChannels,
+                           ph.gpoolToPassMul2.weights, nullptr, ACTIVATION_IDENTITY);
+  } else {
+    policyPassBuf = matmul(g1cat, batchSize, 3*g1C, numPolicyChannels, ph.gpoolToPassMul.weights, nullptr, ACTIVATION_IDENTITY);
+  }
 
   // ---- Value head ----
   const ValueHeadDesc& vh = md.valueHead;

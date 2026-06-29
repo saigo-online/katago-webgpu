@@ -376,6 +376,281 @@ fn conv1x1NCHW(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   c1Out[idx] = STO(acc);
 }
+
+// ===========================================================================
+// rmsNorm: per-position RMSNorm across channels (transformer preLN + trunk tip).
+//   ms = sum_c in[n,c,xy]^2 / C ;  r = 1/sqrt(ms + eps)
+//   out[n,c,xy] = act(in[n,c,xy] * r * gamma[c] (+ beta[c])) * mask[n,xy]
+// One thread per (n,xy). hasBeta picks trunk-tip (gamma+beta+act) vs transformer
+// preLN (weight only). Masked positions output 0.
+// ===========================================================================
+
+struct RMSParams { n : u32, c : u32, hw : u32, act : u32, eps : f32, hasBeta : u32, pad0 : u32, pad1 : u32, };
+
+@group(0) @binding(0) var<uniform> rms : RMSParams;
+@group(0) @binding(1) var<storage, read>       rmsIn    : array<STO>;
+@group(0) @binding(2) var<storage, read>       rmsGamma : array<STO>;
+@group(0) @binding(3) var<storage, read>       rmsBeta  : array<STO>;
+@group(0) @binding(4) var<storage, read>       rmsMask  : array<STO>;
+@group(0) @binding(5) var<storage, read_write> rmsOut   : array<STO>;
+
+@compute @workgroup_size(64)
+fn rmsNorm(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let pos = gid.x;                 // [0, n*hw)
+  if (pos >= rms.n * rms.hw) { return; }
+  let n  = pos / rms.hw;
+  let xy = pos % rms.hw;
+  let base = n * rms.c * rms.hw + xy;
+  if (f32(rmsMask[n * rms.hw + xy]) == 0.0) {
+    for (var c : u32 = 0u; c < rms.c; c = c + 1u) { rmsOut[base + c * rms.hw] = STO(0.0); }
+    return;
+  }
+  var sumSq : f32 = 0.0;
+  for (var c : u32 = 0u; c < rms.c; c = c + 1u) { let v = f32(rmsIn[base + c * rms.hw]); sumSq = sumSq + v * v; }
+  let r = inverseSqrt(sumSq / f32(rms.c) + rms.eps);
+  for (var c : u32 = 0u; c < rms.c; c = c + 1u) {
+    var v = f32(rmsIn[base + c * rms.hw]) * r * f32(rmsGamma[c]);
+    if (rms.hasBeta != 0u) { v = v + f32(rmsBeta[c]); }
+    rmsOut[base + c * rms.hw] = STO(activate(v, rms.act));
+  }
+}
+
+// ===========================================================================
+// proj1x1: per-position channel projection with MatMulLayerDesc weights, which
+// are [inC][outC] (in-major) -- the TRANSPOSE of conv1x1's [outC][inC]. No bias
+// (transformer q/k/v/out and FFN linears are bias-free matmuls).
+//   out[n,o,xy] = sum_ic in[n,ic,xy] * W[ic*outC + o]
+// ===========================================================================
+
+struct ProjParams { n : u32, inC : u32, outC : u32, hw : u32, };
+
+@group(0) @binding(0) var<uniform> pj : ProjParams;
+@group(0) @binding(1) var<storage, read>       pjIn  : array<STO>;
+@group(0) @binding(2) var<storage, read>       pjW   : array<STO>;
+@group(0) @binding(3) var<storage, read_write> pjOut : array<STO>;
+
+@compute @workgroup_size(64)
+fn proj1x1(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= pj.n * pj.outC * pj.hw) { return; }
+  let xy = idx % pj.hw;
+  let o  = (idx / pj.hw) % pj.outC;
+  let n  = idx / (pj.hw * pj.outC);
+  let inBase = n * pj.inC * pj.hw + xy;
+  var acc : f32 = 0.0;
+  for (var ic : u32 = 0u; ic < pj.inC; ic = ic + 1u) {
+    acc = acc + f32(pjIn[inBase + ic * pj.hw]) * f32(pjW[ic * pj.outC + o]);
+  }
+  pjOut[idx] = STO(acc);
+}
+
+// ===========================================================================
+// ropeApply: in-place rotary embedding on q/k. For each (n, head, pair p, xy)
+// rotate channels (head*headDim+2p, +1) by cos/sin[tableIdx].
+//   learnable: tableIdx = (kvh*numPairs+p)*hw + xy,  kvh = head*numKVHeads/numHeads
+//   fixed:     tableIdx = p*hw + xy
+// ===========================================================================
+
+struct RopeParams { n : u32, numHeads : u32, headDim : u32, numPairs : u32, hw : u32, numKVHeads : u32, learnable : u32, pad0 : u32, };
+
+@group(0) @binding(0) var<uniform> rp : RopeParams;
+@group(0) @binding(1) var<storage, read_write> rpData : array<STO>;
+@group(0) @binding(2) var<storage, read>       rpCos  : array<STO>;
+@group(0) @binding(3) var<storage, read>       rpSin  : array<STO>;
+
+@compute @workgroup_size(64)
+fn ropeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= rp.n * rp.numHeads * rp.numPairs * rp.hw) { return; }
+  let xy = idx % rp.hw;
+  let p  = (idx / rp.hw) % rp.numPairs;
+  let h  = (idx / (rp.hw * rp.numPairs)) % rp.numHeads;
+  let n  = idx / (rp.hw * rp.numPairs * rp.numHeads);
+  let totalDim = rp.numHeads * rp.headDim;
+  let c0 = h * rp.headDim + 2u * p;
+  let idx0 = (n * totalDim + c0) * rp.hw + xy;
+  let idx1 = idx0 + rp.hw;
+  var tableIdx : u32;
+  if (rp.learnable != 0u) { let kvh = h * rp.numKVHeads / rp.numHeads; tableIdx = (kvh * rp.numPairs + p) * rp.hw + xy; }
+  else { tableIdx = p * rp.hw + xy; }
+  let cv = f32(rpCos[tableIdx]);
+  let sv = f32(rpSin[tableIdx]);
+  let x0 = f32(rpData[idx0]);
+  let x1 = f32(rpData[idx1]);
+  rpData[idx0] = STO(x0 * cv - x1 * sv);
+  rpData[idx1] = STO(x0 * sv + x1 * cv);
+}
+
+// ===========================================================================
+// attnScores: scores[n,h,qi,ki] = (1/sqrt(headDim)) * sum_d q[n,h,d,qi]*k[n,kvh,d,ki]
+//   kvh = h / kvGroupSize ; q is NCHW [n, numHeads*headDim, hw], k [n, numKVHeads*headDim, hw]
+// ===========================================================================
+
+struct AttnSParams { n : u32, numHeads : u32, numKVHeads : u32, headDim : u32, hw : u32, kvGroupSize : u32, scale : f32, pad0 : u32, };
+
+@group(0) @binding(0) var<uniform> asP : AttnSParams;
+@group(0) @binding(1) var<storage, read>       asQ : array<STO>;
+@group(0) @binding(2) var<storage, read>       asK : array<STO>;
+@group(0) @binding(3) var<storage, read_write> asScores : array<STO>;
+
+@compute @workgroup_size(64)
+fn attnScores(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= asP.n * asP.numHeads * asP.hw * asP.hw) { return; }
+  let ki = idx % asP.hw;
+  let qi = (idx / asP.hw) % asP.hw;
+  let h  = (idx / (asP.hw * asP.hw)) % asP.numHeads;
+  let n  = idx / (asP.hw * asP.hw * asP.numHeads);
+  let kvh = h / asP.kvGroupSize;
+  let qBase = (n * asP.numHeads * asP.headDim + h * asP.headDim) * asP.hw + qi;
+  let kBase = (n * asP.numKVHeads * asP.headDim + kvh * asP.headDim) * asP.hw + ki;
+  var acc : f32 = 0.0;
+  for (var d : u32 = 0u; d < asP.headDim; d = d + 1u) {
+    acc = acc + f32(asQ[qBase + d * asP.hw]) * f32(asK[kBase + d * asP.hw]);
+  }
+  asScores[idx] = STO(acc * asP.scale);
+}
+
+// ===========================================================================
+// attnSoftmax: in-place row-softmax of scores[n,h,qi,:] over ki, masked.
+// One thread per (n,h,qi). Masked qi -> zero row; masked ki excluded.
+// ===========================================================================
+
+struct AttnSMParams { n : u32, numHeads : u32, hw : u32, pad0 : u32, };
+
+@group(0) @binding(0) var<uniform> smP : AttnSMParams;
+@group(0) @binding(1) var<storage, read_write> smScores : array<STO>;
+@group(0) @binding(2) var<storage, read>       smMask : array<STO>;
+
+@compute @workgroup_size(64)
+fn attnSoftmax(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= smP.n * smP.numHeads * smP.hw) { return; }
+  let qi = idx % smP.hw;
+  let n  = idx / (smP.hw * smP.numHeads);
+  let rowBase = idx * smP.hw;
+  if (f32(smMask[n * smP.hw + qi]) == 0.0) {
+    for (var ki : u32 = 0u; ki < smP.hw; ki = ki + 1u) { smScores[rowBase + ki] = STO(0.0); }
+    return;
+  }
+  var mx : f32 = -3.0e38;
+  for (var ki : u32 = 0u; ki < smP.hw; ki = ki + 1u) {
+    if (f32(smMask[n * smP.hw + ki]) != 0.0) { mx = max(mx, f32(smScores[rowBase + ki])); }
+  }
+  var sum : f32 = 0.0;
+  for (var ki : u32 = 0u; ki < smP.hw; ki = ki + 1u) {
+    var e : f32 = 0.0;
+    if (f32(smMask[n * smP.hw + ki]) != 0.0) { e = exp(f32(smScores[rowBase + ki]) - mx); }
+    smScores[rowBase + ki] = STO(e);
+    sum = sum + e;
+  }
+  for (var ki : u32 = 0u; ki < smP.hw; ki = ki + 1u) { smScores[rowBase + ki] = STO(f32(smScores[rowBase + ki]) / sum); }
+}
+
+// ===========================================================================
+// attnOutput: out[n,h,e,qi] = sum_ki scores[n,h,qi,ki] * v[n,kvh,e,ki]
+//   out NCHW [n, numHeads*vHeadDim, hw]; v NCHW [n, numKVHeads*vHeadDim, hw]
+// ===========================================================================
+
+struct AttnOParams { n : u32, numHeads : u32, numKVHeads : u32, vHeadDim : u32, hw : u32, kvGroupSize : u32, pad0 : u32, pad1 : u32, };
+
+@group(0) @binding(0) var<uniform> aoP : AttnOParams;
+@group(0) @binding(1) var<storage, read>       aoScores : array<STO>;
+@group(0) @binding(2) var<storage, read>       aoV : array<STO>;
+@group(0) @binding(3) var<storage, read_write> aoOut : array<STO>;
+
+@compute @workgroup_size(64)
+fn attnOutput(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= aoP.n * aoP.numHeads * aoP.vHeadDim * aoP.hw) { return; }
+  let qi = idx % aoP.hw;
+  let e  = (idx / aoP.hw) % aoP.vHeadDim;
+  let h  = (idx / (aoP.hw * aoP.vHeadDim)) % aoP.numHeads;
+  let n  = idx / (aoP.hw * aoP.vHeadDim * aoP.numHeads);
+  let kvh = h / aoP.kvGroupSize;
+  let rowBase = ((n * aoP.numHeads + h) * aoP.hw + qi) * aoP.hw;
+  let vBase = (n * aoP.numKVHeads * aoP.vHeadDim + kvh * aoP.vHeadDim + e) * aoP.hw;
+  var acc : f32 = 0.0;
+  for (var ki : u32 = 0u; ki < aoP.hw; ki = ki + 1u) {
+    acc = acc + f32(aoScores[rowBase + ki]) * f32(aoV[vBase + ki]);
+  }
+  aoOut[(n * aoP.numHeads * aoP.vHeadDim + h * aoP.vHeadDim + e) * aoP.hw + qi] = STO(acc);
+}
+
+// ===========================================================================
+// swigluGate: out[i] = silu(a[i]) * gate[i]   (SwiGLU FFN hidden activation)
+// ===========================================================================
+
+struct SwiParams { total : u32, pad0 : u32, pad1 : u32, pad2 : u32, };
+
+@group(0) @binding(0) var<uniform> swP : SwiParams;
+@group(0) @binding(1) var<storage, read>       swA : array<STO>;
+@group(0) @binding(2) var<storage, read>       swGate : array<STO>;
+@group(0) @binding(3) var<storage, read_write> swOut : array<STO>;
+
+@compute @workgroup_size(64)
+fn swigluGate(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let i = gid.x;
+  if (i >= swP.total) { return; }
+  let a = f32(swA[i]);
+  let s = select(1.0 / (1.0 + exp(-a)), exp(a) / (1.0 + exp(a)), a < 0.0);
+  swOut[i] = STO(a * s * f32(swGate[i]));
+}
+
+// ===========================================================================
+// Spatial RMSNorm (trunk tip): one rms over ALL channels AND valid positions per
+// batch element. Two passes: reduce -> per-batch rms, then apply.
+//   rms[n] = 1/sqrt( (sum over valid c,xy of x^2) / (validPositions*C) + eps )
+// ===========================================================================
+
+struct RMSRParams { n : u32, c : u32, hw : u32, pad0 : u32, eps : f32, pad1 : u32, pad2 : u32, pad3 : u32, };
+
+@group(0) @binding(0) var<uniform> rmsr : RMSRParams;
+@group(0) @binding(1) var<storage, read>       rmsrIn   : array<STO>;
+@group(0) @binding(2) var<storage, read>       rmsrMask : array<STO>;
+@group(0) @binding(3) var<storage, read_write> rmsrOut  : array<f32>;   // [n]
+
+@compute @workgroup_size(64)
+fn rmsReduceSpatial(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let nn = gid.x;
+  if (nn >= rmsr.n) { return; }
+  var sumSq : f32 = 0.0;
+  var valid : u32 = 0u;
+  for (var xy : u32 = 0u; xy < rmsr.hw; xy = xy + 1u) {
+    if (f32(rmsrMask[nn * rmsr.hw + xy]) != 0.0) {
+      valid = valid + 1u;
+      for (var c : u32 = 0u; c < rmsr.c; c = c + 1u) {
+        let v = f32(rmsrIn[(nn * rmsr.c + c) * rmsr.hw + xy]);
+        sumSq = sumSq + v * v;
+      }
+    }
+  }
+  let total = max(1.0, f32(valid) * f32(rmsr.c));
+  rmsrOut[nn] = inverseSqrt(sumSq / total + rmsr.eps);
+}
+
+struct RMSAParams { n : u32, c : u32, hw : u32, act : u32, hasBeta : u32, pad0 : u32, pad1 : u32, pad2 : u32, };
+
+@group(0) @binding(0) var<uniform> rmsa : RMSAParams;
+@group(0) @binding(1) var<storage, read>       rmsaIn    : array<STO>;
+@group(0) @binding(2) var<storage, read>       rmsaGamma : array<STO>;
+@group(0) @binding(3) var<storage, read>       rmsaBeta  : array<STO>;
+@group(0) @binding(4) var<storage, read>       rmsaMask  : array<STO>;
+@group(0) @binding(5) var<storage, read>       rmsaRms   : array<f32>;   // [n]
+@group(0) @binding(6) var<storage, read_write> rmsaOut   : array<STO>;
+
+@compute @workgroup_size(64)
+fn rmsApplySpatial(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= rmsa.n * rmsa.c * rmsa.hw) { return; }
+  let xy = idx % rmsa.hw;
+  let c  = (idx / rmsa.hw) % rmsa.c;
+  let nn = idx / (rmsa.hw * rmsa.c);
+  if (f32(rmsaMask[nn * rmsa.hw + xy]) == 0.0) { rmsaOut[idx] = STO(0.0); return; }
+  var v = f32(rmsaIn[idx]) * rmsaRms[nn] * f32(rmsaGamma[c]);
+  if (rmsa.hasBeta != 0u) { v = v + f32(rmsaBeta[c]); }
+  rmsaOut[idx] = STO(activate(v, rmsa.act));
+}
 )WGSL";
 
 }  // namespace KataGoWebGPU

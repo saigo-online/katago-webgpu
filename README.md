@@ -11,12 +11,12 @@ The same hand-written **WGSL** kernels run two places:
 - **Browser** — the identical kernels compiled to WASM via Dawn's `emdawnwebgpu`
   port, so a webpage can evaluate KataGo with no server round-trip.
 
-> Status: the WebGPU backend evaluates plain-residual + global-pooling **and
-> nested-bottleneck** nets — g170 **b6c96 / b10c128 / b20c256** (modelVersion 8)
-> through kata1 **b18c384nbt** (modelVersion 14: nested-bottleneck + optimism
-> policy + scaled-mish) — all **validated byte-identical to KataGo's Eigen CPU
-> reference**. It is a real, working backend — not a mock — with honest limits
-> noted below. See [`WEBGPU_STATUS.md`](WEBGPU_STATUS.md) for the engineering log.
+> Status: the WebGPU backend evaluates **the full KataGo architecture through
+> modelVersion 17** — convolutional (g170 b6/b10/b20), nested-bottleneck
+> (b18c384nbt), **and transformer** nets (attention + RoPE + SwiGLU + RMSNorm,
+> incl. grouped-query attention and optimism/q-value policy) — all **validated
+> byte-identical to KataGo's Eigen CPU reference**. A real, working backend, not a
+> mock. See [`WEBGPU_STATUS.md`](WEBGPU_STATUS.md) for the engineering log.
 
 ---
 
@@ -56,10 +56,13 @@ they agree.
 
 ## Highlights
 
-- **Full forward pass on WebGPU** — initial conv + global-input matmul, ordinary,
-  global-pooling **and nested-bottleneck** residual blocks (recursive), policy head
-  (incl. pass + optimism, modelVersion ≥ 12) and value head (value / score /
+- **Full forward pass on WebGPU** — initial conv + global-input matmul; ordinary,
+  global-pooling, nested-bottleneck **and transformer** blocks (recursive); policy
+  head (pass + optimism/q-value, modelVersion ≥ 12) and value head (value / score /
   ownership). relu / mish / silu / scaled-mish activations. Direct WGSL, fp32 accum.
+- **Transformer stack** (modelVersion ≥ 15) — RMSNorm (per-position + spatial),
+  multi-head attention with **learnable/fixed RoPE**, **grouped-query attention**,
+  masked softmax, and **SwiGLU** feed-forward. All byte-identical to Eigen.
 - **Validated** — byte-identical to the Eigen CPU backend on the per-op tests
   (`runnnlayertests`) and full-net evaluation; the GPU and CPU WASM paths agree.
 - **Tuned** — 1×1 fast conv, persistent weight upload, per-handle buffer pooling,
@@ -120,10 +123,11 @@ README-KATAGO-UPSTREAM.md   the original KataGo README
 
 ## Honest limits
 
-- **Nets**: convolutional trunks through modelVersion 14 — ordinary, global-pooling
-  and **nested-bottleneck** blocks; optimism policy (the standard policy, channel 0).
-  Still **rejected with a clear error** (not silently mis-evaluated): **transformer**
-  blocks (attention/FFN, b28-style) and **RMSNorm** trunks — next on the roadmap.
+- **Nets**: the full architecture through modelVersion 17 — conv / global-pooling /
+  nested-bottleneck / transformer blocks, BatchNorm + RMSNorm, optimism + q-value
+  policy. Still **rejected with a clear error** (not silently mis-evaluated): the
+  **SGF-metadata encoder** (`metaEncoderVersion ≠ 0` — train without it) and
+  **grouped** RMSNorm (`cgroupSize ≠ 0`).
 - **Demo**: single-position analysis (no move history fed yet, so ko/superko and
   "the actual game" aren't modeled); score is approximate; 19×19, Tromp-Taylor.
 - **Perf**: direct convs (no Winograd yet). b6c96 is fast but weak; b20c256
