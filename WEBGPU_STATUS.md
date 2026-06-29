@@ -38,8 +38,9 @@ Tested 7 configurations          # conv ×3, batchnorm ×2, residual, global-poo
 Done                             # no mismatches
 
 # full-net eval, WebGPU vs Eigen, same net:
-#   b6c96   : byte-identical (Win/Loss/Score/Policy/Ownership), symmetries 0/3/5
-#   b10c128 : matches within float rounding (Win 73.51c vs 73.52c — CPU↔GPU accumulation)
+#   b6c96      : byte-identical (Win/Loss/Score/Policy/Ownership), symmetries 0/3/5
+#   b10c128    : matches within float rounding (Win 73.51c vs 73.52c — CPU↔GPU accumulation)
+#   b20c256x2  : agree exactly (Win 99.93c / Lead 7.86; 23.5M params) — the demo's strongest net
 ```
 
 The dual-backend WASM is also cross-checked: the **WebGPU and Eigen-CPU paths
@@ -147,9 +148,9 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
   (`numPolicyChannels != 1`, modelVersion ≥ 12) are rejected with a clear error.
 - **Demo**: single-position analysis — no move history is fed yet, so ko/superko
   and "the actual game" aren't modeled; score is approximate; 19×19, Tromp-Taylor.
-- **Perf**: direct convs (no Winograd yet); the bundled b6c96 is small and weak —
-  great for a fast demo, modest strength (its flat opening policy is genuine, and
-  reproduced identically on both backends).
+- **Perf**: direct convs (no Winograd yet). The demo's net selector spans b6c96
+  (fast, weak — its flat opening policy is genuine) → b10c128 → b20c256 (23.5M
+  params, strong, but an 87 MB download and slower per eval). All modelVersion 8.
 
 ## Roadmap
 
@@ -159,8 +160,8 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
    for b28-style and modelVersion ≥ 12 nets. The largest chunk.
 3. **Winograd 3×3** — the main remaining conv speedup.
 4. **Selective-fp32 heads** + validate the fp16 GPU path on a `shader-f16` adapter.
-5. **Demo**: feed move history (ko/superko, real games), a stronger net (b10/b18),
-   and ownership/score polish.
+5. **Demo**: feed move history (ko/superko, real games) and ownership/score
+   polish. *(Stronger nets — b10c128 / b20c256 via the selector — done.)*
 
 ## Key source references (`cpp/`)
 

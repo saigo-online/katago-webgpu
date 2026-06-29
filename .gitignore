@@ -113,6 +113,7 @@ web/demo/kataeval.wasm.map
 web/demo/*_dbg.*
 # self-signed TLS certs from serve-demo-tls.sh
 web/.certs/
-# neural net weights — re-bundled by build-eval.sh, don't commit the blob
+# neural net weights — re-bundled by build-eval.sh, don't commit the blobs
 web/demo/model.bin.gz
+web/demo/model-*.bin.gz
 

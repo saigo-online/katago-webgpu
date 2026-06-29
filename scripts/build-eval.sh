@@ -48,7 +48,13 @@ emcc "${OBJS[@]}" --use-port=emdawnwebgpu -sUSE_ZLIB=1 \
 
 echo "==> built:"; ls -la "$ROOT/web/demo/kataeval.js" "$ROOT/web/demo/kataeval.wasm"
 
-# Bundle the demo net from the committed test model (web/demo/model.bin.gz is
-# gitignored, so regenerate it here for an out-of-the-box demo).
-MODEL="$ROOT/cpp/tests/models/g170-b6c96-s175395328-d26788732.bin.gz"
-if [ -f "$MODEL" ]; then cp "$MODEL" "$ROOT/web/demo/model.bin.gz"; echo "==> bundled net -> web/demo/model.bin.gz"; fi
+# Bundle the demo nets (web/demo/model-*.bin.gz are gitignored, so regenerate
+# here for an out-of-the-box demo). The analyze.html net selector picks among
+# them via ?net=. All are g170, modelVersion 8 (plain residual + gpool) — the
+# family this backend supports — in increasing strength.
+bundle() { [ -f "$1" ] && { cp "$1" "$ROOT/web/demo/$2"; echo "==> bundled $(basename "$1") -> web/demo/$2"; }; }
+bundle "$ROOT/cpp/tests/models/g170-b6c96-s175395328-d26788732.bin.gz"     model-b6c96.bin.gz
+bundle "$ROOT/cpp/tests/models/g170e-b10c128-s1141046784-d204142634.bin.gz" model-b10c128.bin.gz
+# Stronger net, not committed (87 MB): supply via $B20_NET, else skipped — the
+# selector still offers it and shows a friendly note if it isn't bundled.
+bundle "${B20_NET:-/srv/nfs/fleet/go/models_ref/bin_gz/kata1-b20c256x2-s5303129600-d1228401921.bin.gz}" model-b20c256.bin.gz

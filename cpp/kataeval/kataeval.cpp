@@ -114,6 +114,8 @@ KATAEVAL_EXPORT int kgeEval(const int* stones, int pla, double komi,
 
     const int hw = gXLen * gYLen;
     std::memcpy(policyOut, output.policyProbs, (hw + 1) * sizeof(float));  // raw logits
+    // valueOut[0..2] are raw win/loss/noResult logits too — the caller softmaxes
+    // them (see web/demo/analyze.html); valueOut[3..4] are scoreMean / lead.
     valueOut[0] = output.whiteWinProb;
     valueOut[1] = output.whiteLossProb;
     valueOut[2] = output.whiteNoResultProb;

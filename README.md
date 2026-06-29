@@ -12,17 +12,18 @@ The same hand-written **WGSL** kernels run two places:
   port, so a webpage can evaluate KataGo with no server round-trip.
 
 > Status: the WebGPU backend evaluates plain-residual + global-pooling nets
-> (the g170 b6c96 / b10c128 family) and is **validated byte-identical to
-> KataGo's Eigen CPU reference**. It is a real, working backend — not a mock —
-> with honest limits noted below. See [`WEBGPU_STATUS.md`](WEBGPU_STATUS.md) for
-> the full engineering log.
+> (the g170 **b6c96 / b10c128 / b20c256** family, modelVersion 8) and is
+> **validated byte-identical to KataGo's Eigen CPU reference**. It is a real,
+> working backend — not a mock — with honest limits noted below. See
+> [`WEBGPU_STATUS.md`](WEBGPU_STATUS.md) for the full engineering log.
 
 ---
 
 ## See it
 
-A playable goban that analyzes and plays using a real b6c96 net, evaluated in
-*your* browser:
+A playable goban that analyzes and plays using a real KataGo net, evaluated in
+*your* browser — pick the strength from the **net selector** (b6c96 → b10c128 →
+b20c256):
 
 ```bash
 scripts/build-eval.sh        # compile the eval to WASM (emcc + emdawnwebgpu)
@@ -32,8 +33,10 @@ scripts/serve-demo-tls.sh    # serve over HTTPS (WebGPU needs a secure context)
 
 - **`analyze.html`** — place stones and watch the **policy** (move probabilities),
   **win-rate**, **score**, and **ownership** update live; **"Engine plays"** makes
-  KataGo take its top move. Add **`?cpu`** to the URL to force the CPU backend and
-  compare.
+  KataGo take its top move. The **net selector** swaps strength (defaults to
+  b10c128; `?net=b20c256` for the strongest). Add **`?cpu`** to the URL to force
+  the CPU backend and compare. `build-eval.sh` bundles b6c96 + b10c128 from the
+  repo's test models; the 87 MB b20c256 is opt-in via `$B20_NET`.
 - **`index.html`** — a lighter demo that runs the raw `conv2dNCHW` WGSL kernel as
   a live stone-influence map (proves the GPU pipeline without the full net).
 
@@ -114,14 +117,15 @@ README-KATAGO-UPSTREAM.md   the original KataGo README
 
 ## Honest limits
 
-- **Nets**: plain-residual + global-pooling, modelVersion 8 (g170 b6/b10/…).
-  Nested-bottleneck / transformer (b18nbt/b28), RMSNorm trunks, and optimism
+- **Nets**: plain-residual + global-pooling, modelVersion 8 (g170 b6 / b10 /
+  b20). Nested-bottleneck / transformer (b18nbt/b28), RMSNorm trunks, and optimism
   policy are **rejected with a clear error**, not silently mis-evaluated — they're
   on the roadmap.
 - **Demo**: single-position analysis (no move history fed yet, so ko/superko and
   "the actual game" aren't modeled); score is approximate; 19×19, Tromp-Taylor.
-- **Perf**: direct convs (no Winograd yet); the bundled b6c96 is a small, weak net
-  (great for a fast demo, modest strength).
+- **Perf**: direct convs (no Winograd yet). b6c96 is fast but weak; b20c256
+  (23.5M params, ~9 dan) is strong but an 87 MB download and slower per eval —
+  pick per your hardware.
 
 ## Credits & license
 

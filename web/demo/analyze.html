@@ -26,7 +26,7 @@
 <body>
   <div>
     <h1>saiGo · offline KataGo — analyze &amp; play</h1>
-    <div class="muted">b6c96 net, evaluated entirely in your browser on WebGPU (no server).
+    <div class="muted">A real KataGo net, evaluated entirely in your browser on WebGPU (no server).
       Click to place stones; the overlay shows the policy (move probabilities) and the
       win-rate bar updates. "Engine plays" makes KataGo take its top move.</div>
     <div id="boardWrap" style="margin-top:10px;">
@@ -37,6 +37,7 @@
 
   <div class="panel">
     <div class="row status" id="status">loading engine…</div>
+    <div class="row">Net: <select id="net"></select> <span class="muted" id="netnote"></span></div>
     <div class="row">
       <div class="wr"><span>Black <span id="bwr">–</span></span><span><span id="wwr">–</span> White</span></div>
       <div class="bar"><div class="b" id="barB" style="width:50%">.</div><div class="w" id="barW" style="width:50%">.</div></div>
@@ -78,21 +79,34 @@
   function softmax(arr) { let m = -1e30; for (const v of arr) m = Math.max(m, v); let s = 0; const o = arr.map(v => { const e = Math.exp(v - m); s += e; return e; }); return o.map(v => v / s); }
   let lastPolicy = null, lastBest = -1;
 
+  // --- net selection (all g170, modelVersion 8 = supported), increasing strength ---
+  const NETS = {
+    'b6c96':   { file: 'model-b6c96.bin.gz',   label: 'b6c96 · fast (3.8 MB)' },
+    'b10c128': { file: 'model-b10c128.bin.gz', label: 'b10c128 · stronger (11 MB)' },
+    'b20c256': { file: 'model-b20c256.bin.gz', label: 'b20c256 · strongest (87 MB)' },
+  };
+  const qs = new URLSearchParams(location.search);
+  const netKey = NETS[qs.get('net')] ? qs.get('net') : 'b10c128';
+  const sel = $('net');
+  for (const k in NETS) { const o = document.createElement('option'); o.value = k; o.textContent = NETS[k].label; if (k === netKey) o.selected = true; sel.appendChild(o); }
+  sel.onchange = () => { const u = new URLSearchParams(location.search); u.set('net', sel.value); location.search = u.toString(); }; // reload with new net
+
   // --- load engine + model ---
   let M = null, ready = false, sPtr, pPtr, vPtr, oPtr;
   try {
     M = await createKata();
-    if (new URLSearchParams(location.search).has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
-    $('status').textContent = 'fetching model…';
-    const bytes = new Uint8Array(await (await fetch('model.bin.gz')).arrayBuffer());
-    M.FS.writeFile('/model.bin.gz', bytes);
+    if (qs.has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
+    $('status').textContent = 'fetching ' + netKey + ' net…';
+    const resp = await fetch(NETS[netKey].file);
+    if (!resp.ok) { $('status').innerHTML = 'net <b>' + netKey + '</b> not bundled — re-run <span class="mono">build-eval.sh</span>' + (netKey === 'b20c256' ? ' with the 87 MB net available ($B20_NET)' : ''); return; }
+    M.FS.writeFile('/model.bin.gz', new Uint8Array(await resp.arrayBuffer()));
     $('status').textContent = 'initializing engine (WebGPU, else CPU)…';
     const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
     if (!ok) { $('status').innerHTML = 'engine: <span class="bad">load failed</span> — ' + M.ccall('kgeError','string',[],[]); return; }
     sPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
     ready = true;
     const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen fallback)';
-    $('status').innerHTML = 'engine: <span class="ok">ready</span> · KataGo b6c96 on ' + backend;
+    $('status').innerHTML = 'engine: <span class="ok">ready</span> · KataGo ' + netKey + ' on ' + backend;
     $('adapter').textContent = 'backend: ' + backend + ' · add ?cpu to URL to force CPU';
     await analyze();
   } catch (e) { $('status').innerHTML = 'engine: <span class="bad">error</span> — ' + e; return; }
