@@ -1,283 +1,171 @@
-# KataGo native WebGPU (Dawn) backend — status & roadmap
+# KataGo on WebGPU — status & roadmap
 
-**Goal:** a `USE_BACKEND=WEBGPU` for KataGo that runs the neural net on the GPU
-through **Dawn** (native WebGPU) on the desktop, with the *same* WGSL kernels
-later reusable in-browser via Emscripten. This keeps KataGo's real C++ search,
-rules, GTP and analysis engine intact and replaces only the NN backend.
+A `USE_BACKEND=WEBGPU` neural-net backend for KataGo in **WGSL** via
+[Dawn](https://dawn.googlesource.com/dawn), plus the tooling to compile the
+evaluation to **WebAssembly** and run a real net **in the browser**. The same
+hand-written kernels run natively (desktop GPU) and in the browser
+(`emdawnwebgpu`). KataGo's C++ search / rules / GTP are untouched — only the NN
+backend is replaced.
 
-This is the path we chose over delegating inference to onnxruntime-web — see the
-chat that kicked this off. It is a **multi-week port**, not a weekend job. This
-file tracks exactly where it stands and what's left.
+This file is the honest engineering status. The polished overview is in
+[`README.md`](README.md); upstream KataGo's README is
+[`README-KATAGO-UPSTREAM.md`](README-KATAGO-UPSTREAM.md).
 
-## Current status: FULL NET EVALUATION WORKS, validated vs the Eigen CPU reference
+## Current status
 
-The backend **compiles, links, runs on a real GPU via Dawn, and evaluates whole
-KataGo nets correctly**. `getOutput()` runs the full trunk + policy + value graph
-and writes real `NNOutput`s — the old throw is gone. Plain-residual +
-global-pooling nets (the g170 b6/b10/b15/b20/b40 family, modelVersion 8) work.
+**Both targets work and are validated.**
 
-Two layers of validation, both green:
+- **Native** (`-DUSE_BACKEND=WEBGPU`) evaluates whole nets on the desktop GPU via
+  Dawn, **byte-identical to KataGo's Eigen CPU reference**.
+- **Browser** — the same kernels, compiled to WASM, evaluate a real net offline.
+  [`web/demo/analyze.html`](web/demo/analyze.html) is a playable goban that shows
+  live policy / win-rate / ownership and plays its top move.
+- **One WASM, automatic fallback** — `kataeval.wasm` ships both the WebGPU and the
+  Eigen-CPU backend and falls back to CPU transparently when there's no adapter.
+- Published as a fork: **`saigo-online/katago-webgpu`** (branched from
+  `lightvector/KataGo`), referenced by saigo.online as a submodule.
 
+Supported nets: plain-residual + global-pooling, **modelVersion 8** (the g170
+b6/b10/b15/b20/b40 family). Architectures not yet ported are **rejected with a
+clear error**, never silently mis-evaluated — see *Limits* below.
+
+## Validation
+
+```text
+# per-op kernels vs the CPU reference (native WEBGPU build)
+$ katago runnnlayertests
+Tested 7 configurations          # conv ×3, batchnorm ×2, residual, global-pooling
+Done                             # no mismatches
+
+# full-net eval, WebGPU vs Eigen, same net:
+#   b6c96   : byte-identical (Win/Loss/Score/Policy/Ownership), symmetries 0/3/5
+#   b10c128 : matches within float rounding (Win 73.51c vs 73.52c — CPU↔GPU accumulation)
 ```
-$ katago runnnlayertests                       # USE_BACKEND=WEBGPU build
-Tested 7 configurations                         # conv ×3, batchnorm ×2, residual, global-pooling
-Done                                            # no mismatches → all kernels correct to fp32 tol
 
-# Full-net eval vs Eigen CPU reference, same net, tiny-board test:
-$ diff <(katago-eigen  runnnontinyboardtest NET true  true  0 false) \
-       <(katago-webgpu runnnontinyboardtest NET false false 0 false)
-# b6c96  : byte-identical (Win/Loss/Score/Policy/Ownership) across symmetries 0/3/5
-# b10c128: matches within float rounding (Win 73.51c vs 73.52c — CPU↔GPU accumulation)
-```
+The dual-backend WASM is also cross-checked: the **WebGPU and Eigen-CPU paths
+agree** on the same position (same win-rate, same policy), which confirms the
+in-browser GPU forward pass matches the reference end to end.
 
-Milestones **M1–M6 are done and validated**:
-- M1 dispatch harness · M2 conv2dNCHW · M3 scaleBiasMaskAct
-- M4 residual block · M5 global-pooling residual block (caught a real `computeMerged`
-  BN-fold bug: `hasScale`/`hasBias` must NOT gate `scale[]`/`bias[]`)
-- M6 trunk (initialConv + initialMatMul + blocks + trunk-tip) + policy head
-  (incl. pass) + value head (value/score/ownership; value-head pooling uses a
-  distinct mean/scaled/mean-of-squares kernel) + `getOutput` (mask from spatial
-  feature 0, symmetry-correct output writing, modelVersion-aware score fields).
-  Bug found: head output buffers must be created `CopySrc`-capable or `wgReadFloats`
-  silently returns zeros (→ degenerate uniform policy).
+Two real bugs that this validation caught and fixed:
+- BN fold must use `scale[]`/`bias[]` unconditionally (`hasScale`/`hasBias` do
+  **not** gate them — `computeMerged()` semantics); gating silently dropped a bias.
+- Head output buffers must be `CopySrc`-capable, or `wgReadFloats` silently reads
+  zeros → a degenerate uniform policy.
 
-Architectures not yet ported are **rejected with a clear error** (never silently
-wrong): nested-bottleneck, transformer (b18nbt/b28), RMSNorm trunk, optimism
-policy (numPolicyChannels != 1, i.e. modelVersion ≥ 12).
+## Architecture
 
-It ran on a real **NVIDIA GPU** via Dawn's Vulkan path (the per-op tests had
-fallen back to software Vulkan / lavapipe).
+| Layer | What | Where |
+|-------|------|-------|
+| **WebGPU backend** | KataGo `NeuralNet::` backend in WGSL/Dawn | `cpp/neuralnet/webgpubackend.cpp`, `webgpukernels.cpp` |
+| **`kataeval`** | minimal eval as one clean C++ dep | `cpp/kataeval/` (`kataeval.h`, `sources.txt`, `CMakeLists.txt`) |
+| **Browser** | WASM build + goban demo | `web/`, `scripts/build-eval.sh`, `scripts/serve-demo-tls.sh` |
 
-### Performance (started)
+`kataeval` wraps the minimal KataGo subset (32 sources: neuralnet eval + game +
+core — no search/GTP/`command/`) behind a tiny C ABI (`kgeLoad` / `kgeEval` →
+policy/value/ownership). The dual-backend single binary compiles each backend
+under its own namespace (rename macros over the upstream `.cpp`) and
+`cpp/kataeval/dispatch.cpp` implements `NeuralNet::`, trying WebGPU then falling
+back to Eigen. JS does the final softmax (so it can mask illegal moves).
 
-Measured with `katago benchmark -v 256 -t 8` on b6c96 (NVIDIA, search nnEvals/s):
+## Performance
 
-| change | nnEvals/s | visits/s |
-|--------|-----------|----------|
-| baseline (per-dispatch submit, per-output readback) | ~616 | ~978 |
-| + persistent weight cache (upload once, not per eval) | ~623 | — |
-| + single command encoder + coalesced readback | **~765** | **~1396** |
+`katago benchmark -v 256 -t 8`, b6c96, 19×19 (search nnEvals/s):
 
-- **Persistent weights** — conv/matmul/BN weights upload once into the handle
-  (`weightCache`/`bnCache`, keyed by source pointer) instead of ~4 MB re-uploaded
-  every eval. Small win here (fast GPU, small net) but matters for big nets and
-  for the browser, where host→GPU upload is slow.
-- **One Submit per eval** — the whole forward pass records into a single
-  `WgRecorder` command encoder (one compute pass per dispatch for ordering), vs.
-  ~50 `Submit`s before. This + reading all 5 head outputs back through **one**
-  `MapAsync` (instead of 5 blocking round-trips) was the real win: ~+24% eval
-  throughput, ~+43% visits/s (lower latency also improves search efficiency).
+| change | nnEvals/s |
+|--------|-----------|
+| baseline (per-dispatch submit, per-output readback) | ~616 |
+| + persistent weight upload + buffer pool | ~640 |
+| + single command submit + coalesced readback | ~765 |
+| + 1×1 fast conv | **~810** (**+31%**) |
 
-**fp16 storage path (implemented).** The kernels use a `STO` storage-scalar
-alias the backend prepends as `alias STO = f32;` or `enable f16; alias STO = f16;`.
-Every storage load is `f32(...)`, every store `STO(...)`, so one source compiles
-both ways; math always accumulates in **f32** (fp16 storage + fp32 compute —
-halves bandwidth/VRAM, keeps accuracy). The device requests the `shader-f16`
-feature when `useFP16` is on and the adapter supports it, else it **falls back to
-fp32** (the fp32 path is the same kernels and stays fully validated). Host
-float→half conversion **clamps finite values to ±65504** (not Inf) — see fork
-audit below. Buffers/readbacks are fp16-aware and 4-byte-padded.
+The big win was **latency**, not FLOPs: one `Submit` per eval (a single
+`WgRecorder` command encoder) and **one** coalesced `MapAsync` readback instead
+of ~50 submits and 5 blocking round-trips. Weights upload once
+(`weightCache`/`bnCache`); intermediates/uniforms are reused from a per-handle
+`BufferPool`; `conv1x1NCHW` skips the spatial loop for 1×1 layers (the heads).
 
-> Caveat: this machine's Dawn/Vulkan adapter (NVIDIA GB10, new Blackwell driver)
-> does **not** advertise `shader-f16`, and the build has no software fallback
-> adapter, so the fp16 GPU path **could not be exercised here** — it falls back to
-> fp32. fp16 is primarily for the browser, where `shader-f16` is widely exposed.
-
-### Audit of the `/home/taro/code/katago` fork (gweber/KataGo)
-
-The fork diverges from upstream by **2 commits**, both **TensorRT-11-specific**
-(port to strongly-typed networks + FP16 via ONNX graph rewrite) — touching only
-`trtbackend.cpp` / `onnxmodelbuilder.cpp` / `sandbox.cpp`. None of that backend
-code is portable to WebGPU. But its FP16 commit carries two **design lessons**
-that do apply:
-
-1. **Clamp float→half to ±65504, not Inf** — KataGo's `1e9` off-board attention
-   mask bias becomes `0*Inf = NaN` in softmax if promoted to Inf. **Applied** to
-   `wgMakeStorage`'s fp16 upload (matters once transformer nets are supported;
-   defensive now).
-2. **Keep numerically-sensitive layers in FP32** even in FP16 mode — the fork
-   keeps the policy/value heads, trunk tip, and RMSNorm reductions FP32. **Not yet
-   applied** (our fp16 makes everything fp16-storage); a future refinement once a
-   `shader-f16` adapter is available to validate against. The fork measured
-   ~0.08% winrate error and ~2.4× throughput (256-ch transformer, 19×19) with its
-   selective-fp16, which is the bar to match.
-
-Update: **1×1 fast conv** and **buffer pooling** are now done + Eigen-validated
-(`conv1x1NCHW`; a `thread_local` per-handle `BufferPool` reused across evals,
-weights/BN opt out). Cumulative benchmark ~616 → ~810 nnEvals/s (+31%) on b6c96.
 Still open: **Winograd 3×3** (the direct conv is the remaining compute hot spot),
-**selective-fp32 heads** (lesson 2 above — needs a shader-f16 adapter to
-validate), larger fixed batch. Correctness re-checked against Eigen after each.
+larger fixed batch.
 
-### Browser build (Emscripten / WASM) — started
+## fp16
 
-The backend was written against the **standard** WebGPU API specifically so it
-ports to the browser. The toolchain is confirmed and the first WASM artifact
-builds:
+The kernels use a `STO` storage-scalar alias the backend prepends as
+`alias STO = f32;` or `enable f16; alias STO = f16;` — one source, both
+precisions; math always accumulates in **f32** (fp16 *storage*, fp32 *compute*:
+halves bandwidth/VRAM, keeps accuracy). The device requests `shader-f16` when
+available, else falls back to fp32 (the same, validated kernels). Host
+float→half **clamps finite values to ±65504** (not Inf) so KataGo's large finite
+sentinels — e.g. the `1e9` off-board attention-mask bias — don't become
+`0*Inf = NaN` in softmax. Buffers/readbacks are fp16-aware and 4-byte padded.
 
-- **Toolchain**: emsdk (emcc 6.0.1) + Dawn's `emdawnwebgpu` Emscripten port,
-  which Emscripten vendors as a remote port — `emcc --use-port=emdawnwebgpu`
-  auto-fetches it. No manual Dawn-for-WASM build needed.
-- **`web/wasm_smoke.cpp`** + **`scripts/build-web.sh`** compile our *actual*
-  kernel library (`cpp/neuralnet/webgpukernels.cpp`, which has zero KataGo deps)
-  plus a tiny harness to `web/dist/wasm_smoke.{html,js,wasm}`. It runs
-  `scaleBiasMaskAct` on a known input via the browser's WebGPU and checks the
-  result. **Build succeeds** (≈84 KB wasm), proving the WGSL kernels + standard
-  WebGPU C++ API are WASM-portable through emdawnwebgpu.
-- **Async readback** is browser-ready: all blocking waits go through `wgPump`,
-  which is `ProcessEvents()` natively and `emscripten_sleep(0)` (Asyncify/JSPI)
-  in the browser; the harness uses `CallbackMode::AllowSpontaneous` (browser
-  event loop drives callbacks). Build flags: `--use-port=emdawnwebgpu -sASYNCIFY
-  -std=c++20`.
+> Not yet exercised end-to-end: the dev GPU's Dawn/Vulkan driver doesn't expose
+> `shader-f16`, and the in-browser eval currently requests fp32. fp16 is built and
+> the fallback is correct; validating the fp16 GPU path needs a `shader-f16`
+> adapter (widely available in browsers). **Selective-fp32 heads** (keep the
+> policy/value heads + RMSNorm reductions in fp32 even in fp16 mode — a lesson
+> from KataGo's TensorRT FP16 path, which measured ~0.08% winrate error and
+> ~2.4× throughput) is the next fp16 refinement, gated on that validation.
 
-- **Goban demo** — `web/demo/index.html` is a playable board (WGo.js, vendored)
-  wired to an engine WASM module (`web/engine.cpp` → `web/demo/engine.{js,wasm}`)
-  that exposes `engineInit` / `engineInfluence` to JS. Placing stones runs our
-  real `conv2dNCHW` kernel on the GPU (N diffusion passes) and overlays a live
-  stone-influence map — driving the exact upload → dispatch → readback pipeline
-  the net eval will use. Build with `scripts/build-web.sh`, serve with
-  `scripts/serve-demo.sh`, open in Chrome/Edge.
+## Build & run
 
-> Could not run the *GPU* path in this environment: the headless server exposes no
-> WebGPU to the browser (`navigator.gpu` is undefined — the GPU's Vulkan driver
-> is incompatible for Chromium and SwiftShader-WebGPU didn't materialize either).
-> What *was* verified headless via `--dump-dom`: the demo page loads, the WGo
-> board renders (3 canvas layers), and the engine WASM loads + runs `engineInit`,
-> reporting `(no WebGPU adapter)` and degrading gracefully (board still works).
-> On a desktop WebGPU browser the influence overlay and `wasm_smoke`'s
-> `... PASS` line will appear. This is also where **fp16** and **selective-fp32
-> heads** finally become testable (browsers expose shader-f16).
-
-**Path to a slim eval-only WASM module** (the saigo.online target): compile the
-WebGPU backend + `desc.cpp` (model load, needs zlib via `-sUSE_ZLIB`) + the
-minimal `NNOutput`/`ModelDesc` types, behind a small C API
-(`evaluate(spatial, global) -> {policy, value}`) where **JS supplies the input
-feature tensors** (so we skip `game/` board+rules). Add `__EMSCRIPTEN__` guards
-for `AllowSpontaneous` at the RequestAdapter/Device/MapAsync call sites. This is
-far smaller than a full KataGo→WASM port (no search/GTP/command), and is the
-next concrete step.
-
-### Build recipe that works (proven on this machine)
-
-`scripts/build-webgpu.sh` encodes all of this; the points that mattered:
-- Dawn: `-DDAWN_BUILD_MONOLITHIC_LIBRARY=SHARED` (not `ON`), and disable
-  windowing for a headless compute build (`-DDAWN_USE_GLFW=OFF`,
-  `-DDAWN_USE_WAYLAND=OFF`, `-DDAWN_USE_X11=OFF`). Produces `libwebgpu_dawn.so`
-  + a `find_package(Dawn)` package.
-- KataGo: the backend TU needs **C++20** (Dawn's `webgpu_cpp.h` uses
-  requires-expressions). Scoped to just `webgpubackend.cpp` via
-  `set_source_files_properties(... -std=gnu++20)` — bumping the whole target
-  breaks KataGo's C++17 code (`fileutils.cpp` / `path::u8string()`).
-- Use the **standard** WebGPU API (`wgpu::CreateInstance` / `RequestAdapter` /
-  `RequestDevice` / `ProcessEvents`), not `dawn::native::` — the monolithic lib
-  only exports the standard API, and this path also works in-browser.
-- `wgpu::ShaderSourceWGSL` (not the older `ShaderModuleWGSLDescriptor`).
-- Callback lambdas must **not** be `noexcept` (Dawn's `CppFTraits` only
-  specializes the non-noexcept `operator()`).
-- Run with `LD_LIBRARY_PATH` including `third_party/dawn-install/lib`.
-
-## (historical) initial scaffold
-
-What is in place and real:
-
-- **Source vendored** — full KataGo at `cpp/` (this directory is the upstream
-  repo with its `.git` removed so it lives in the monorepo).
-- **Build wiring** — `cpp/CMakeLists.txt` has a `WEBGPU` branch:
-  - adds `neuralnet/webgpubackend.cpp` + `neuralnet/webgpukernels.cpp`
-  - finds Dawn via `find_package(Dawn)` (→ `dawn::webgpu_dawn`) or
-    `-DKATAGO_DAWN_DIR=<dir>`, and defines `USE_WEBGPU_BACKEND`.
-- **Backend plumbing** — `neuralnet/webgpubackend.cpp` implements the entire
-  `NeuralNet::` interface so the target links and runs:
-  - acquires a real native WebGPU device via Dawn, prefers a discrete GPU,
-    enumerates adapters (`printDevices`), compiles the WGSL module;
-  - loads the model with KataGo's normal `ModelDesc` parser;
-  - marshals MCTS inputs (spatial/global/meta, **with symmetry**) exactly like
-    the OpenCL backend.
-- **Starter kernels** — `neuralnet/webgpukernels.cpp` (WGSL): `conv2dNCHW`,
-  `scaleBiasMaskAct` (fused BN+act+mask), `addInPlace` (residual),
-  `matMulBiasAct`, `globalPoolMeanMax`. fp32, direct (no Winograd/fp16).
-- **Dispatch harness (Milestone 1)** — `webgpubackend.cpp` has the buffer
-  helpers, a per-entry-point pipeline cache, `wgDispatch`, and a blocking
-  `wgReadFloats` readback. **Written, not yet run** (needs the Dawn build).
-- **`testEvaluateConv` + `testEvaluateBatchNorm` (Milestones 2–3)** — wired to
-  `conv2dNCHW` / `scaleBiasMaskAct` (NCHW fp32 path). **Written, not yet
-  validated** — the moment Dawn is built, `katago runnnlayertests` checks them
-  against KataGo's own CPU reference.
-- **Build helper** — `scripts/build-webgpu.sh` fetches + builds Dawn, then
-  configures + builds KataGo against it.
-
-> ⚠️ The new C++/WGSL above is **unvalidated** until KataGo is built against
-> Dawn and `runnnlayertests` is run. Three Dawn API surfaces may need a one-line
-> tweak to match the pulled Dawn version (flagged `DAWN API NOTE` in the code):
-> the WGSL shader-source descriptor, the `MapAsync` callback signature, and
-> `OnSubmittedWorkDone`.
-
-What is deliberately **not** done (so we never feed wrong evals to the search):
-
-- `getOutput()` marshals inputs then **throws** — no forward pass yet.
-- `createComputeHandle()` **throws** for nets with nested-bottleneck or
-  transformer blocks (i.e. most modern b18/b28 nets); only plain + global-
-  pooling residual trunks are in scope for the first milestone.
-- `testEvaluate*` hooks return `false` (unimplemented).
-- No fp16, no Winograd/1x1 fast convs, no async readback batching, no tuner.
-
-> The honesty rule for this backend: **a throwing backend beats a wrong one.**
-> Every path either produces a validated-correct result or throws a clear error
-> pointing here.
-
-## How to build right now
+**Native (desktop GPU):**
 
 ```bash
-engines/katago-web/scripts/build-webgpu.sh        # fetches+builds Dawn, then KataGo
-# or, if you already have Dawn installed:
-cmake -S engines/katago-web/cpp -B build-webgpu \
-  -DUSE_BACKEND=WEBGPU -DNO_GIT_REVISION=1 \
-  -DKATAGO_DAWN_DIR=/path/to/dawn-install
-cmake --build build-webgpu -j
+scripts/build-webgpu.sh                          # fetches + builds Dawn, then KataGo
+./cpp/build-webgpu/katago runnnlayertests        # per-op validation vs CPU reference
 ```
 
-Building Dawn is the slow, heavy step (large download + long compile). The
-KataGo side is fast once Dawn exists.
+**Browser (WASM eval + goban demo):**
 
-## Roadmap (each milestone is independently validatable)
+```bash
+scripts/build-eval.sh        # -> web/demo/kataeval.{js,wasm} (needs emsdk, emcc >= 6)
+scripts/serve-demo-tls.sh    # serve over HTTPS, then open analyze.html in Chrome/Edge
+```
 
-The `testEvaluate*` hooks in `nninterface.h` exist precisely so each op can be
-checked numerically against the OpenCL/CUDA/Eigen backends in isolation. Do them
-in order; don't move on until the previous one matches to tolerance.
+WebGPU is a *secure-context* API — `navigator.gpu` only exists over `https://`
+or `localhost`, hence the TLS server (accept the self-signed cert once).
 
-1. **Device + dispatch harness.** ✅ **VALIDATED on GPU** — `wgDispatch` +
-   `wgReadFloats` + pipeline cache in `webgpubackend.cpp`, blocking
-   `ProcessEvents` readback. Proven by M2/M3 running through it.
-2. **`testEvaluateConv`** → ✅ **VALIDATED** — `conv2dNCHW`; 3 NCHW-fp32 configs
-   match the CPU reference (weight layout outC×inC×H×W + SAME padding correct).
-3. **`testEvaluateBatchNorm`** → ✅ **VALIDATED** — `scaleBiasMaskAct` with
-   host-folded `mergedScale`/`mergedBias` + mask; 2 NCHW-fp32 configs match.
-4. **`testEvaluateResidualBlock`** → conv → scaleBiasMaskAct → conv →
-   `addInPlace`.
-5. **`testEvaluateGlobalPoolingResidualBlock`** → `globalPoolMeanMax` +
-   `matMulBiasAct` broadcast-add. Confirm the size-scaled-mean formula matches
-   `openclkernels.cpp` exactly.
-6. **Trunk** — `initialConv`, iterate `trunk.blocks` (ordinary + gpool), trunk
-   tip BN+act. Mirror `struct Trunk` in `openclbackend.cpp`.
-7. **Policy head** — `p1Conv`/`g1Conv`/`g1BN`/gpool→bias/`p1BN`/`p2Conv` and the
-   pass logits (`gpoolToPassMul`/`Bias`). Mirror `struct PolicyHead`.
-8. **Value head** — `v1Conv`/`v1BN`/gpool/`v2`/`v3`/`sv3`/ownership conv. Mirror
-   `struct ValueHead`. Then **`getOutput`** writes real `NNOutput`s; remove the
-   throw. First full net eval — validate vs OpenCL on a known position.
-9. **Nested-bottleneck blocks** (`NESTED_BOTTLENECK_BLOCK_KIND`) — recurse the
-   block list. Then drop them from `assertSupportedArchitectureOrThrow`.
-10. **Transformer blocks** (attention + FFN, RoPE, RMSNorm) for b28-style nets.
-    Largest chunk; needs a matmul/softmax/attention kernel set.
-11. **Performance** — fp16 storage/compute (`shader-f16` feature, fp32 fallback),
-    Winograd 3×3, fused 1×1, persistent buffers, batch the readback.
-12. **Browser target** — compile with Emscripten `-sUSE_WEBGPU`; replace the
-    blocking readback with JSPI/Asyncify or a Web Worker. Kernels are unchanged.
+### Build gotchas worth knowing (encoded in the scripts)
 
-## Key source references (in `cpp/neuralnet/`)
+- Dawn: `-DDAWN_BUILD_MONOLITHIC_LIBRARY=SHARED`, windowing off
+  (`-DDAWN_USE_{GLFW,WAYLAND,X11}=OFF`) for a headless compute build.
+- The WebGPU TU needs **C++20** (`webgpu_cpp.h` uses requires-expressions);
+  KataGo's `fileutils.cpp` breaks under C++20 — so compile per-file (native CMake
+  scopes it via `set_source_files_properties`; the WASM build compiles per-file).
+- Use the **standard** WebGPU API (`CreateInstance`/`RequestAdapter`/`RequestDevice`),
+  not `dawn::native::` — same path works natively and in-browser.
+- Browser specifics: `-sASYNCIFY` + `emscripten_sleep(0)` to pump the event loop
+  (`wgPump`), `CallbackMode::AllowSpontaneous` for the callbacks, `-fexceptions`
+  at **link** (the CPU fallback relies on catching the no-adapter exception), and
+  a bigger `-sSTACK_SIZE` (Eigen's 19×19 tensors overflow the default).
+- half-float lib: `-DHALF_ENABLE_CPP11_CFENV=0` (Emscripten lacks the `FE_*` flags).
 
-- `nninterface.h` — the contract every backend implements.
-- `openclbackend.cpp` — closest reference (hand-written GPU kernels + host graph:
-  `struct Trunk`/`PolicyHead`/`ValueHead`/`Model`/`Buffers`).
-- `openclkernels.cpp` — the OpenCL kernels to port to WGSL.
-- `desc.h` — `ModelDesc`/`TrunkDesc`/layer descs and the `*_BLOCK_KIND` consts.
-- `activations.h` — `ACTIVATION_*` codes (kept in sync in the WGSL `activate()`).
+## Limits
+
+- **Nets**: modelVersion 8, plain-residual + global-pooling. Nested-bottleneck /
+  transformer (b18nbt/b28), RMSNorm trunks, and optimism policy
+  (`numPolicyChannels != 1`, modelVersion ≥ 12) are rejected with a clear error.
+- **Demo**: single-position analysis — no move history is fed yet, so ko/superko
+  and "the actual game" aren't modeled; score is approximate; 19×19, Tromp-Taylor.
+- **Perf**: direct convs (no Winograd yet); the bundled b6c96 is small and weak —
+  great for a fast demo, modest strength (its flat opening policy is genuine, and
+  reproduced identically on both backends).
+
+## Roadmap
+
+1. **Nested-bottleneck blocks** — recurse the block list; drop the guard. Unlocks
+   b18nbt nets.
+2. **Transformer blocks** (attention + FFN, RoPE, RMSNorm) + optimism policy —
+   for b28-style and modelVersion ≥ 12 nets. The largest chunk.
+3. **Winograd 3×3** — the main remaining conv speedup.
+4. **Selective-fp32 heads** + validate the fp16 GPU path on a `shader-f16` adapter.
+5. **Demo**: feed move history (ko/superko, real games), a stronger net (b10/b18),
+   and ownership/score polish.
+
+## Key source references (`cpp/`)
+
+- `neuralnet/nninterface.h` — the backend contract.
+- `neuralnet/webgpubackend.cpp`, `webgpukernels.cpp` — the WebGPU backend + WGSL.
+- `neuralnet/eigenbackend.cpp` — the CPU reference (and the WASM fallback backend).
+- `kataeval/` — the clean eval dependency (header + source manifest + dispatcher).
+- `neuralnet/desc.h` — `ModelDesc`/`TrunkDesc`/layer descs, `*_BLOCK_KIND` consts.
