@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>saiGo · WebGPU engine + goban</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 24px;
+         display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-start; }
+  h1 { font-size: 19px; margin: 0 0 4px; }
+  #boardWrap { position: relative; display: inline-block; }
+  /* WGo stacks its board canvases up to z-index 200; the overlay must sit above
+     them (translucent) or it's drawn behind the board and never seen. */
+  #overlay { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 500; }
+  .panel { max-width: 340px; }
+  .row { margin: 10px 0; }
+  code, .mono { font-family: ui-monospace, monospace; }
+  .status { padding: 8px 10px; border-radius: 8px; background: #8883; }
+  .ok { color: #1a8917; } .bad { color: #c0392b; }
+  button { font: inherit; padding: 5px 10px; border-radius: 6px; cursor: pointer; }
+  .muted { opacity: .7; font-size: 13px; }
+  input[type=range] { vertical-align: middle; }
+</style>
+</head>
+<body>
+  <div>
+    <h1>saiGo · goban + in-browser WebGPU engine</h1>
+    <div class="muted">Click to place stones. The shaded overlay is a stone-influence map
+      computed on the GPU by our actual KataGo <code>conv2dNCHW</code> WGSL kernel
+      (compiled to WASM via Dawn / emdawnwebgpu).</div>
+    <div id="boardWrap">
+      <div id="board"></div>
+      <canvas id="overlay"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row status" id="engineStatus">engine: starting…</div>
+    <div class="row">Adapter: <span class="mono" id="adapter">—</span></div>
+    <div class="row">
+      <label><input type="checkbox" id="showInfluence" checked> show GPU influence overlay</label>
+    </div>
+    <div class="row">
+      diffusion passes: <input type="range" id="passes" min="1" max="24" value="10">
+      <span id="passesVal" class="mono">10</span>
+    </div>
+    <div class="row">
+      <button id="clear">Clear board</button>
+      <button id="pass">Pass / swap colour</button>
+    </div>
+    <div class="row muted" id="timing">—</div>
+    <div class="row muted">
+      This proves the full upload → GPU dispatch → readback pipeline in the browser.
+      Swapping the influence kernel for the real policy/value net is the next step
+      (slim eval-only WASM target — see <span class="mono">WEBGPU_STATUS.md</span>).
+    </div>
+  </div>
+
+<script src="vendor/wgo.min.js"></script>
+<script src="engine.js"></script>
+<script>
+(async function () {
+  const N = 9, HW = N * N, BOARD_PX = 480;
+  const statusEl = document.getElementById('engineStatus');
+  const adapterEl = document.getElementById('adapter');
+  const timingEl  = document.getElementById('timing');
+  const passesEl  = document.getElementById('passes');
+  const passesVal = document.getElementById('passesVal');
+  const showEl    = document.getElementById('showInfluence');
+
+  // --- goban (WGo.js) ---
+  const board = new WGo.Board(document.getElementById('board'), { size: N, width: BOARD_PX });
+  const grid = Array.from({ length: N }, () => new Array(N).fill(0)); // +1 black, -1 white, 0 empty
+  let toPlay = WGo.B;
+
+  // overlay canvas aligned to WGo's board canvas
+  const overlay = document.getElementById('overlay');
+  const octx = overlay.getContext('2d');
+  function syncOverlaySize() {
+    const c = document.querySelector('#board canvas');
+    if (!c) return;
+    overlay.width = c.width; overlay.height = c.height;
+    overlay.style.width = c.style.width || (c.width + 'px');
+    overlay.style.height = c.style.height || (c.height + 'px');
+    overlay.style.left = c.offsetLeft + 'px';
+    overlay.style.top = c.offsetTop + 'px';
+  }
+  syncOverlaySize();
+
+  // --- engine (WASM/WebGPU) ---
+  let Module = null, boardPtr = 0, outPtr = 0, ready = false;
+  try {
+    Module = await createEngine();
+    boardPtr = Module._malloc(HW * 4);
+    outPtr = Module._malloc(HW * 4);
+    const ok = await Module.ccall('engineInit', 'number', [], [], { async: true });
+    const name = Module.ccall('engineDeviceName', 'string', [], []);
+    adapterEl.textContent = name;
+    if (ok) {
+      ready = true;
+      statusEl.innerHTML = 'engine: <span class="ok">ready</span> (WebGPU)';
+    } else {
+      statusEl.innerHTML = 'engine: <span class="bad">no WebGPU</span> — board still works';
+    }
+  } catch (e) {
+    statusEl.innerHTML = 'engine: <span class="bad">failed to load</span> (' + e + ')';
+  }
+
+  // --- influence compute + overlay ---
+  async function updateInfluence() {
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    if (!ready || !showEl.checked) { timingEl.textContent = ready ? 'overlay hidden' : 'engine not ready'; return; }
+    // flatten board NCHW (row-major y,x)
+    const ints = new Int32Array(HW);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) ints[y * N + x] = grid[x][y];
+    Module.HEAP32.set(ints, boardPtr >> 2);
+    const passes = parseInt(passesEl.value, 10);
+    const t0 = performance.now();
+    await Module.ccall('engineInfluence', null,
+      ['number', 'number', 'number', 'number'], [boardPtr, N, outPtr, passes], { async: true });
+    const dt = (performance.now() - t0).toFixed(1);
+    const infl = Module.HEAPF32.subarray(outPtr >> 2, (outPtr >> 2) + HW);
+    let maxAbs = 1e-6;
+    for (let i = 0; i < HW; i++) maxAbs = Math.max(maxAbs, Math.abs(infl[i]));
+    const sr = board.stoneRadius || (BOARD_PX / (N + 1)) / 2;
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      const v = infl[y * N + x] / maxAbs;          // -1..1
+      if (Math.abs(v) < 0.04) continue;
+      const cx = board.getX(x), cy = board.getY(y);
+      octx.fillStyle = v > 0 ? `rgba(20,20,20,${Math.min(0.55, Math.abs(v) * 0.55)})`
+                             : `rgba(245,245,245,${Math.min(0.6, Math.abs(v) * 0.6)})`;
+      octx.fillRect(cx - sr, cy - sr, sr * 2, sr * 2);
+    }
+    timingEl.textContent = `GPU influence (${passes} conv passes) in ${dt} ms`;
+  }
+
+  // --- interaction ---
+  board.addEventListener('click', (x, y) => {
+    if (x < 0 || y < 0 || x >= N || y >= N) return;
+    if (grid[x][y] !== 0) { board.removeObjectsAt(x, y); grid[x][y] = 0; }
+    else { board.addObject({ x, y, c: toPlay }); grid[x][y] = (toPlay === WGo.B ? 1 : -1); toPlay = (toPlay === WGo.B ? WGo.W : WGo.B); }
+    syncOverlaySize();
+    updateInfluence();
+  });
+  document.getElementById('clear').onclick = () => {
+    board.removeAllObjects();
+    for (let x = 0; x < N; x++) grid[x].fill(0);
+    toPlay = WGo.B; syncOverlaySize(); updateInfluence();
+  };
+  document.getElementById('pass').onclick = () => { toPlay = (toPlay === WGo.B ? WGo.W : WGo.B); };
+  passesEl.oninput = () => { passesVal.textContent = passesEl.value; updateInfluence(); };
+  showEl.onchange = updateInfluence;
+  window.addEventListener('resize', () => { syncOverlaySize(); updateInfluence(); });
+
+  updateInfluence();
+})();
+</script>
+</body>
+</html>

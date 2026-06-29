@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>saiGo · offline KataGo (analyze + play)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 22px; display: flex; gap: 26px; flex-wrap: wrap; align-items: flex-start; }
+  h1 { font-size: 19px; margin: 0 0 6px; }
+  #boardWrap { position: relative; display: inline-block; }
+  #overlay { position: absolute; left: 0; top: 0; pointer-events: none; z-index: 500; }
+  .panel { width: 300px; }
+  .row { margin: 10px 0; }
+  .mono { font-family: ui-monospace, monospace; }
+  .status { padding: 8px 10px; border-radius: 8px; background: #8883; }
+  .ok { color: #1a8917; } .bad { color: #c0392b; }
+  button { font: inherit; padding: 6px 11px; border-radius: 6px; cursor: pointer; margin: 2px 0; }
+  .muted { opacity: .72; font-size: 13px; }
+  .bar { height: 26px; border-radius: 6px; overflow: hidden; display: flex; border: 1px solid #8884; }
+  .bar .b { background: #111; } .bar .w { background: #eee; }
+  .bar span { color: transparent; }
+  .wr { display: flex; justify-content: space-between; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div>
+    <h1>saiGo · offline KataGo — analyze &amp; play</h1>
+    <div class="muted">b6c96 net, evaluated entirely in your browser on WebGPU (no server).
+      Click to place stones; the overlay shows the policy (move probabilities) and the
+      win-rate bar updates. "Engine plays" makes KataGo take its top move.</div>
+    <div id="boardWrap" style="margin-top:10px;">
+      <div id="board"></div>
+      <canvas id="overlay"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row status" id="status">loading engine…</div>
+    <div class="row">
+      <div class="wr"><span>Black <span id="bwr">–</span></span><span><span id="wwr">–</span> White</span></div>
+      <div class="bar"><div class="b" id="barB" style="width:50%">.</div><div class="w" id="barW" style="width:50%">.</div></div>
+    </div>
+    <div class="row">Best move: <span class="mono" id="best">–</span> · Score: <span class="mono" id="score">–</span></div>
+    <div class="row">To move: <span class="mono" id="tomove">Black</span> · Eval: <span class="mono" id="evtime">–</span></div>
+    <div class="row">
+      <button id="play">Engine plays ▶</button>
+      <button id="pass">Pass</button>
+      <button id="clear">Clear</button>
+      <label style="margin-left:6px;"><input type="checkbox" id="owner"> ownership</label>
+    </div>
+    <div class="row muted" id="adapter">adapter: –</div>
+    <div class="row muted">Powered by <span class="mono">kataeval</span> (cpp/kataeval) — the clean
+      KataGo-eval dependency compiled to WASM. Same forward pass that's validated byte-identical
+      to the Eigen CPU backend natively.</div>
+  </div>
+
+<script src="vendor/wgo.min.js"></script>
+<script src="kataeval.js"></script>
+<script>
+(async function () {
+  const N = 19, HW = N * N, BOARD_PX = 600;
+  const $ = id => document.getElementById(id);
+  const board = new WGo.Board($('board'), { size: N, width: BOARD_PX });
+  const grid = Array.from({ length: N }, () => new Array(N).fill(0)); // 1 black, 2 white
+  let toPlay = 1;  // 1 black, 2 white
+  const overlay = $('overlay'), octx = overlay.getContext('2d');
+  function syncOverlay() {
+    const c = document.querySelector('#board canvas'); if (!c) return;
+    overlay.width = c.width; overlay.height = c.height;
+    overlay.style.width = (c.style.width || c.width + 'px'); overlay.style.height = (c.style.height || c.height + 'px');
+    overlay.style.left = c.offsetLeft + 'px'; overlay.style.top = c.offsetTop + 'px';
+  }
+  syncOverlay();
+
+  // helpers / state declared before the load block (which calls analyze()).
+  const idx = (x, y) => y * N + x;
+  function softmax(arr) { let m = -1e30; for (const v of arr) m = Math.max(m, v); let s = 0; const o = arr.map(v => { const e = Math.exp(v - m); s += e; return e; }); return o.map(v => v / s); }
+  let lastPolicy = null, lastBest = -1;
+
+  // --- load engine + model ---
+  let M = null, ready = false, sPtr, pPtr, vPtr, oPtr;
+  try {
+    M = await createKata();
+    if (new URLSearchParams(location.search).has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
+    $('status').textContent = 'fetching model…';
+    const bytes = new Uint8Array(await (await fetch('model.bin.gz')).arrayBuffer());
+    M.FS.writeFile('/model.bin.gz', bytes);
+    $('status').textContent = 'initializing engine (WebGPU, else CPU)…';
+    const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
+    if (!ok) { $('status').innerHTML = 'engine: <span class="bad">load failed</span> — ' + M.ccall('kgeError','string',[],[]); return; }
+    sPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
+    ready = true;
+    const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen fallback)';
+    $('status').innerHTML = 'engine: <span class="ok">ready</span> · KataGo b6c96 on ' + backend;
+    $('adapter').textContent = 'backend: ' + backend + ' · add ?cpu to URL to force CPU';
+    await analyze();
+  } catch (e) { $('status').innerHTML = 'engine: <span class="bad">error</span> — ' + e; return; }
+
+  async function analyze() {
+    if (!ready) return;
+    const stones = new Int32Array(HW);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) stones[idx(x, y)] = grid[x][y];
+    M.HEAP32.set(stones, sPtr >> 2);
+    const t0 = performance.now();
+    const ok = await M.ccall('kgeEval', 'number',
+      ['number','number','number','number','number','number'],
+      [sPtr, toPlay, 7.5, pPtr, vPtr, $('owner').checked ? oPtr : 0], { async: true });
+    if (!ok) { $('status').innerHTML = 'eval failed: ' + M.ccall('kgeError','string',[],[]); return; }
+    const dt = (performance.now() - t0).toFixed(0);
+    const pol = M.HEAPF32.subarray(pPtr >> 2, (pPtr >> 2) + HW + 1);
+    const val = M.HEAPF32.subarray(vPtr >> 2, (vPtr >> 2) + 5);
+
+    // value: white-perspective softmax(win,loss,noResult)
+    const [pWin, pLoss] = softmax([val[0], val[1], val[2]]);
+    const wWhite = pWin * 100, wBlack = pLoss * 100;
+    $('wwr').textContent = wWhite.toFixed(1) + '%'; $('bwr').textContent = wBlack.toFixed(1) + '%';
+    $('barW').style.width = wWhite + '%'; $('barB').style.width = wBlack + '%';
+    $('score').textContent = (val[3] * 20).toFixed(1) + ' (W)';  // raw*~20 -> points (approx)
+    $('evtime').textContent = dt + ' ms';
+    $('tomove').textContent = toPlay === 1 ? 'Black' : 'White';
+
+    // policy: softmax over legal (empty) points + pass
+    const legalLogits = [], legalPos = [];
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (grid[x][y] === 0) { legalLogits.push(pol[idx(x, y)]); legalPos.push(idx(x, y)); }
+    legalLogits.push(pol[HW]); legalPos.push(HW); // pass
+    const probs = softmax(legalLogits);
+    lastPolicy = new Float32Array(HW + 1);
+    let best = -1, bestP = -1;
+    for (let i = 0; i < legalPos.length; i++) { lastPolicy[legalPos[i]] = probs[i]; if (probs[i] > bestP) { bestP = probs[i]; best = legalPos[i]; } }
+    lastBest = best;
+    $('best').textContent = best === HW ? `pass (${(bestP*100).toFixed(1)}%)`
+      : `${'ABCDEFGHJKLMNOPQRST'[best % N]}${N - Math.floor(best / N)} (${(bestP*100).toFixed(1)}%)`;
+
+    drawOverlay(pol, val);
+  }
+
+  function drawOverlay(pol, val) {
+    syncOverlay(); octx.clearRect(0, 0, overlay.width, overlay.height);
+    const sr = board.stoneRadius;
+    // ownership tint
+    if ($('owner').checked) {
+      const own = M.HEAPF32.subarray(oPtr >> 2, (oPtr >> 2) + HW);
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+        const v = own[idx(x, y)]; if (Math.abs(v) < 0.05) continue;
+        octx.fillStyle = v > 0 ? `rgba(20,20,20,${Math.min(.45, v*.45)})` : `rgba(240,240,240,${Math.min(.5, -v*.5)})`;
+        octx.fillRect(board.getX(x) - sr, board.getY(y) - sr, sr*2, sr*2);
+      }
+    }
+    // policy dots on empty points
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+      if (grid[x][y] !== 0) continue;
+      const p = lastPolicy ? lastPolicy[idx(x, y)] : 0; if (p < 0.002) continue;
+      const r = Math.max(2, Math.min(sr * 0.95, sr * Math.sqrt(p) * 2.2));
+      octx.beginPath(); octx.arc(board.getX(x), board.getY(y), r, 0, 7);
+      octx.fillStyle = (idx(x, y) === lastBest) ? 'rgba(40,140,250,0.85)' : 'rgba(40,140,250,0.40)';
+      octx.fill();
+    }
+  }
+
+  function placeStone(x, y) {
+    board.addObject({ x, y, c: toPlay === 1 ? WGo.B : WGo.W });
+    grid[x][y] = toPlay; toPlay = toPlay === 1 ? 2 : 1;
+  }
+
+  board.addEventListener('click', (x, y) => {
+    if (x < 0 || y < 0 || x >= N || y >= N || grid[x][y] !== 0) return;
+    placeStone(x, y); analyze();
+  });
+  $('play').onclick = async () => {
+    if (!ready || lastBest < 0) return;
+    if (lastBest === HW) { toPlay = toPlay === 1 ? 2 : 1; await analyze(); return; }
+    placeStone(lastBest % N, Math.floor(lastBest / N)); await analyze();
+  };
+  $('pass').onclick = async () => { toPlay = toPlay === 1 ? 2 : 1; await analyze(); };
+  $('clear').onclick = async () => { board.removeAllObjects(); for (let x = 0; x < N; x++) grid[x].fill(0); toPlay = 1; await analyze(); };
+  $('owner').onchange = analyze;
+  window.addEventListener('resize', () => { syncOverlay(); if (lastPolicy) drawOverlay(); });
+})();
+</script>
+</body>
+</html>

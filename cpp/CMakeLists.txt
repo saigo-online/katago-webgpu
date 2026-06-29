@@ -44,7 +44,7 @@ endif()
 set(BUILD_DISTRIBUTED 0 CACHE BOOL "Build with http support for contributing to distributed training")
 set(USE_BACKEND CACHE STRING "Neural net backend")
 string(TOUPPER "${USE_BACKEND}" USE_BACKEND)
-set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL)
+set_property(CACHE USE_BACKEND PROPERTY STRINGS "" CUDA TENSORRT OPENCL EIGEN METAL WEBGPU)
 
 set(USE_TCMALLOC 0 CACHE BOOL "Use TCMalloc")
 set(NO_GIT_REVISION 0 CACHE BOOL "Disable embedding the git revision into the compiled exe")
@@ -163,6 +163,19 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
   endif()
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/eigenbackend.cpp
+    )
+elseif(USE_BACKEND STREQUAL "WEBGPU")
+  # ----------------------------------------------------------------------------
+  # Native WebGPU backend (via Dawn). SCAFFOLD — see engines/katago-web/WEBGPU_STATUS.md.
+  # "Native" means it runs against Dawn's webgpu-native implementation on the
+  # desktop GPU; the exact same WGSL kernels are intended to also run in-browser
+  # once compiled with Emscripten (-sUSE_WEBGPU). The kernel port is in progress;
+  # this build links and runs the plumbing, and throws loudly where kernels are
+  # not yet ported rather than returning wrong NN outputs.
+  message(STATUS "-DUSE_BACKEND=WEBGPU, using native WebGPU (Dawn) backend. [scaffold — see WEBGPU_STATUS.md]")
+  set(NEURALNET_BACKEND_SOURCES
+    neuralnet/webgpubackend.cpp
+    neuralnet/webgpukernels.cpp
     )
 elseif(USE_BACKEND STREQUAL "")
   message(WARNING "${ColorBoldRed}WARNING: Using dummy neural net backend, intended for non-neural-net testing only, will fail on any code path requiring a neural net. To use neural net, specify -DUSE_BACKEND=CUDA or -DUSE_BACKEND=TENSORRT or -DUSE_BACKEND=OPENCL or -DUSE_BACKEND=EIGEN to compile with the respective backend.${ColorReset}")
@@ -530,6 +543,36 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
       include_directories(SYSTEM ${EIGEN3_INCLUDE_DIRS})
       message(STATUS "Found Eigen3 at ${EIGEN3_INCLUDE_DIRS}")
     endif()
+  endif()
+elseif(USE_BACKEND STREQUAL "WEBGPU")
+  target_compile_definitions(katago PRIVATE USE_WEBGPU_BACKEND)
+  # Dawn's generated webgpu_cpp.h needs C++20 (requires-expressions in its
+  # callback machinery). Scope C++20 to just this TU — bumping the whole target
+  # breaks KataGo's C++17 code (e.g. fileutils.cpp relies on path::u8string()
+  # returning std::string, which changes to std::u8string under C++20). The
+  # later -std flag wins over the target's -std=gnu++17.
+  set_source_files_properties(neuralnet/webgpubackend.cpp PROPERTIES COMPILE_OPTIONS "-std=gnu++20")
+  # Dawn (native WebGPU). Expect it either installed as a CMake package
+  # (find_package(Dawn) -> dawn::webgpu_dawn) or pre-built and pointed at via
+  # -DKATAGO_DAWN_DIR=<dir> (containing include/ and the webgpu_dawn library).
+  # engines/katago-web/scripts/build-webgpu.sh sets this up for you.
+  set(KATAGO_DAWN_DIR "" CACHE PATH "Path to a built/installed Dawn (with include/ headers and the webgpu_dawn library)")
+  find_package(Dawn QUIET)
+  if(Dawn_FOUND)
+    message(STATUS "Found Dawn CMake package; linking dawn::webgpu_dawn")
+    target_link_libraries(katago dawn::webgpu_dawn)
+  elseif(EXISTS "${KATAGO_DAWN_DIR}")
+    message(STATUS "Using KATAGO_DAWN_DIR=${KATAGO_DAWN_DIR}")
+    target_include_directories(katago SYSTEM PRIVATE "${KATAGO_DAWN_DIR}/include")
+    find_library(KATAGO_WEBGPU_DAWN_LIB
+      NAMES webgpu_dawn dawn dawn_native
+      HINTS "${KATAGO_DAWN_DIR}/lib" "${KATAGO_DAWN_DIR}/lib64" "${KATAGO_DAWN_DIR}")
+    if(NOT KATAGO_WEBGPU_DAWN_LIB)
+      message(FATAL_ERROR "WebGPU backend: could not find a Dawn/webgpu_dawn library under KATAGO_DAWN_DIR=${KATAGO_DAWN_DIR}. Run engines/katago-web/scripts/build-webgpu.sh first.")
+    endif()
+    target_link_libraries(katago ${KATAGO_WEBGPU_DAWN_LIB})
+  else()
+    message(FATAL_ERROR "WebGPU backend selected but Dawn was not found.\n  Build Dawn with engines/katago-web/scripts/build-webgpu.sh and re-run cmake with one of:\n    -DCMAKE_PREFIX_PATH=<dawn-install-prefix>   (so find_package(Dawn) works), or\n    -DKATAGO_DAWN_DIR=<dir with include/ and webgpu_dawn lib>")
   endif()
 endif()
 

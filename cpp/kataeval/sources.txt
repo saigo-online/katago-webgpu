@@ -1,0 +1,47 @@
+# kataeval — minimal KataGo source set for neural-net evaluation (WebGPU backend).
+# This is the single source of truth for the dependency's contents: one path per
+# line, relative to cpp/. Read by both kataeval/CMakeLists.txt (native) and
+# scripts/build-eval.sh (WASM). No search / GTP / command/ — just model load,
+# input features, and the WebGPU forward pass.
+#
+# Dual backend in one binary: kataeval/backend_gpu.cpp (WebGPU, C++20) and
+# kataeval/backend_cpu.cpp (Eigen, needs -DUSE_EIGEN_BACKEND + eigen3 headers)
+# are renamed into separate namespaces; kataeval/dispatch.cpp routes NeuralNet::
+# to one, trying WebGPU then falling back to CPU. backend_gpu.cpp #includes
+# webgpubackend.cpp (so don't list it directly); likewise backend_cpu.cpp.
+
+kataeval/backend_gpu.cpp
+kataeval/backend_cpu.cpp
+kataeval/dispatch.cpp
+neuralnet/webgpukernels.cpp
+neuralnet/desc.cpp
+neuralnet/modelversion.cpp
+neuralnet/nneval.cpp
+neuralnet/nninputs.cpp
+neuralnet/sgfmetadata.cpp
+neuralnet/debugprint.cpp
+
+game/board.cpp
+game/boardhistory.cpp
+game/rules.cpp
+game/graphhash.cpp
+
+core/global.cpp
+core/hash.cpp
+core/rand.cpp
+core/rand_helpers.cpp
+core/sha2.cpp
+core/base64.cpp
+core/fileutils.cpp
+core/config_parser.cpp
+core/logger.cpp
+core/fancymath.cpp
+core/timer.cpp
+core/datetime.cpp
+core/md5.cpp
+core/makedir.cpp
+core/bsearch.cpp
+core/commandloop.cpp
+core/multithread.cpp
+
+kataeval/kataeval.cpp

@@ -91,3 +91,28 @@ cpp/build.ninja
 cpp/KataGoSwift.*
 cpp/include/KataGoSwift/KataGoSwift-swift.h
 cpp/external/katagocoreml/proto/
+
+# ============================================================================
+# katago-web: WebGPU backend + browser build artifacts (keep the repo lean)
+# NOTE: .gitignore has no inline comments — keep comments on their own lines.
+# ============================================================================
+# Dawn source/build/install (~GBs; built by scripts/build-webgpu.sh)
+third_party/
+# native builds
+cpp/build-webgpu/
+cpp/build-eigen/
+cpp/build-wasm/
+node_modules/
+# generated web artifacts (built by scripts/build-web.sh / build-eval.sh)
+web/dist/
+web/demo/engine.js
+web/demo/engine.wasm
+web/demo/kataeval.js
+web/demo/kataeval.wasm
+web/demo/kataeval.wasm.map
+web/demo/*_dbg.*
+# self-signed TLS certs from serve-demo-tls.sh
+web/.certs/
+# neural net weights — re-bundled by build-eval.sh, don't commit the blob
+web/demo/model.bin.gz
+
