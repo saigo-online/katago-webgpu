@@ -90,6 +90,7 @@
       <div>time</div><div id="m_time">–</div>
       <div>threads</div><div id="m_threads">–</div>
       <div>tree</div><div id="m_reuse">–</div>
+      <div>memory</div><div id="m_mem">–</div>
     </div>
     <div class="muted">principal variation</div>
     <div class="row mono" id="m_pv" style="min-height:3.4em;">–</div>
@@ -108,8 +109,11 @@
 (async function () {
   const N = 19, HW = N * N, BOARD_PX = 600;
   const $ = id => document.getElementById(id);
-  const board = new WGo.Board($('board'), { size: N, width: BOARD_PX });
-  const pvBoard = new WGo.Board($('pvboard'), { size: N, width: 360 });
+  // WGo treats a '#'-prefixed background as a CSS color (no image) — avoids the missing
+  // wood1.jpg texture (which 404s -> black board). A warm goban tone instead.
+  const WOOD = '#e8c887';
+  const board = new WGo.Board($('board'), { size: N, width: BOARD_PX, background: WOOD });
+  const pvBoard = new WGo.Board($('pvboard'), { size: N, width: 360, background: WOOD });
   // Render the engine's principal variation on the 2nd board: current stones, then the
   // PV played out as numbered, alternating moves from the side to move (its read-ahead).
   function renderPV(pv) {
@@ -325,6 +329,7 @@
     $('m_time').textContent = r.ms.toLocaleString() + ' ms';
     $('m_threads').textContent = threads;
     $('m_reuse').textContent = r.reused ? 'reused ✓' : 'fresh';
+    if (r.mem) $('m_mem').textContent = (r.mem / 1048576).toFixed(0) + ' MB';
     $('m_pv').textContent = r.pv.map(ptName).join(' ') || '–';
   }
   async function kataThink() {

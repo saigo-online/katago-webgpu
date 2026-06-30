@@ -23,6 +23,7 @@
 #include "../neuralnet/modelversion.h"
 #ifdef KGE_THREADS
 #include <utility>
+#include <atomic>
 #include "../core/logger.h"
 #include "../search/search.h"
 #include "../search/asyncbot.h"
@@ -475,9 +476,13 @@ static bool ensureKataEngine() {
   return true;
 }
 
-// Stop any background ponder so the engine is idle for a fresh request.
+// Stop any running search/ponder so the engine is idle for a fresh request.
+static std::atomic<bool> gSearchDone{true};
+static Loc gSearchBestLoc = Board::NULL_LOC;
+static Player gPollPla = P_BLACK;
+static int gPollReused = 0;
 static void stopPonder() {
-  if(gBot != nullptr && gPondering) { gBot->stopAndWait(); gPondering = false; }
+  if(gBot != nullptr) { gBot->stopAndWait(); gPondering = false; gSearchDone = true; }
 }
 
 static int locToIdx(Loc loc) {
@@ -603,25 +608,20 @@ KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int 
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 
-// ---- Chunked search: live, upticking stats -------------------------------------
-// The UI wants to WATCH the engine think. genMoveSynchronous blocks until done, so we
-// expose it in slices: kgeSearchSetup positions the bot (with tree reuse), then each
-// kgeSearchStep(visitTarget) searches up to that cumulative target and returns the
-// current stats. Because setParamsNoClearing keeps the tree, raising the target each
-// call just deepens it — so the worker can step (chunk by chunk) and stream visits/PV/
-// win-rate as they climb, and keep stepping past the target to "ponder".
-static Player gStepPla = P_BLACK;
-static int gStepThreads = 1;
-static int gStepReused = 0;
-
-KATAEVAL_EXPORT int kgeSearchSetup(const int* moveLocs, const int* moveCols, int numMoves,
-                                   int toPla, double komi, int numSearchThreads) {
+// ---- Async search with live polling --------------------------------------------
+// To WATCH the engine think, start the search asynchronously (genMoveAsync runs it on
+// the bot's threads, non-blocking) and let the worker poll kgePoll to stream live,
+// monotonically-climbing stats. When it finishes, kgePonderBegin starts a REAL
+// background ponder() that keeps deepening the SAME tree — so visits genuinely climb
+// during ponder too. One continuous search per phase (no per-slice restarts).
+KATAEVAL_EXPORT int kgeSearchBegin(const int* moveLocs, const int* moveCols, int numMoves,
+                                   int toPla, double komi, int maxVisits, double maxTimeMs,
+                                   int numSearchThreads) {
   if(gModel == nullptr) { gErr = "not loaded"; return 0; }
   try {
     if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
     stopPonder();
-    gStepPla = (Player)toPla;
-    gStepThreads = numSearchThreads > 0 ? numSearchThreads : 1;
+    gPollPla = (Player)toPla;
     std::vector<std::pair<Loc,Player>> newLine;
     for(int i = 0; i < numMoves; i++) newLine.push_back({ decodeLoc(moveLocs[i]), (Player)moveCols[i] });
     size_t common = 0;
@@ -635,30 +635,42 @@ KATAEVAL_EXPORT int kgeSearchSetup(const int* moveLocs, const int* moveCols, int
     if(!reused) {
       Board board; BoardHistory hist;
       replayLine(moveLocs, moveCols, numMoves, komi, board, hist);
-      gBot->setPosition(gStepPla, board, hist);
+      gBot->setPosition(gPollPla, board, hist);
     }
     gBotLine = newLine;
-    gStepReused = reused ? 1 : 0;
+    gPollReused = reused ? 1 : 0;
+
+    SearchParams params = SearchParams::basicDecentParams();
+    params.maxVisits = maxVisits; params.maxPlayouts = maxVisits;
+    params.maxTime = maxTimeMs / 1000.0;
+    params.maxVisitsPondering = 1000000000; params.maxTimePondering = 1e20;  // ponder runs until stopped
+    params.numThreads = numSearchThreads > 0 ? numSearchThreads : 1;
+    gBot->setParamsNoClearing(params);
+
+    gSearchDone = false;
+    gSearchBestLoc = Board::NULL_LOC;
+    gBot->genMoveAsync(gPollPla, 0, TimeControls(), 1.0, [](Loc loc, int, Search*) {
+      gSearchBestLoc = loc; gSearchDone = true;
+    });
     return 1;
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 
-KATAEVAL_EXPORT int kgeSearchStep(int visitTarget, int* bestOut, float* winrateOut, float* scoreOut,
-                                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut) {
+// Read current search/ponder stats — safe while the search threads run (KataGo's own
+// live analysis reads this way). doneOut=1 once the async move callback has fired.
+KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
+                            int* pvOut, int pvCap, int* pvLenOut, int* visitsOut,
+                            int* doneOut, int* reusedOut) {
   if(gBot == nullptr) { gErr = "no engine"; return 0; }
   try {
-    SearchParams params = SearchParams::basicDecentParams();
-    params.maxVisits = visitTarget; params.maxPlayouts = visitTarget; params.maxTime = 1e20;
-    params.numThreads = gStepThreads;
-    gBot->setParamsNoClearing(params);  // raise the ceiling, keep the tree -> deepen
-    Loc best = gBot->genMoveSynchronous(gStepPla, TimeControls());
-    if(bestOut) *bestOut = locToIdx(best);
     const Search* s = gBot->getSearch();
     ReportedSearchValues vals;
     if(s->getRootValues(vals)) {
-      if(winrateOut) *winrateOut = (float)((gStepPla == P_WHITE) ? vals.winValue : vals.lossValue);
-      if(scoreOut)   *scoreOut   = (float)((gStepPla == P_WHITE) ? vals.lead : -vals.lead);
+      if(winrateOut) *winrateOut = (float)((gPollPla == P_WHITE) ? vals.winValue : vals.lossValue);
+      if(scoreOut)   *scoreOut   = (float)((gPollPla == P_WHITE) ? vals.lead : -vals.lead);
       if(visitsOut)  *visitsOut  = (int)vals.visits;
+    } else {
+      if(winrateOut) *winrateOut = 0.5f; if(scoreOut) *scoreOut = 0.0f; if(visitsOut) *visitsOut = 0;
     }
     int pvLen = 0;
     if(pvOut && pvCap > 0) {
@@ -666,10 +678,25 @@ KATAEVAL_EXPORT int kgeSearchStep(int visitTarget, int* bestOut, float* winrateO
       if(s->getRootNode() != NULL) s->appendPV(pvBuf, vb, eb, sl, sv, s->getRootNode(), pvCap);
       for(size_t i = 0; i < pvBuf.size() && pvLen < pvCap; i++) pvOut[pvLen++] = locToIdx(pvBuf[i]);
     }
+    bool done = gSearchDone.load();
+    if(bestOut) *bestOut = done ? locToIdx(gSearchBestLoc) : (pvLen > 0 ? pvOut[0] : -1);
     if(pvLenOut) *pvLenOut = pvLen;
-    if(reusedOut) *reusedOut = gStepReused;
+    if(doneOut) *doneOut = done ? 1 : 0;
+    if(reusedOut) *reusedOut = gPollReused;
     return 1;
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
+}
+
+KATAEVAL_EXPORT int kgePonderBegin() {  // real background ponder; poll to watch it climb
+  if(gBot == nullptr) { gErr = "no engine"; return 0; }
+  try { gBot->ponder(); gPondering = true; return 1; }
+  catch(const std::exception& e) { gErr = e.what(); return 0; }
+}
+
+KATAEVAL_EXPORT int kgeStopSearch() {  // stop search/ponder before a new request
+  if(gBot == nullptr) return 1;
+  try { gBot->stopAndWait(); gPondering = false; gSearchDone = true; return 1; }
+  catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 #endif  // KGE_THREADS
 

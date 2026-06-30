@@ -26,7 +26,7 @@ async function cachedNet(url) {
   if (cache) { try { await cache.put(url, res.clone()); } catch (_) {} }
   return await res.arrayBuffer();
 }
-let mlPtr, mcPtr, bmPtr, wrPtr, scPtr, pvPtr, pvlPtr, visPtr, reusedPtr;  // search buffers
+let mlPtr, mcPtr, bmPtr, wrPtr, scPtr, pvPtr, pvlPtr, visPtr, reusedPtr, donePtr;  // search buffers
 let bPtr, pPtr, vPtr, oPtr;                             // analysis (kgeEvalSeqKata) buffers
 
 async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
@@ -55,7 +55,7 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
   if (!ok) throw new Error('kgeLoad: ' + M.ccall('kgeError', 'string', [], []));
   mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4);
   bmPtr = M._malloc(4); wrPtr = M._malloc(4); scPtr = M._malloc(4); visPtr = M._malloc(4);
-  pvlPtr = M._malloc(4); reusedPtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4);
+  pvlPtr = M._malloc(4); reusedPtr = M._malloc(4); donePtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4);
   const HW = N * N;
   bPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
   ready = true;
@@ -66,27 +66,27 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let pollToken = 0;  // bumped on every new request; a running stream exits when it changes
 
-function readStep() {
+function pollStats() {
+  const ok = M.ccall('kgePoll', 'number',
+    ['number','number','number','number','number','number','number','number','number'],
+    [bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, donePtr, reusedPtr]);
+  if (!ok) throw new Error('kgePoll: ' + M.ccall('kgeError', 'string', [], []));
   const plen = M.HEAP32[pvlPtr >> 2];
   return {
     best: M.HEAP32[bmPtr >> 2],
     wr: M.HEAPF32[wrPtr >> 2],
     score: M.HEAPF32[scPtr >> 2],
     nv: M.HEAP32[visPtr >> 2],
+    done: !!M.HEAP32[donePtr >> 2],
     reused: !!M.HEAP32[reusedPtr >> 2],
     pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
+    mem: M.HEAP8.length,
   };
 }
-async function step(visitTarget) {
-  const ok = await M.ccall('kgeSearchStep', 'number',
-    ['number','number','number','number','number','number','number','number','number'],
-    [visitTarget, bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, reusedPtr], { async: true });
-  if (!ok) throw new Error('kgeSearchStep: ' + M.ccall('kgeError', 'string', [], []));
-  return readStep();
-}
 
-// Chunked, streaming search: climb to the visit target a slice at a time (posting live
-// 'progress' each slice), then keep stepping to ponder until a newer request preempts.
+// Async search: start ONE continuous search (genMoveAsync, non-blocking), poll live as
+// visits climb, then start a real background ponder and keep polling. A pollToken
+// supersedes a running stream when a newer request arrives.
 async function search(req, token) {
   if (!ready) throw new Error('engine not initialized');
   const moves = req.moves || [];
@@ -95,37 +95,38 @@ async function search(req, token) {
   for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
   M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
   const threads = (req.threads | 0) || 1;
-  const ok = await M.ccall('kgeSearchSetup', 'number',
-    ['number','number','number','number','number','number'],
-    [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, threads], { async: true });
-  if (!ok) throw new Error('kgeSearchSetup: ' + M.ccall('kgeError', 'string', [], []));
+  M.ccall('kgeStopSearch', 'number', [], []);  // halt any prior search/ponder
+  const ok = await M.ccall('kgeSearchBegin', 'number',
+    ['number','number','number','number','number','number','number','number'],
+    [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, req.visits | 0, req.ms | 0, threads], { async: true });
+  if (!ok) throw new Error('kgeSearchBegin: ' + M.ccall('kgeError', 'string', [], []));
 
-  const target = Math.max(1, req.visits | 0);
-  const chunk = Math.max(40, Math.floor(target / 16));
   const t0 = performance.now();
-  let done = 0, s = null;
-  while (done < target && token === pollToken) {
-    done = Math.min(target, done + chunk);
-    s = await step(done);
-    const ms = Math.round(performance.now() - t0);
-    postMessage({ progress: true, state: 'searching', threads, ms, nps: ms > 0 ? Math.round(s.nv / (ms / 1000)) : 0, ...s });
-  }
-  if (token !== pollToken) return null;  // superseded
-  const ms = Math.round(performance.now() - t0);
-  const final = { ...s, threads, ms, nps: ms > 0 ? Math.round(s.nv / (ms / 1000)) : 0 };
+  const post = (s, state, t) => postMessage({ progress: true, state, threads,
+    ms: Math.round(performance.now() - t), nps: (performance.now() - t) > 0 ? Math.round(s.nv / ((performance.now() - t) / 1000)) : 0, ...s });
 
-  // Ponder: keep deepening the same tree in the background, streaming live, until a new
-  // request bumps the token. Detached so the search() result resolves now.
+  // search phase: poll the running search until it finishes
+  let s = pollStats();
+  while (!s.done && token === pollToken) {
+    post(s, 'searching', t0);
+    await sleep(90);
+    if (token !== pollToken) return null;
+    s = pollStats();
+  }
+  if (token !== pollToken) return null;
+  post(s, 'searching', t0);
+  const final = { ...s, threads, ms: Math.round(performance.now() - t0),
+    nps: (performance.now() - t0) > 0 ? Math.round(s.nv / ((performance.now() - t0) / 1000)) : 0 };
+
+  // ponder phase: real background ponder, polled live (detached so search() resolves now)
+  M.ccall('kgePonderBegin', 'number', [], []);
   (async () => {
-    let v = target; const pt0 = performance.now();
+    const pt0 = performance.now();
     while (token === pollToken) {
-      v += chunk;
-      let ps; try { ps = await step(v); } catch (_) { break; }
+      await sleep(160);
       if (token !== pollToken) break;
-      const pms = Math.round(performance.now() - pt0);
-      postMessage({ progress: true, state: 'pondering', threads, ms: pms,
-                    nps: pms > 0 ? Math.round((ps.nv - target) / (pms / 1000)) : 0, ...ps });
-      await sleep(40);  // yield so a new request can preempt
+      let ps; try { ps = pollStats(); } catch (_) { break; }
+      post(ps, 'pondering', pt0);
     }
   })();
 

@@ -81,14 +81,17 @@ int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
                   int* bestMoveOut, float* winrateOut, float* scoreOut,
                   int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut);
 
-// Chunked search for LIVE stats: kgeSearchSetup positions the bot (tree reuse), then
-// each kgeSearchStep(visitTarget) deepens the SAME tree up to that cumulative target
-// and reports current stats — step in slices to stream upticking visits/PV/win-rate,
-// and keep stepping past the target to ponder. Threaded build only.
-int kgeSearchSetup(const int* moveLocs, const int* moveCols, int numMoves,
-                   int toPla, double komi, int numSearchThreads);
-int kgeSearchStep(int visitTarget, int* bestOut, float* winrateOut, float* scoreOut,
-                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut);
+// Async search for LIVE stats (threaded build only). kgeSearchBegin starts a single
+// continuous search on the bot's threads (non-blocking, with tree reuse); poll kgePoll
+// to stream monotonically-climbing visits/PV/win-rate/score (doneOut=1 when finished).
+// Then kgePonderBegin starts a real background ponder (keep polling); kgeStopSearch
+// halts before a new request.
+int kgeSearchBegin(const int* moveLocs, const int* moveCols, int numMoves,
+                   int toPla, double komi, int maxVisits, double maxTimeMs, int numSearchThreads);
+int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
+            int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* doneOut, int* reusedOut);
+int kgePonderBegin(void);
+int kgeStopSearch(void);
 
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size
