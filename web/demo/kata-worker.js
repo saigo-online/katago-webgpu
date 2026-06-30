@@ -1,0 +1,62 @@
+// Web Worker hosting the THREADED kataeval (kataeval-mt.js) — KataGo's REAL Search.
+//
+// Why a worker: kgeSearchKata runs KataGo's Search, which spawns its own pthreads
+// (1 NN-server thread that owns the WebGPU device + N search threads) and BLOCKS the
+// caller until the search finishes. Blocking is forbidden on the page's main thread
+// (Atomics.wait throws there) but fine on a worker — so the engine lives here and the
+// UI thread stays responsive. Requires cross-origin isolation (COOP/COEP) for threads.
+importScripts('kataeval-mt.js');
+
+const MAXMV = 1024, PVCAP = 32;
+let M = null, N = 19, ready = false;
+let mlPtr, mcPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;
+
+async function init(netFile, boardSize) {
+  M = await createKata();
+  N = boardSize;
+  const resp = await fetch(netFile);
+  if (!resp.ok) throw new Error('fetch ' + netFile + ' -> ' + resp.status);
+  M.FS.writeFile('/model.bin.gz', new Uint8Array(await resp.arrayBuffer()));
+  const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
+  if (!ok) throw new Error('kgeLoad: ' + M.ccall('kgeError', 'string', [], []));
+  mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4);
+  bmPtr = M._malloc(4); wrPtr = M._malloc(4); visPtr = M._malloc(4); pvlPtr = M._malloc(4);
+  pvPtr = M._malloc(PVCAP * 4);
+  ready = true;
+  const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen)';
+  return { backend, version: M.ccall('kgeModelVersion', 'number', [], []) };
+}
+
+async function search(req) {
+  if (!ready) throw new Error('engine not initialized');
+  const moves = req.moves || [];
+  const n = Math.min(moves.length, MAXMV);
+  const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
+  for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
+  M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
+  const t0 = performance.now();
+  const ok = await M.ccall('kgeSearchKata', 'number',
+    ['number','number','number','number','number','number','number','number','number','number','number','number','number','number'],
+    [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, req.visits | 0, req.ms | 0, req.threads | 0,
+     bmPtr, wrPtr, pvPtr, PVCAP, pvlPtr, visPtr], { async: true });
+  if (!ok) throw new Error('kgeSearchKata: ' + M.ccall('kgeError', 'string', [], []));
+  const plen = M.HEAP32[pvlPtr >> 2];
+  return {
+    best: M.HEAP32[bmPtr >> 2],
+    wr: M.HEAPF32[wrPtr >> 2],
+    nv: M.HEAP32[visPtr >> 2],
+    pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
+    ms: Math.round(performance.now() - t0),
+  };
+}
+
+onmessage = async (e) => {
+  const { id, type } = e.data;
+  try {
+    if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize)) });
+    else if (type === 'search') postMessage({ id, ok: true, ...(await search(e.data)) });
+    else throw new Error('unknown message type: ' + type);
+  } catch (err) {
+    postMessage({ id, ok: false, error: String((err && err.message) || err) });
+  }
+};

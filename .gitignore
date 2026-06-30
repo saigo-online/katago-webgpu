@@ -123,3 +123,8 @@ web/demo/threadtest.js
 web/demo/threadtest.wasm
 web/demo/threadtest*.js
 web/demo/threadtest*.wasm
+
+# threaded kataeval (MT=1) build artifacts — rebuilt by build-eval.sh MT=1
+web/demo/kataeval-mt.js
+web/demo/kataeval-mt.wasm
+web/demo/kataeval-mt.*.js

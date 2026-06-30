@@ -54,8 +54,10 @@
     </div>
     <div class="row">
       <button id="think">Think ▶</button>
+      <button id="thinkkata" title="KataGo's real Search (tree reuse + heuristics) on a worker thread">KataGo search ▶</button>
       visits <input id="visits" type="number" value="400" min="1" max="20000" style="width:64px">
       ms <input id="ms" type="number" value="3000" min="100" max="120000" style="width:70px">
+      threads <input id="threads" type="number" value="4" min="1" max="8" style="width:46px">
       <label style="margin-left:6px;"><input type="checkbox" id="searchplay"> engine searches</label>
     </div>
     <div class="row mono" id="searchout" style="min-height:1.4em"></div>
@@ -223,6 +225,54 @@
     return best;
   }
 
+  // --- KataGo real-search worker (threaded kataeval-mt) ----------------------
+  // Runs KataGo's actual Search off the main thread; needs cross-origin isolation.
+  let kataWorker = null, kataReqId = 0, kataInited = false;
+  const kataPending = new Map();
+  function kataCall(msg) {
+    return new Promise((resolve, reject) => {
+      const id = ++kataReqId; kataPending.set(id, { resolve, reject });
+      kataWorker.postMessage({ id, ...msg });
+    });
+  }
+  async function ensureKataWorker() {
+    if (!self.crossOriginIsolated)
+      throw new Error('page is not cross-origin isolated (COOP/COEP) — wasm threads unavailable');
+    if (!kataWorker) {
+      kataWorker = new Worker('kata-worker.js');
+      kataWorker.onmessage = (e) => {
+        const p = kataPending.get(e.data.id); if (!p) return;
+        kataPending.delete(e.data.id);
+        e.data.ok ? p.resolve(e.data) : p.reject(new Error(e.data.error));
+      };
+      kataWorker.onerror = (ev) => {
+        for (const p of kataPending.values()) p.reject(new Error('worker: ' + (ev.message || 'error')));
+        kataPending.clear();
+      };
+    }
+    if (!kataInited) { await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N }); kataInited = true; }
+  }
+  async function kataThink() {
+    if (!ready) return null;
+    try {
+      $('searchout').textContent = 'KataGo: starting engine…';
+      await ensureKataWorker();
+      const visits = Math.max(1, parseInt($('visits').value) || 400);
+      const ms = Math.max(100, parseInt($('ms').value) || 3000);
+      const threads = Math.max(1, parseInt($('threads').value) || 4);
+      $('searchout').textContent = 'KataGo thinking…';
+      const r = await kataCall({ type: 'search', moves: moves.slice(0, MAXMV), toPlay, komi: 7.5, visits, ms, threads });
+      const mv = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
+      const pv = r.pv.map(mv);
+      $('searchout').innerHTML = `KataGo: <b>${mv(r.best)}</b> · ${(r.wr * 100).toFixed(1)}% · ${r.nv} visits / ${r.ms} ms · ${threads}t · PV ${pv.slice(0, 8).join(' ')}`;
+      searchBest = r.best; drawOverlay();
+      return r.best;
+    } catch (e) {
+      $('searchout').innerHTML = 'KataGo search failed: <span class="bad">' + (e.message || e) + '</span>';
+      return null;
+    }
+  }
+
   // Redraw all stones from the displayed grid (captures appear/disappear).
   function renderBoard() {
     board.removeAllObjects();
@@ -244,6 +294,7 @@
     playMove(idx(x, y));
   });
   $('think').onclick = think;
+  $('thinkkata').onclick = kataThink;
   $('play').onclick = async () => {
     if (!ready) return;
     if ($('searchplay').checked) { const mv = await think(); if (mv !== null) playMove(mv); }   // searched move (loc or -1)

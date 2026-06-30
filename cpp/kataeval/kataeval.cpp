@@ -21,6 +21,12 @@
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/modelversion.h"
+#ifdef KGE_THREADS
+#include "../core/logger.h"
+#include "../search/search.h"
+#include "../search/searchparams.h"
+#include "../search/reportedsearchvalues.h"
+#endif
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -41,6 +47,13 @@ int gXLen = 19, gYLen = 19, gModelVersion = 0;
 bool gUseNHWC = false;  // WebGPU wants NCHW (false); the Eigen CPU backend wants NHWC (true)
 std::string gErr = "";
 const int KGE_MAX_BATCH = 16;  // batched eval: many MCTS leaves per forward pass
+
+// ---- Real KataGo engine (Path A): NNEvaluator + Search ---------------------
+std::string gModelPath;            // stashed by kgeLoad so the NNEvaluator can load it
+#ifdef KGE_THREADS
+NNEvaluator* gNNEval = nullptr;    // 1 server thread owns the WebGPU device (deferred init)
+Search* gKataSearch = nullptr;     // KataGo's real search: tree reuse, heuristics, PV
+#endif
 
 // ---- Batched MCTS (PUCT) ---------------------------------------------------
 // AlphaZero PUCT with KataGo's formula + virtual-loss batched leaf collection.
@@ -121,6 +134,7 @@ KATAEVAL_EXPORT int kgeLoad(const char* modelPath, int boardSize) {
     Board::initHash();
     ScoreValue::initTables();
     NeuralNet::globalInitialize();
+    gModelPath = modelPath;  // NNEvaluator (kgeSearchKata) reloads from this path
     gModel = NeuralNet::loadModelFile(modelPath, "");
     const ModelDesc& desc = NeuralNet::getModelDesc(gModel);
     gModelVersion = desc.modelVersion;
@@ -418,5 +432,96 @@ KATAEVAL_EXPORT int kgeSearch(const int* moveLocs, const int* moveCols, int numM
     return 0;
   }
 }
+
+#ifdef KGE_THREADS
+// ---- Real KataGo engine (Path A) -------------------------------------------
+// kgeSearchKata runs KataGo's actual Search (tree reuse, PUCT heuristics, PV) over
+// our WebGPU backend. The NNEvaluator owns ONE server thread; that thread creates
+// the WebGPU device (init was deferred to createComputeHandle), so the thread-local
+// device lives where it's used. The Search's numThreads worker threads only queue
+// NN requests to that server thread (batched) — they never touch WebGPU objects.
+static Logger& kgeLogger() {
+  static Logger logger(nullptr, false, false, false, false);  // silent
+  return logger;
+}
+
+static bool ensureKataEngine() {
+  if(gKataSearch != nullptr) return true;
+  ConfigParser cfg;  // consulted-only by the backend during construction; not stored
+  gNNEval = new NNEvaluator(
+    "kge", gModelPath, "", &kgeLogger(),
+    KGE_MAX_BATCH, gXLen, gYLen,
+    /*requireExactNNLen*/true, /*inputsUseNHWC*/false,  // WebGPU = NCHW
+    /*nnCacheSizePowerOfTwo*/20, /*nnMutexPoolSizePowerofTwo*/16,
+    /*debugSkipNeuralNet*/false, /*homeDataDirOverride*/"",
+    enabled_t::False /*fp32 for now*/,
+    /*numThreads (NN server)*/1, /*gpuIdxByServerThread*/std::vector<int>{-1},
+    /*randSeed*/"kge-nneval", /*doRandomize*/false, /*defaultSymmetry*/0,
+    /*disableWarmup*/true, cfg);
+  gNNEval->spawnServerThreads();
+  gKataSearch = new Search(SearchParams::basicDecentParams(), gNNEval, &kgeLogger(), "kge-search");
+  return true;
+}
+
+static int locToIdx(Loc loc) {
+  if(loc == Board::PASS_LOC || loc == Board::NULL_LOC) return -1;
+  return Location::getY(loc, gXLen) * gXLen + Location::getX(loc, gXLen);
+}
+
+KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
+                                  int toPla, double komi, int maxVisits, double maxTimeMs,
+                                  int numSearchThreads,
+                                  int* bestMoveOut, float* winrateOut,
+                                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut) {
+  if(gModel == nullptr) { gErr = "not loaded"; return 0; }
+  try {
+    if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
+    Rules rules = Rules::getTrompTaylorish();
+    rules.komi = (float)komi;
+    Board board(gXLen, gYLen);
+    Player firstPla = (numMoves > 0) ? (Player)moveCols[0] : P_BLACK;
+    BoardHistory hist(board, firstPla, rules, 0);
+    for(int i = 0; i < numMoves; i++) {
+      Player pla = (Player)moveCols[i];
+      Loc loc = (moveLocs[i] < 0) ? Board::PASS_LOC : Location::getLoc(moveLocs[i] % gXLen, moveLocs[i] / gXLen, gXLen);
+      if(hist.isLegal(board, loc, pla)) hist.makeBoardMoveAssumeLegal(board, loc, pla, NULL);
+    }
+    Player rootPla = (Player)toPla;
+
+    SearchParams params = SearchParams::basicDecentParams();
+    params.maxVisits = maxVisits;
+    params.maxPlayouts = maxVisits;
+    params.maxTime = maxTimeMs / 1000.0;
+    params.numThreads = numSearchThreads > 0 ? numSearchThreads : 1;
+    gKataSearch->setParams(params);
+    gKataSearch->setPosition(rootPla, board, hist);
+
+    Loc best = gKataSearch->runWholeSearchAndGetMove(rootPla);
+    if(bestMoveOut) *bestMoveOut = locToIdx(best);
+
+    ReportedSearchValues vals;
+    double winrate = 0.5; int64_t visits = 0;
+    if(gKataSearch->getRootValues(vals)) {
+      // winValue is white-perspective P(win); convert to the side to move.
+      winrate = (rootPla == P_WHITE) ? vals.winValue : vals.lossValue;
+      visits = vals.visits;
+    }
+    if(winrateOut) *winrateOut = (float)winrate;
+    if(visitsOut) *visitsOut = (int)visits;
+
+    int pvLen = 0;
+    if(pvOut && pvCap > 0) {
+      std::vector<Loc> pvBuf; std::vector<int64_t> vb, eb; std::vector<Loc> sl; std::vector<double> sv;
+      gKataSearch->appendPV(pvBuf, vb, eb, sl, sv, gKataSearch->getRootNode(), pvCap);
+      for(size_t i = 0; i < pvBuf.size() && pvLen < pvCap; i++) pvOut[pvLen++] = locToIdx(pvBuf[i]);
+    }
+    if(pvLenOut) *pvLenOut = pvLen;
+    return 1;
+  } catch(const std::exception& e) {
+    gErr = e.what();
+    return 0;
+  }
+}
+#endif  // KGE_THREADS
 
 }  // extern "C"

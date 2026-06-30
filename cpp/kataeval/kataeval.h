@@ -63,6 +63,16 @@ int kgeSearch(const int* moveLocs, const int* moveCols, int numMoves,
               int* bestMoveOut, float* winrateOut,
               int* pvOut, int pvCap, int* pvLenOut, int* visitsOut);
 
+// kgeSearchKata: KataGo's REAL Search (tree reuse, PUCT heuristics, PV) over the
+// WebGPU backend, via an NNEvaluator (1 server thread owns the device) + numSearchThreads
+// worker threads queueing batched NN requests. Same outputs as kgeSearch, plus a
+// numSearchThreads knob. Requires the threaded build (-pthread). See Path A.
+int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
+                  int toPla, double komi, int maxVisits, double maxTimeMs,
+                  int numSearchThreads,
+                  int* bestMoveOut, float* winrateOut,
+                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut);
+
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size
 int kgeModelVersion(void);        // loaded model's version

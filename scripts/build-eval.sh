@@ -18,9 +18,25 @@ CFLAGS=( -O2 -fexceptions -DNO_GIT_REVISION -DHALF_ENABLE_CPP11_CFENV=0
          -I external -isystem external/filesystem-1.5.8/include
          --use-port=emdawnwebgpu -sUSE_ZLIB=1 )
 
-# Read the canonical dependency manifest (one clean dep, one source of truth).
-mapfile -t SRCS < <(grep -vE '^\s*(#|$)' kataeval/sources.txt)
-echo "==> kataeval: ${#SRCS[@]} sources from kataeval/sources.txt"
+# MT=1 -> threaded build with KataGo's REAL Search (kgeSearchKata): adds -pthread,
+# the search source closure, and the kgeSearchKata export; emits kataeval-mt.js
+# (meant to be hosted in a Web Worker). The default single-thread build is unchanged
+# (kataeval.js, no search sources, runs on the main thread).
+MANIFESTS=( kataeval/sources.txt )
+OUTNAME=kataeval
+EXPORTS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeSearch,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_malloc,_free
+LINKEXTRA=( -sINITIAL_MEMORY=64MB )
+if [ "${MT:-0}" = 1 ]; then
+  CFLAGS+=( -pthread -DKGE_THREADS )
+  MANIFESTS+=( kataeval/sources-search.txt )
+  OUTNAME=kataeval-mt
+  EXPORTS="$EXPORTS,_kgeSearchKata"
+  LINKEXTRA=( -pthread -sPTHREAD_POOL_SIZE=8 -sINITIAL_MEMORY=256MB )
+fi
+
+# Read the canonical dependency manifest(s) (one clean dep, one source of truth).
+mapfile -t SRCS < <(cat "${MANIFESTS[@]}" | grep -vE '^\s*(#|$)')
+echo "==> $OUTNAME: ${#SRCS[@]} sources from ${MANIFESTS[*]}"
 
 OBJS=()
 for f in "${SRCS[@]}"; do
@@ -36,17 +52,17 @@ for f in "${SRCS[@]}"; do
   OBJS+=("$o")
 done
 
-echo "==> linking -> web/demo/kataeval.js"
+echo "==> linking -> web/demo/$OUTNAME.js"
 emcc "${OBJS[@]}" --use-port=emdawnwebgpu -sUSE_ZLIB=1 \
   -fexceptions \
   -sASYNCIFY -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 \
-  -sSTACK_SIZE=16MB -sINITIAL_MEMORY=64MB \
+  -sSTACK_SIZE=16MB "${LINKEXTRA[@]}" \
   -sMODULARIZE=1 -sEXPORT_NAME=createKata \
-  -sEXPORTED_FUNCTIONS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeSearch,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_malloc,_free \
+  -sEXPORTED_FUNCTIONS="$EXPORTS" \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS,HEAPF32,HEAP32,UTF8ToString \
-  -O2 -o "$ROOT/web/demo/kataeval.js"
+  -O2 -o "$ROOT/web/demo/$OUTNAME.js"
 
-echo "==> built:"; ls -la "$ROOT/web/demo/kataeval.js" "$ROOT/web/demo/kataeval.wasm"
+echo "==> built:"; ls -la "$ROOT/web/demo/$OUTNAME.js" "$ROOT/web/demo/$OUTNAME.wasm"
 
 # Bundle the demo nets (web/demo/model-*.bin.gz are gitignored, so regenerate
 # here for an out-of-the-box demo). The analyze.html net selector picks among
