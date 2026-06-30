@@ -249,6 +249,12 @@
       kataWorker = new Worker('kata-worker.js');
       kataWorker.onmessage = (e) => {
         if (e.data.diag) { console.log('[kata]', e.data.diag); $('searchout').textContent = 'KataGo · ' + e.data.diag; return; }
+        if (e.data.progress) {   // live search/ponder stats — stream them into the panel
+          renderMetrics(e.data, e.data.threads);
+          setBotState(e.data.state + '…', e.data.state === 'pondering' ? 'live' : 'run');
+          searchBest = e.data.best; drawOverlay();
+          return;
+        }
         const p = kataPending.get(e.data.id); if (!p) return;
         kataPending.delete(e.data.id);
         e.data.ok ? p.resolve(e.data) : p.reject(new Error(e.data.error));
@@ -303,6 +309,7 @@
       const threads = Math.max(1, parseInt($('threads').value) || 4);
       $('searchout').textContent = 'KataGo thinking…';
       const r = await kataCall({ type: 'search', moves: moves.slice(0, MAXMV), toPlay, komi: 7.5, visits, ms, threads });
+      if (r.superseded) return null;   // a newer request took over and owns the panel now
       renderMetrics(r, threads);
       setBotState('pondering…', 'live');   // the engine keeps thinking in the background
       $('searchout').innerHTML = `KataGo: <b>${ptName(r.best)}</b> · ${(r.wr * 100).toFixed(1)}% · ${r.nv} visits · ${r.nps.toLocaleString()}/s · ${threads}t${r.reused ? ' · reused' : ''}`;

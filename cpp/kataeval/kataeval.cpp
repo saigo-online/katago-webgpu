@@ -602,6 +602,75 @@ KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int 
     return 1;
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
+
+// ---- Chunked search: live, upticking stats -------------------------------------
+// The UI wants to WATCH the engine think. genMoveSynchronous blocks until done, so we
+// expose it in slices: kgeSearchSetup positions the bot (with tree reuse), then each
+// kgeSearchStep(visitTarget) searches up to that cumulative target and returns the
+// current stats. Because setParamsNoClearing keeps the tree, raising the target each
+// call just deepens it — so the worker can step (chunk by chunk) and stream visits/PV/
+// win-rate as they climb, and keep stepping past the target to "ponder".
+static Player gStepPla = P_BLACK;
+static int gStepThreads = 1;
+static int gStepReused = 0;
+
+KATAEVAL_EXPORT int kgeSearchSetup(const int* moveLocs, const int* moveCols, int numMoves,
+                                   int toPla, double komi, int numSearchThreads) {
+  if(gModel == nullptr) { gErr = "not loaded"; return 0; }
+  try {
+    if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
+    stopPonder();
+    gStepPla = (Player)toPla;
+    gStepThreads = numSearchThreads > 0 ? numSearchThreads : 1;
+    std::vector<std::pair<Loc,Player>> newLine;
+    for(int i = 0; i < numMoves; i++) newLine.push_back({ decodeLoc(moveLocs[i]), (Player)moveCols[i] });
+    size_t common = 0;
+    while(common < gBotLine.size() && common < newLine.size() && gBotLine[common] == newLine[common]) common++;
+    bool reused = false;
+    if(gBot->getSearch()->getRootNode() != NULL && common == gBotLine.size()) {
+      reused = true;
+      for(size_t i = common; i < newLine.size() && reused; i++)
+        if(!gBot->makeMove(newLine[i].first, newLine[i].second)) reused = false;
+    }
+    if(!reused) {
+      Board board; BoardHistory hist;
+      replayLine(moveLocs, moveCols, numMoves, komi, board, hist);
+      gBot->setPosition(gStepPla, board, hist);
+    }
+    gBotLine = newLine;
+    gStepReused = reused ? 1 : 0;
+    return 1;
+  } catch(const std::exception& e) { gErr = e.what(); return 0; }
+}
+
+KATAEVAL_EXPORT int kgeSearchStep(int visitTarget, int* bestOut, float* winrateOut, float* scoreOut,
+                                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut) {
+  if(gBot == nullptr) { gErr = "no engine"; return 0; }
+  try {
+    SearchParams params = SearchParams::basicDecentParams();
+    params.maxVisits = visitTarget; params.maxPlayouts = visitTarget; params.maxTime = 1e20;
+    params.numThreads = gStepThreads;
+    gBot->setParamsNoClearing(params);  // raise the ceiling, keep the tree -> deepen
+    Loc best = gBot->genMoveSynchronous(gStepPla, TimeControls());
+    if(bestOut) *bestOut = locToIdx(best);
+    const Search* s = gBot->getSearch();
+    ReportedSearchValues vals;
+    if(s->getRootValues(vals)) {
+      if(winrateOut) *winrateOut = (float)((gStepPla == P_WHITE) ? vals.winValue : vals.lossValue);
+      if(scoreOut)   *scoreOut   = (float)((gStepPla == P_WHITE) ? vals.lead : -vals.lead);
+      if(visitsOut)  *visitsOut  = (int)vals.visits;
+    }
+    int pvLen = 0;
+    if(pvOut && pvCap > 0) {
+      std::vector<Loc> pvBuf; std::vector<int64_t> vb, eb; std::vector<Loc> sl; std::vector<double> sv;
+      if(s->getRootNode() != NULL) s->appendPV(pvBuf, vb, eb, sl, sv, s->getRootNode(), pvCap);
+      for(size_t i = 0; i < pvBuf.size() && pvLen < pvCap; i++) pvOut[pvLen++] = locToIdx(pvBuf[i]);
+    }
+    if(pvLenOut) *pvLenOut = pvLen;
+    if(reusedOut) *reusedOut = gStepReused;
+    return 1;
+  } catch(const std::exception& e) { gErr = e.what(); return 0; }
+}
 #endif  // KGE_THREADS
 
 }  // extern "C"

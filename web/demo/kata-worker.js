@@ -63,32 +63,73 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
   return { backend, version: M.ccall('kgeModelVersion', 'number', [], []) };
 }
 
-async function search(req) {
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+let pollToken = 0;  // bumped on every new request; a running stream exits when it changes
+
+function readStep() {
+  const plen = M.HEAP32[pvlPtr >> 2];
+  return {
+    best: M.HEAP32[bmPtr >> 2],
+    wr: M.HEAPF32[wrPtr >> 2],
+    score: M.HEAPF32[scPtr >> 2],
+    nv: M.HEAP32[visPtr >> 2],
+    reused: !!M.HEAP32[reusedPtr >> 2],
+    pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
+  };
+}
+async function step(visitTarget) {
+  const ok = await M.ccall('kgeSearchStep', 'number',
+    ['number','number','number','number','number','number','number','number','number'],
+    [visitTarget, bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, reusedPtr], { async: true });
+  if (!ok) throw new Error('kgeSearchStep: ' + M.ccall('kgeError', 'string', [], []));
+  return readStep();
+}
+
+// Chunked, streaming search: climb to the visit target a slice at a time (posting live
+// 'progress' each slice), then keep stepping to ponder until a newer request preempts.
+async function search(req, token) {
   if (!ready) throw new Error('engine not initialized');
   const moves = req.moves || [];
   const n = Math.min(moves.length, MAXMV);
   const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
   for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
   M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
+  const threads = (req.threads | 0) || 1;
+  const ok = await M.ccall('kgeSearchSetup', 'number',
+    ['number','number','number','number','number','number'],
+    [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, threads], { async: true });
+  if (!ok) throw new Error('kgeSearchSetup: ' + M.ccall('kgeError', 'string', [], []));
+
+  const target = Math.max(1, req.visits | 0);
+  const chunk = Math.max(40, Math.floor(target / 16));
   const t0 = performance.now();
-  const ok = await M.ccall('kgeSearchKata', 'number',
-    ['number','number','number','number','number','number','number','number','number','number','number','number','number','number','number','number'],
-    [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, req.visits | 0, req.ms | 0, req.threads | 0,
-     bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, reusedPtr], { async: true });
-  if (!ok) throw new Error('kgeSearchKata: ' + M.ccall('kgeError', 'string', [], []));
-  const plen = M.HEAP32[pvlPtr >> 2];
+  let done = 0, s = null;
+  while (done < target && token === pollToken) {
+    done = Math.min(target, done + chunk);
+    s = await step(done);
+    const ms = Math.round(performance.now() - t0);
+    postMessage({ progress: true, state: 'searching', threads, ms, nps: ms > 0 ? Math.round(s.nv / (ms / 1000)) : 0, ...s });
+  }
+  if (token !== pollToken) return null;  // superseded
   const ms = Math.round(performance.now() - t0);
-  const nv = M.HEAP32[visPtr >> 2];
-  return {
-    best: M.HEAP32[bmPtr >> 2],
-    wr: M.HEAPF32[wrPtr >> 2],
-    score: M.HEAPF32[scPtr >> 2],
-    nv,
-    nps: ms > 0 ? Math.round(nv / (ms / 1000)) : 0,
-    reused: !!M.HEAP32[reusedPtr >> 2],
-    pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
-    ms,
-  };
+  const final = { ...s, threads, ms, nps: ms > 0 ? Math.round(s.nv / (ms / 1000)) : 0 };
+
+  // Ponder: keep deepening the same tree in the background, streaming live, until a new
+  // request bumps the token. Detached so the search() result resolves now.
+  (async () => {
+    let v = target; const pt0 = performance.now();
+    while (token === pollToken) {
+      v += chunk;
+      let ps; try { ps = await step(v); } catch (_) { break; }
+      if (token !== pollToken) break;
+      const pms = Math.round(performance.now() - pt0);
+      postMessage({ progress: true, state: 'pondering', threads, ms: pms,
+                    nps: pms > 0 ? Math.round((ps.nv - target) / (pms / 1000)) : 0, ...ps });
+      await sleep(40);  // yield so a new request can preempt
+    }
+  })();
+
+  return final;
 }
 
 // Instant per-move analysis (raw NN policy/value/ownership) — same NNEvaluator-backed
@@ -119,11 +160,16 @@ onmessage = async (e) => {
   try {
     if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText, e.data.forceCpu)) });
     else if (type === 'eval') {
+      pollToken++;                       // stop any running ponder stream (position changing)
       const r = await evalPos(e.data);
       const xfer = [r.board.buffer, r.policy.buffer, r.value.buffer]; if (r.owner) xfer.push(r.owner.buffer);
       postMessage({ id, ok: true, ...r }, xfer);
     }
-    else if (type === 'search') postMessage({ id, ok: true, ...(await search(e.data)) });
+    else if (type === 'search') {
+      const token = ++pollToken;         // supersede any prior search/ponder stream
+      const r = await search(e.data, token);
+      postMessage({ id, ok: true, superseded: r === null, ...(r || {}) });
+    }
     else throw new Error('unknown message type: ' + type);
   } catch (err) {
     postMessage({ id, ok: false, error: String((err && err.message) || err) });
