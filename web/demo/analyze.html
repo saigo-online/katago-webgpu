@@ -51,6 +51,7 @@
     <div class="row status" id="status">loading engine…</div>
     <div class="row">Net: <select id="net"></select> Size: <select id="size"></select>
       Handi: <select id="hc"></select> Komi: <input id="komi" type="number" value="7.5" step="0.5" style="width:54px">
+      <label title="Opt-in fp16: ~2x on fp16-stable (modern) nets; g170 nets overflow to garbage"><input type="checkbox" id="fp16"> fp16</label>
       <span class="muted" id="netnote"></span></div>
     <div class="row">
       <div class="wr"><span>Black <span id="bwr">–</span></span><span><span id="wwr">–</span> White</span></div>
@@ -210,6 +211,8 @@
   const hcSel = $('hc');
   for (const h of [0,1,2,3,4,5,6,7,8,9]) { const o = document.createElement('option'); o.value = h; o.textContent = h === 0 ? 'none' : h; if (h === hc) o.selected = true; hcSel.appendChild(o); }
   hcSel.onchange = () => { const u = new URLSearchParams(location.search); u.set('hc', hcSel.value); location.search = u.toString(); };
+  $('fp16').checked = qs.has('fp16');
+  $('fp16').onchange = () => { const u = new URLSearchParams(location.search); if ($('fp16').checked) u.set('fp16', '1'); else u.delete('fp16'); location.search = u.toString(); };
   // handicap black stones precede the game; the engine sees them before the played moves.
   const hcMoves = handicapStones(hc, N).map(([x, y]) => ({ loc: y * N + x, col: 1 }));
   const engineMoves = () => hcMoves.concat(moves);
@@ -383,7 +386,7 @@
       ]);
       try { await cachedNet(NETS[netKey].file, m => $('status').textContent = m); }
       catch (e) { throw new Error('net "' + netKey + '" not bundled — re-run build-eval.sh' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with $B20_NET / $B18_NET')); }
-      kataInfo = await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText, forceCpu: qs.has('cpu') }, [wasmBuf]);
+      kataInfo = await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText, forceCpu: qs.has('cpu'), fp16: qs.has('fp16') }, [wasmBuf]);
       kataInited = true;
     }
     return kataInfo;

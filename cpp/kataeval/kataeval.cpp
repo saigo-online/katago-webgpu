@@ -57,6 +57,8 @@ const int KGE_MAX_BATCH = 32;  // batched eval: per-batch GPU latency is ~fixed,
 
 // ---- Real KataGo engine (Path A): NNEvaluator + Search ---------------------
 std::string gModelPath;            // stashed by kgeLoad so the NNEvaluator can load it
+bool gWantFp16 = false;            // opt-in fp16 (kgeSetFp16) — default off; fp16 overflows
+                                   // the trunk on g170 nets, but is ~2x on fp16-stable nets
 #ifdef KGE_THREADS
 NNEvaluator* gNNEval = nullptr;    // 1 server thread owns the WebGPU device (deferred init)
 AsyncBot* gBot = nullptr;          // KataGo's real engine: tree reuse (makeMove) + ponder
@@ -137,6 +139,10 @@ extern "C" {
 KATAEVAL_EXPORT const char* kgeError(void) { return gErr.c_str(); }
 KATAEVAL_EXPORT int kgeBoardSize(void) { return gXLen; }
 KATAEVAL_EXPORT int kgeModelVersion(void) { return gModelVersion; }
+
+// Opt into fp16 for the threaded engine (call BEFORE the first eval/search). Default
+// off; only safe on fp16-stable nets (g170 overflow to garbage). See WEBGPU_STATUS.
+KATAEVAL_EXPORT void kgeSetFp16(int v) { gWantFp16 = (v != 0); }
 
 KATAEVAL_EXPORT int kgeLoad(const char* modelPath, int boardSize) {
   try {
@@ -470,10 +476,9 @@ static bool ensureKataEngine() {
     /*requireExactNNLen*/true, /*inputsUseNHWC*/false,  // WebGPU = NCHW
     /*nnCacheSizePowerOfTwo*/20, /*nnMutexPoolSizePowerofTwo*/16,
     /*debugSkipNeuralNet*/false, /*homeDataDirOverride*/"",
-    // fp32: fp16 still overflows the trunk on g170 nets (garbage) and is 3-16c off on
-    // the test nets — the per-handle scale8 rescale for fp16 stability isn't done yet.
-    // Correctness first; re-enable per-net once fp16 is validated (KATAGO_WEBGPU_FP16).
-    enabled_t::False,
+    // fp32 by default — fp16 overflows the trunk on g170 nets (garbage); opt in via
+    // kgeSetFp16 for fp16-stable (modern mish_scale8/silu) nets to get the ~2x win.
+    gWantFp16 ? enabled_t::Auto : enabled_t::False,
     /*numThreads (NN server)*/1, /*gpuIdxByServerThread*/std::vector<int>{-1},
     /*randSeed*/"kge-nneval", /*doRandomize*/false, /*defaultSymmetry*/0,
     /*disableWarmup*/true, cfg);
