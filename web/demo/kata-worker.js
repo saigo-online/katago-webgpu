@@ -7,6 +7,11 @@
 // UI thread stays responsive. Requires cross-origin isolation (COOP/COEP) for threads.
 importScripts('kataeval-mt.js');
 
+// Surface errors that would otherwise be swallowed (pthread pool spawn, rejections).
+const diag = (m) => { try { postMessage({ diag: m }); } catch (_) {} };
+self.onerror = (e) => diag('worker.onerror: ' + ((e && e.message) || e));
+self.addEventListener('unhandledrejection', (e) => diag('unhandledrejection: ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason)));
+
 const MAXMV = 1024, PVCAP = 32;
 let M = null, N = 19, ready = false;
 
@@ -23,17 +28,25 @@ async function cachedNet(url) {
 }
 let mlPtr, mcPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;
 
-async function init(netFile, boardSize) {
+async function init(netFile, boardSize, wasmBinary, jsText) {
   // The module is loaded via importScripts INTO this worker, so emscripten's
   // _scriptName would point at kata-worker.js — it would then spawn pthread workers
   // as new Worker('kata-worker.js') (re-running THIS file) instead of the pthread
   // bootstrap. mainScriptUrlOrBlob tells it the real module URL so pthread + wasm
   // loading resolve correctly.
-  const moduleUrl = new URL('kataeval-mt.js', self.location.href).href;
+  // Spawn pthread workers from a blob: URL (built from the page-fetched JS text), not
+  // the https URL — a nested new Worker(https-url) fails over a self-signed/overridden
+  // cert. The blob is same-origin and in-memory, so no cert is involved.
+  const moduleBlob = new Blob([jsText], { type: 'text/javascript' });
+  diag('createKata: spawning thread pool…');
   M = await createKata({
-    mainScriptUrlOrBlob: moduleUrl,
+    // The page fetched the wasm for us (a worker's fetch() also fails over the cert);
+    // use those bytes directly so the worker never fetches the wasm.
+    wasmBinary,
+    mainScriptUrlOrBlob: moduleBlob,
     locateFile: (p) => new URL(p, self.location.href).href,
   });
+  diag('createKata: runtime + thread pool ready');
   N = boardSize;
   M.FS.writeFile('/model.bin.gz', new Uint8Array(await cachedNet(netFile)));
   const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
@@ -72,7 +85,7 @@ async function search(req) {
 onmessage = async (e) => {
   const { id, type } = e.data;
   try {
-    if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize)) });
+    if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText)) });
     else if (type === 'search') postMessage({ id, ok: true, ...(await search(e.data)) });
     else throw new Error('unknown message type: ' + type);
   } catch (err) {

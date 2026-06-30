@@ -19,10 +19,15 @@ mkdir -p "$CERTDIR"
 if [ ! -f "$CERTDIR/cert.pem" ]; then
   echo "==> generating self-signed cert"
   IPS=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.' | sed 's/^/IP:/' | paste -sd, -)
+  # Include hostnames too (short + FQDN) — a worker's fetch() of the wasm fails over
+  # a cert the browser only provisionally accepted, so the SAN must actually match
+  # whatever host you type in the URL (e.g. https://zendo:8443).
+  DNSES=$(for h in "$(hostname -s 2>/dev/null)" "$(hostname 2>/dev/null)" "$(hostname -f 2>/dev/null)" localhost; do
+            [ -n "$h" ] && echo "DNS:$h"; done | sort -u | paste -sd, -)
   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
     -keyout "$CERTDIR/key.pem" -out "$CERTDIR/cert.pem" \
     -subj "/CN=saigo-webgpu-demo" \
-    -addext "subjectAltName=${IPS},DNS:localhost,IP:127.0.0.1" 2>/dev/null
+    -addext "subjectAltName=${IPS},${DNSES},IP:127.0.0.1" 2>/dev/null
 fi
 
 echo "==> Serving $DIR over HTTPS on :$PORT (all interfaces)"

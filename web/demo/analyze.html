@@ -247,10 +247,10 @@
   // Runs KataGo's actual Search off the main thread; needs cross-origin isolation.
   let kataWorker = null, kataReqId = 0, kataInited = false;
   const kataPending = new Map();
-  function kataCall(msg) {
+  function kataCall(msg, transfer) {
     return new Promise((resolve, reject) => {
       const id = ++kataReqId; kataPending.set(id, { resolve, reject });
-      kataWorker.postMessage({ id, ...msg });
+      kataWorker.postMessage({ id, ...msg }, transfer || []);
     });
   }
   async function ensureKataWorker() {
@@ -259,6 +259,7 @@
     if (!kataWorker) {
       kataWorker = new Worker('kata-worker.js');
       kataWorker.onmessage = (e) => {
+        if (e.data.diag) { console.log('[kata]', e.data.diag); $('searchout').textContent = 'KataGo · ' + e.data.diag; return; }
         const p = kataPending.get(e.data.id); if (!p) return;
         kataPending.delete(e.data.id);
         e.data.ok ? p.resolve(e.data) : p.reject(new Error(e.data.error));
@@ -268,7 +269,20 @@
         kataPending.clear();
       };
     }
-    if (!kataInited) { await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N }); kataInited = true; }
+    if (!kataInited) {
+      // Fetch BOTH the wasm and the module JS HERE (main thread) — over a self-signed/
+      // overridden cert, a worker's fetch() AND its nested new Worker(https-url) both
+      // fail. We hand the worker the wasm bytes (-> wasmBinary) and the JS text (-> a
+      // Blob it gives emscripten as mainScriptUrlOrBlob, so pthread workers spawn from
+      // a blob: URL with no cert involved).
+      $('searchout').textContent = 'KataGo: loading engine…';
+      const [wasmBuf, jsText] = await Promise.all([
+        fetch('kataeval-mt.wasm').then(r => r.arrayBuffer()),
+        fetch('kataeval-mt.js').then(r => r.text()),
+      ]);
+      await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText }, [wasmBuf]);
+      kataInited = true;
+    }
   }
   async function kataThink() {
     if (!ready) return null;
