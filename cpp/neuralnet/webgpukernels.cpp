@@ -424,6 +424,53 @@ fn tiledGemm(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_i
 }
 
 // ===========================================================================
+// tiledGemmInBnAct: tiledGemm fused with the PRE-activation it consumes. KataGo
+// blocks are norm->act->conv, so we fold scaleBiasMaskAct into the B-tile load:
+//   B[k,xy] = act(in[n,k,xy]*scale[k] + bias[k]) * mask[n,xy]
+// equals conv1x1(bnAct(in)) in one dispatch, no intermediate tensor. (out-major
+// conv weights only; used for the nbt pre/post 1x1 projections + heads.)
+// ===========================================================================
+
+struct TGBParams { n : u32, inC : u32, outC : u32, hw : u32, act : u32, pad0 : u32, pad1 : u32, pad2 : u32, };
+
+@group(0) @binding(0) var<uniform> tgb : TGBParams;
+@group(0) @binding(1) var<storage, read>       tgbIn    : array<STO>;
+@group(0) @binding(2) var<storage, read>       tgbW     : array<STO>;
+@group(0) @binding(3) var<storage, read>       tgbScale : array<STO>;
+@group(0) @binding(4) var<storage, read>       tgbBias  : array<STO>;
+@group(0) @binding(5) var<storage, read>       tgbMask  : array<STO>;
+@group(0) @binding(6) var<storage, read_write> tgbOut   : array<STO>;
+
+var<workgroup> tgbAs : array<f32, 256>;
+var<workgroup> tgbBs : array<f32, 256>;
+
+@compute @workgroup_size(16, 16)
+fn tiledGemmInBnAct(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) lid : vec3<u32>) {
+  let n  = wid.z;
+  let o  = wid.x * 16u + lid.x;
+  let xy = wid.y * 16u + lid.y;
+  var acc : f32 = 0.0;
+  let nTiles = (tgb.inC + 15u) / 16u;
+  for (var t : u32 = 0u; t < nTiles; t = t + 1u) {
+    let kA = t * 16u + lid.y;
+    var av : f32 = 0.0;
+    if (o < tgb.outC && kA < tgb.inC) { av = f32(tgbW[o * tgb.inC + kA]); }
+    tgbAs[lid.x * 16u + lid.y] = av;
+    let kB = t * 16u + lid.x;
+    var bv : f32 = 0.0;
+    if (kB < tgb.inC && xy < tgb.hw) {
+      let m = f32(tgbMask[n * tgb.hw + xy]);
+      bv = activate(f32(tgbIn[(n * tgb.inC + kB) * tgb.hw + xy]) * f32(tgbScale[kB]) + f32(tgbBias[kB]), tgb.act) * m;
+    }
+    tgbBs[lid.x * 16u + lid.y] = bv;
+    workgroupBarrier();
+    for (var kk : u32 = 0u; kk < 16u; kk = kk + 1u) { acc = acc + tgbAs[lid.x * 16u + kk] * tgbBs[kk * 16u + lid.y]; }
+    workgroupBarrier();
+  }
+  if (o < tgb.outC && xy < tgb.hw) { tgbOut[(n * tgb.outC + o) * tgb.hw + xy] = STO(acc); }
+}
+
+// ===========================================================================
 // Winograd F(2x2, 3x3) convolution — 3 stages (SAME padding, stride 1, dil 1).
 // Reduces the 3x3 conv's per-output multiplies from 9 to 4 by transforming
 // 4x4 input tiles and 3x3 filters into a 4x4 elementwise (Hadamard) domain.

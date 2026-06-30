@@ -322,6 +322,7 @@ struct ConvParamsHost {
 };
 struct Conv1x1ParamsHost { uint32_t n, inC, outC, hw; };
 struct TGParamsHost { uint32_t n, inC, outC, hw, wInMajor, pad0, pad1, pad2; };
+struct TGBParamsHost { uint32_t n, inC, outC, hw, act, pad0, pad1, pad2; };
 struct SBMAParamsHost { uint32_t n, c, hw, act; };
 struct AddParamsHost { uint32_t total, pad0, pad1, pad2; };
 struct WgParamsHost { uint32_t n, inC, outC, h, w, nTilesX, nTilesY, xi; };
@@ -917,6 +918,17 @@ void NeuralNet::getOutput(
       {wgMakeUniform(ctx,p), in, sb.first, sb.second, maskBuf, out}, (uint32_t)((elts+63)/64));
     return out;
   };
+  // Fused bnAct -> 1x1 conv (pre-activation block pattern): one dispatch, no
+  // intermediate. KATAGO_WEBGPU_NO_FUSION=1 falls back to separate bnAct + conv.
+  const bool useFusion = useTiledGemm && (std::getenv("KATAGO_WEBGPU_NO_FUSION") == nullptr);
+  auto convBnAct1x1 = [&](wgpu::Buffer in, int inC, int outC, const ConvLayerDesc& cd, const BatchNormLayerDesc& bn, int actCode) {
+    auto sb = bnbuf(bn);
+    TGBParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw,(uint32_t)actCode,0u,0u,0u};
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, (size_t)batchSize*outC*hw, true);
+    rec.dispatch("tiledGemmInBnAct", {wgMakeUniform(ctx,p), in, wbuf(cd.weights), sb.first, sb.second, maskBuf, out},
+                 (uint32_t)((outC+15)/16), (uint32_t)((hw+15)/16), (uint32_t)batchSize);
+    return out;
+  };
   auto matmul = [&](wgpu::Buffer a, int M, int K, int O, const std::vector<float>& W, const std::vector<float>* bias, int actCode) {
     MMParamsHost p{(uint32_t)M,(uint32_t)K,(uint32_t)O,(uint32_t)actCode, bias?1u:0u, 0u,0u,0u};
     wgpu::Buffer biasB = bias ? wbuf(*bias) : wgMakeStorage(ctx,nullptr,1,false);
@@ -1049,14 +1061,18 @@ void NeuralNet::getOutput(
       else if(kindAndBlock.first == NESTED_BOTTLENECK_BLOCK_KIND) {
         const NestedBottleneckResidualBlockDesc* b = (const NestedBottleneckResidualBlockDesc*)kindAndBlock.second.get();
         int bottleC = b->preConv.outChannels;
-        // m = preConv(preAct(preBN(x)))      -- project down to bottleneck width
-        wgpu::Buffer pre = bnAct(bx, C, b->preBN, b->preActivation.activation);
-        wgpu::Buffer mid = conv(pre, C, bottleC, b->preConv);
+        bool pre1x1  = b->preConv.convXSize == 1 && b->preConv.convYSize == 1;
+        bool post1x1 = b->postConv.convXSize == 1 && b->postConv.convYSize == 1;
+        // m = preConv(act(preBN(x)))         -- project down (fused if 1x1)
+        wgpu::Buffer mid;
+        if(useFusion && pre1x1) mid = convBnAct1x1(bx, C, bottleC, b->preConv, b->preBN, b->preActivation.activation);
+        else { wgpu::Buffer pre = bnAct(bx, C, b->preBN, b->preActivation.activation); mid = conv(pre, C, bottleC, b->preConv); }
         // sub-blocks at bottleneck width, in place on mid
         applyBlocks(b->blocks, mid, bottleC);
-        // x += postConv(postAct(postBN(m)))  -- project up, residual to x
-        wgpu::Buffer post = bnAct(mid, bottleC, b->postBN, b->postActivation.activation);
-        wgpu::Buffer fin = conv(post, bottleC, C, b->postConv);
+        // x += postConv(act(postBN(m)))      -- project up, residual to x
+        wgpu::Buffer fin;
+        if(useFusion && post1x1) fin = convBnAct1x1(mid, bottleC, C, b->postConv, b->postBN, b->postActivation.activation);
+        else { wgpu::Buffer post = bnAct(mid, bottleC, b->postBN, b->postActivation.activation); fin = conv(post, bottleC, C, b->postConv); }
         addInPlace(bx, fin, (size_t)batchSize*C*hw);
       }
       else if(kindAndBlock.first == TRANSFORMER_ATTENTION_BLOCK_KIND) {
