@@ -193,7 +193,15 @@ struct ComputeContext {
 // wgpu::StringView) and the WGSL shader-source descriptor
 // (ShaderModuleWGSLDescriptor vs newer ShaderSourceWGSL).
 static wgpu::Adapter requestAdapterSync(Logger* logger) {
+  // Dawn disables shader-f16 on ALL NVIDIA Vulkan GPUs by default (a guard for f16
+  // CTS failures, crbug.com/42251215) unless this adapter-stage toggle is set.
+  // Harmless on non-NVIDIA / non-Vulkan (unknown toggles are ignored).
+  static const char* const kEnabledToggles[] = { "vulkan_enable_f16_on_nvidia" };
+  wgpu::DawnTogglesDescriptor toggles{};
+  toggles.enabledToggleCount = 1;
+  toggles.enabledToggles = kEnabledToggles;
   wgpu::RequestAdapterOptions options{};
+  options.nextInChain = &toggles;
   options.powerPreference = wgpu::PowerPreference::HighPerformance;
   wgpu::Adapter result = nullptr;
   volatile bool done = false;
@@ -252,7 +260,10 @@ static wgpu::Device acquireDevice(Logger* logger, bool wantFP16, bool& gotFP16) 
 static void initContextGpu(ComputeContext* context, Logger* logger) {
   if(!gInstance)
     NeuralNet::globalInitialize();
-  bool wantFP16 = (context->useFP16Mode != enabled_t::False);
+  // fp16 storage (fp32 compute) when the caller asks, or KATAGO_WEBGPU_FP16=1 forces
+  // it for A/B testing. Needs an adapter exposing shader-f16 (see the NVIDIA toggle
+  // in requestAdapterSync); falls back to fp32 otherwise.
+  bool wantFP16 = (context->useFP16Mode != enabled_t::False) || (std::getenv("KATAGO_WEBGPU_FP16") != nullptr);
   bool gotFP16 = false;
   context->device = acquireDevice(logger, wantFP16, gotFP16);
   context->useFP16 = gotFP16;

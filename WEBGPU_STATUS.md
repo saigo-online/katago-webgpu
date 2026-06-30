@@ -119,9 +119,14 @@ to Eigen on conv / nbt / transformer / GQA nets + per-op):
 Pending (need GPU features this dev adapter — NVIDIA GB10, software Vulkan — does
 **not** expose, so they can't be validated here; to do on a `shader-f16`/subgroup
 browser/GPU):
-- **#4 fp16 compute + selective-fp32 heads** — the fp16 *storage* path exists; true
-  fp16 compute + keeping policy/value/RMSNorm reductions in fp32 needs a `shader-f16`
-  adapter to validate (this one reports "using fp32").
+- **#4 fp16 storage** — **now working + validated on the GB10.** Dawn disables
+  shader-f16 on *all* NVIDIA Vulkan GPUs by default (a guard for f16 conformance
+  failures, [crbug.com/42251215](https://crbug.com/42251215)); we opt in with the
+  adapter toggle `vulkan_enable_f16_on_nvidia` (in `requestAdapterSync`). fp16
+  storage + fp32 compute then matches Eigen within tolerance: b6c96 92.04c vs
+  92.06c, b4c256 transformer **exact**, b10c128 within ~0.6c. Enable with
+  `KATAGO_WEBGPU_FP16=1` (or the caller's `useFP16Mode`). *Next:* selective-fp32
+  heads to tighten the larger-net gap (keep value head + RMSNorm reductions fp32).
 - **#5 subgroup reductions** — `subgroupAdd`/`subgroupShuffle` for pooling / softmax /
   GEMM dot-products; needs the WebGPU subgroups feature (absent here, and a missing
   feature would fail shader compilation, so it must be feature-gated on the device).
