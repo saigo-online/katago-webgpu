@@ -424,6 +424,64 @@ fn tiledGemm(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_i
 }
 
 // ===========================================================================
+// tiledGemmRT: register-tiled GEMM — 8x8 workgroup, each thread computes a 2x2
+// output micro-tile (16x16 tile/workgroup, cooperative 4-per-thread tile loads).
+// More arithmetic per shared-memory load than tiledGemm; same math (byte-exact).
+// ===========================================================================
+
+@group(0) @binding(0) var<uniform> rt : TGParams;
+@group(0) @binding(1) var<storage, read>       rtIn  : array<STO>;
+@group(0) @binding(2) var<storage, read>       rtW   : array<STO>;
+@group(0) @binding(3) var<storage, read_write> rtOut : array<STO>;
+
+var<workgroup> rtAs : array<f32, 256>;   // [16 o][16 k]
+var<workgroup> rtBs : array<f32, 256>;   // [16 k][16 xy]
+
+@compute @workgroup_size(8, 8)
+fn tiledGemmRT(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) lid : vec3<u32>) {
+  let n = wid.z;
+  let oTile = wid.x * 16u;
+  let xyTile = wid.y * 16u;
+  let tid = lid.x * 8u + lid.y;            // 0..63
+  var acc : array<f32, 4>;                 // [di*2 + dj]
+  acc[0] = 0.0; acc[1] = 0.0; acc[2] = 0.0; acc[3] = 0.0;
+  let nTiles = (rt.inC + 15u) / 16u;
+  for (var t : u32 = 0u; t < nTiles; t = t + 1u) {
+    // cooperative load: 64 threads x 4 = 256 elements per tile
+    for (var r : u32 = 0u; r < 4u; r = r + 1u) {
+      let e = tid + r * 64u;               // 0..255
+      let er = e / 16u; let ec = e % 16u;
+      // A[oTile+er, t*16+ec]
+      let ao = oTile + er; let ak = t * 16u + ec;
+      var av : f32 = 0.0;
+      if (ao < rt.outC && ak < rt.inC) { if (rt.wInMajor != 0u) { av = f32(rtW[ak * rt.outC + ao]); } else { av = f32(rtW[ao * rt.inC + ak]); } }
+      rtAs[er * 16u + ec] = av;
+      // B[t*16+er, xyTile+ec]
+      let bk = t * 16u + er; let bxy = xyTile + ec;
+      var bv : f32 = 0.0;
+      if (bk < rt.inC && bxy < rt.hw) { bv = f32(rtIn[(n * rt.inC + bk) * rt.hw + bxy]); }
+      rtBs[er * 16u + ec] = bv;
+    }
+    workgroupBarrier();
+    for (var kk : u32 = 0u; kk < 16u; kk = kk + 1u) {
+      let a0 = rtAs[(lid.x * 2u) * 16u + kk];
+      let a1 = rtAs[(lid.x * 2u + 1u) * 16u + kk];
+      let b0 = rtBs[kk * 16u + lid.y * 2u];
+      let b1 = rtBs[kk * 16u + lid.y * 2u + 1u];
+      acc[0] = acc[0] + a0 * b0; acc[1] = acc[1] + a0 * b1;
+      acc[2] = acc[2] + a1 * b0; acc[3] = acc[3] + a1 * b1;
+    }
+    workgroupBarrier();
+  }
+  for (var di : u32 = 0u; di < 2u; di = di + 1u) {
+    for (var dj : u32 = 0u; dj < 2u; dj = dj + 1u) {
+      let o = oTile + lid.x * 2u + di; let xy = xyTile + lid.y * 2u + dj;
+      if (o < rt.outC && xy < rt.hw) { rtOut[(n * rt.outC + o) * rt.hw + xy] = STO(acc[di * 2u + dj]); }
+    }
+  }
+}
+
+// ===========================================================================
 // tiledGemmInBnAct: tiledGemm fused with the PRE-activation it consumes. KataGo
 // blocks are norm->act->conv, so we fold scaleBiasMaskAct into the B-tile load:
 //   B[k,xy] = act(in[n,k,xy]*scale[k] + bias[k]) * mask[n,xy]

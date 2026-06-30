@@ -849,9 +849,11 @@ void NeuralNet::getOutput(
   // Shared-memory tiled GEMM for 1x1 conv / projections (into a caller buffer).
   // KATAGO_WEBGPU_NO_TILEDGEMM=1 forces the naive per-output kernels (A/B).
   const bool useTiledGemm = (std::getenv("KATAGO_WEBGPU_NO_TILEDGEMM") == nullptr);
+  // Register tiling (2x2 micro-tile/thread) on top of shared-memory tiling.
+  const char* gemmKernel = std::getenv("KATAGO_WEBGPU_NO_REGTILE") ? "tiledGemm" : "tiledGemmRT";
   auto tgemmInto = [&](wgpu::Buffer in, wgpu::Buffer out, int inC, int outC, wgpu::Buffer W, bool wInMajor) {
     TGParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw, wInMajor?1u:0u, 0u,0u,0u};
-    rec.dispatch("tiledGemm", {wgMakeUniform(ctx,p), in, W, out},
+    rec.dispatch(gemmKernel, {wgMakeUniform(ctx,p), in, W, out},
                  (uint32_t)((outC+15)/16), (uint32_t)((hw+15)/16), (uint32_t)batchSize);
   };
   auto bnbuf = [&](const BatchNormLayerDesc& bn) {
