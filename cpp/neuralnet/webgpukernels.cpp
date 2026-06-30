@@ -598,6 +598,63 @@ fn winogradInput(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 }
 
+// --- Stage 1 fused: winogradInput with pre-activation BN+act+mask folded into the
+// load (act(in*scale[ic]+bias[ic])*mask) so a pre-conv scaleBiasMaskAct dispatch is
+// eliminated. xi field carries the activation kind. Math identical to the unfused
+// path (validated byte-exact in fp32). ---
+@group(0) @binding(0) var<uniform> wgib : WgParams;
+@group(0) @binding(1) var<storage, read>       wgibIn    : array<STO>;
+@group(0) @binding(2) var<storage, read>       wgibScale : array<STO>;
+@group(0) @binding(3) var<storage, read>       wgibBias  : array<STO>;
+@group(0) @binding(4) var<storage, read>       wgibMask  : array<STO>;
+@group(0) @binding(5) var<storage, read_write> wgibV     : array<STO>;
+
+@compute @workgroup_size(64)
+fn winogradInputBnAct(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let nTiles = wgib.nTilesX * wgib.nTilesY;
+  let idx = gid.x;
+  if (idx >= wgib.n * wgib.inC * nTiles) { return; }
+  let tile = idx % nTiles;
+  let ic   = (idx / nTiles) % wgib.inC;
+  let nn   = idx / (nTiles * wgib.inC);
+  let ty   = tile / wgib.nTilesX;
+  let tx   = tile % wgib.nTilesX;
+  let hw = wgib.h * wgib.w;
+  let chanBase = (nn * wgib.inC + ic) * hw;
+  let sc = f32(wgibScale[ic]); let bi = f32(wgibBias[ic]);
+  var d : array<f32, 16>;
+  for (var a = 0u; a < 4u; a = a + 1u) {
+    let iy = i32(2u * ty + a) - 1;
+    for (var b = 0u; b < 4u; b = b + 1u) {
+      let ix = i32(2u * tx + b) - 1;
+      var v = 0.0;
+      if (iy >= 0 && iy < i32(wgib.h) && ix >= 0 && ix < i32(wgib.w)) {
+        let raw = f32(wgibIn[chanBase + u32(iy) * wgib.w + u32(ix)]);
+        let m   = f32(wgibMask[nn * hw + u32(iy) * wgib.w + u32(ix)]);
+        v = activate(raw * sc + bi, wgib.xi) * m;
+      }
+      d[a * 4u + b] = v;
+    }
+  }
+  var t : array<f32, 16>;
+  for (var j = 0u; j < 4u; j = j + 1u) {
+    let d0 = d[0u*4u+j]; let d1 = d[1u*4u+j]; let d2 = d[2u*4u+j]; let d3 = d[3u*4u+j];
+    t[0u*4u+j] = d0 - d2;
+    t[1u*4u+j] = d1 + d2;
+    t[2u*4u+j] = -d1 + d2;
+    t[3u*4u+j] = d1 - d3;
+  }
+  let nTilesAll = wgib.n * wgib.inC * nTiles;
+  let vOff = (nn * wgib.inC + ic) * nTiles + tile;
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    let t0 = t[i*4u+0u]; let t1 = t[i*4u+1u]; let t2 = t[i*4u+2u]; let t3 = t[i*4u+3u];
+    wgibV[( (i*4u+0u) ) * nTilesAll + vOff] = STO(t0 - t2);
+    wgibV[( (i*4u+1u) ) * nTilesAll + vOff] = STO(t1 + t2);
+    wgibV[( (i*4u+2u) ) * nTilesAll + vOff] = STO(-t1 + t2);
+    wgibV[( (i*4u+3u) ) * nTilesAll + vOff] = STO(t1 - t3);
+  }
+}
+
 // --- Stage 2: per-component matmul  M[xi] = U[xi](outC x inC) . V[xi](inC x nTiles)
 // thread per (xi, n, oc, tile) ---
 @group(0) @binding(0) var<uniform> wgm : WgParams;

@@ -1068,6 +1068,29 @@ void NeuralNet::getOutput(
                  (uint32_t)((outC+15)/16), (uint32_t)((hw+15)/16), (uint32_t)batchSize);
     return out;
   };
+  // Fused pre-activation 3x3 conv: bnAct(in) folded into the Winograd input transform
+  // (one fewer scaleBiasMaskAct dispatch per such conv). Falls back to bnAct+conv for
+  // non-3x3 / NO_WINOGRAD / NO_FUSION. The matmul+output reuse the same params (they
+  // ignore the xi field, which here carries the activation kind).
+  const bool useWinoFuse = std::getenv("KATAGO_WEBGPU_NO_FUSION") == nullptr;
+  auto convBnAct3x3 = [&](wgpu::Buffer in, int inC, int outC, const BatchNormLayerDesc& bn, int actCode,
+                          const ConvLayerDesc& cd) -> wgpu::Buffer {
+    bool wino = useWinoFuse && std::getenv("KATAGO_WEBGPU_NO_WINOGRAD") == nullptr
+                && cd.convXSize == 3 && cd.convYSize == 3 && cd.dilationX == 1 && cd.dilationY == 1;
+    if(!wino) return conv(bnAct(in, inC, bn, actCode), inC, outC, cd);
+    auto sb = bnbuf(bn);
+    const int nTilesX = (nnXLen+1)/2, nTilesY = (nnYLen+1)/2, nTiles = nTilesX*nTilesY;
+    WgParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)nnYLen,(uint32_t)nnXLen,
+                   (uint32_t)nTilesX,(uint32_t)nTilesY,(uint32_t)actCode};  // xi carries the act kind
+    wgpu::Buffer pbuf = wgMakeUniform(ctx, p);
+    wgpu::Buffer V = wgMakeStorage(ctx, nullptr, (size_t)16*batchSize*inC*nTiles, false);
+    wgpu::Buffer M = wgMakeStorage(ctx, nullptr, (size_t)16*batchSize*outC*nTiles, false);
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, (size_t)batchSize*outC*hw, true);
+    rec.dispatch("winogradInputBnAct", {pbuf, in, sb.first, sb.second, maskBuf, V}, (uint32_t)(((size_t)batchSize*inC*nTiles+63)/64));
+    rec.dispatch("winogradMatmul", {pbuf, wbufWino(cd,outC,inC), V, M}, (uint32_t)(((size_t)16*batchSize*outC*nTiles+63)/64));
+    rec.dispatch("winogradOutput", {pbuf, M, out}, (uint32_t)(((size_t)batchSize*outC*nTiles+63)/64));
+    return out;
+  };
   auto matmul = [&](wgpu::Buffer a, int M, int K, int O, const std::vector<float>& W, const std::vector<float>* bias, int actCode) {
     MMParamsHost p{(uint32_t)M,(uint32_t)K,(uint32_t)O,(uint32_t)actCode, bias?1u:0u, 0u,0u,0u};
     wgpu::Buffer biasB = bias ? wbuf(*bias) : wgMakeStorage(ctx,nullptr,1,false);
@@ -1187,10 +1210,8 @@ void NeuralNet::getOutput(
       if(kindAndBlock.first == ORDINARY_BLOCK_KIND) {
         const ResidualBlockDesc* b = (const ResidualBlockDesc*)kindAndBlock.second.get();
         int midC = b->regularConv.outChannels;
-        wgpu::Buffer s1 = bnAct(bx, C, b->preBN, b->preActivation.activation);
-        wgpu::Buffer mid = conv(s1, C, midC, b->regularConv);
-        wgpu::Buffer s2 = bnAct(mid, midC, b->midBN, b->midActivation.activation);
-        wgpu::Buffer fin = conv(s2, midC, C, b->finalConv);
+        wgpu::Buffer mid = convBnAct3x3(bx, C, midC, b->preBN, b->preActivation.activation, b->regularConv);
+        wgpu::Buffer fin = convBnAct3x3(mid, midC, C, b->midBN, b->midActivation.activation, b->finalConv);
         addInPlace(bx, fin, (size_t)batchSize*C*hw);
       }
       else if(kindAndBlock.first == GLOBAL_POOLING_BLOCK_KIND) {
@@ -1203,8 +1224,7 @@ void NeuralNet::getOutput(
         wgpu::Buffer cat = gpool("globalPoolMeanMax", gp2, gpoolC);
         wgpu::Buffer bias = matmul(cat, batchSize, 3*gpoolC, regularC, b->gpoolToBiasMul.weights, nullptr, ACTIVATION_IDENTITY);
         addChanBias(reg, bias, regularC);
-        wgpu::Buffer s2 = bnAct(reg, regularC, b->midBN, b->midActivation.activation);
-        wgpu::Buffer fin = conv(s2, regularC, C, b->finalConv);
+        wgpu::Buffer fin = convBnAct3x3(reg, regularC, C, b->midBN, b->midActivation.activation, b->finalConv);
         addInPlace(bx, fin, (size_t)batchSize*C*hw);
       }
       else if(kindAndBlock.first == NESTED_BOTTLENECK_BLOCK_KIND) {
