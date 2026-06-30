@@ -159,21 +159,23 @@ struct ComputeContext {
 #ifdef KATAGO_HAVE_WEBGPU
   wgpu::Device device;
   wgpu::Queue queue;
-  wgpu::ShaderModule kernels;
-  // Compute pipelines are expensive to create; cache one per WGSL entry point.
+  wgpu::ShaderModule kernels;     // primary module: f16 storage when useFP16, else f32
+  wgpu::ShaderModule kernelsF32;  // always-f32 module, for selective-fp32 heads (only built when useFP16)
+  // Compute pipelines are expensive to create; cache one per (entry point, f32) pair.
   std::unordered_map<std::string, wgpu::ComputePipeline> pipelineCache;
 
-  wgpu::ComputePipeline getPipeline(const char* entryPoint) {
-    auto it = pipelineCache.find(entryPoint);
+  wgpu::ComputePipeline getPipeline(const char* entryPoint, bool f32 = false) {
+    std::string key = f32 ? (std::string(entryPoint) + "#f32") : entryPoint;
+    auto it = pipelineCache.find(key);
     if(it != pipelineCache.end())
       return it->second;
     wgpu::ComputePipelineDescriptor desc{};
-    desc.compute.module = kernels;
+    desc.compute.module = (f32 && kernelsF32) ? kernelsF32 : kernels;
     desc.compute.entryPoint = entryPoint;
     wgpu::ComputePipeline pipeline = device.CreateComputePipeline(&desc);
     if(pipeline == nullptr)
       throw StringError(string("WebGPU backend: failed to create compute pipeline for ") + entryPoint);
-    pipelineCache[entryPoint] = pipeline;
+    pipelineCache[key] = pipeline;
     return pipeline;
   }
 #endif
@@ -269,15 +271,29 @@ static void initContextGpu(ComputeContext* context, Logger* logger) {
   context->useFP16 = gotFP16;
   context->queue = context->device.GetQueue();
 
-  std::string src = (gotFP16 ? "enable f16;\nalias STO = f16;\n" : "alias STO = f32;\n");
-  src += KataGoWebGPU::WGSL_KERNELS;
-  wgpu::ShaderSourceWGSL wgslDesc{};
-  wgslDesc.code = src.c_str();
-  wgpu::ShaderModuleDescriptor smDesc{};
-  smDesc.nextInChain = &wgslDesc;
-  context->kernels = context->device.CreateShaderModule(&smDesc);
-  if(!context->kernels)
-    throw StringError("WebGPU backend: failed to compile WGSL kernel module.");
+  auto compile = [&](const std::string& code) {
+    wgpu::ShaderSourceWGSL wgslDesc{};
+    wgslDesc.code = code.c_str();
+    wgpu::ShaderModuleDescriptor smDesc{};
+    smDesc.nextInChain = &wgslDesc;
+    wgpu::ShaderModule m = context->device.CreateShaderModule(&smDesc);
+    if(!m) throw StringError("WebGPU backend: failed to compile WGSL kernel module.");
+    return m;
+  };
+  // fp16->fp32 convert (selective-fp32 heads); only valid where f16 is enabled.
+  static const char* const WGSL_CONVERT =
+    "@group(0) @binding(0) var<uniform> cvtN : vec4<u32>;\n"
+    "@group(0) @binding(1) var<storage, read> cvtIn : array<f16>;\n"
+    "@group(0) @binding(2) var<storage, read_write> cvtOut : array<f32>;\n"
+    "@compute @workgroup_size(64) fn convF16ToF32(@builtin(global_invocation_id) gid : vec3<u32>) {\n"
+    "  let i = gid.x; if (i >= cvtN.x) { return; } cvtOut[i] = f32(cvtIn[i]); }\n";
+  std::string base = KataGoWebGPU::WGSL_KERNELS;
+  if(gotFP16) {
+    context->kernels = compile("enable f16;\nalias STO = f16;\n" + base + WGSL_CONVERT);
+    context->kernelsF32 = compile("alias STO = f32;\n" + base);  // for the heads
+  } else {
+    context->kernels = compile("alias STO = f32;\n" + base);
+  }
   if(logger != NULL) {
     if(gotFP16)
       logger->write("WebGPU backend: fp16 storage ENABLED (shader-f16)");
@@ -400,9 +416,10 @@ void foldBatchNorm(const BatchNormLayerDesc* desc, std::vector<float>& mergedSca
 
 // Storage scalar size and 4-byte-padded byte count (WebGPU requires buffer /
 // copy / write sizes be a multiple of 4; an odd f16 count would otherwise fail).
-static inline size_t wgScalarBytes(ComputeContext* ctx) { return ctx->useFP16 ? 2 : 4; }
-static inline uint64_t wgPaddedBytes(ComputeContext* ctx, size_t count) {
-  uint64_t b = (uint64_t)count * wgScalarBytes(ctx);
+// forceF32 overrides fp16 storage (selective-fp32 heads keep f32 buffers/readbacks).
+static inline size_t wgScalarBytes(ComputeContext* ctx, bool forceF32 = false) { return (ctx->useFP16 && !forceF32) ? 2 : 4; }
+static inline uint64_t wgPaddedBytes(ComputeContext* ctx, size_t count, bool forceF32 = false) {
+  uint64_t b = (uint64_t)count * wgScalarBytes(ctx, forceF32);
   return (b + 3ull) & ~3ull;
 }
 
@@ -428,13 +445,18 @@ struct BufferPool {
 // Current thread's active pool (set by getOutput; null in the one-shot test hooks
 // and for cached weights, which must persist rather than be recycled).
 static thread_local BufferPool* tlPool = nullptr;
+// When set (selective-fp32 heads), new storage buffers + weight uploads are f32 and
+// dispatches use the f32 module, even while the trunk ran in fp16. Reset each eval.
+static thread_local bool tlForceF32 = false;
 
 // Create a storage buffer of `count` scalars in the context's storage type
 // (f32 or f16), optionally uploading float `data` (converted to half for fp16).
 // When `pooled` and a thread pool is active, the buffer is drawn from / returned
 // to that pool (weights pass pooled=false so cached buffers are never recycled).
-wgpu::Buffer wgMakeStorage(ComputeContext* ctx, const float* data, size_t count, bool copySrc, bool pooled = true) {
-  uint64_t bytes = wgPaddedBytes(ctx, count);
+wgpu::Buffer wgMakeStorage(ComputeContext* ctx, const float* data, size_t count, bool copySrc, bool pooled = true, bool forceF32 = false) {
+  forceF32 = forceF32 || tlForceF32;
+  bool asF16 = ctx->useFP16 && !forceF32;
+  uint64_t bytes = wgPaddedBytes(ctx, count, forceF32);
   wgpu::BufferUsage usage = wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
   if(copySrc) usage |= wgpu::BufferUsage::CopySrc;
   wgpu::Buffer buf;
@@ -445,7 +467,7 @@ wgpu::Buffer wgMakeStorage(ComputeContext* ctx, const float* data, size_t count,
     buf = ctx->device.CreateBuffer(&d);
   }
   if(data != nullptr) {
-    if(ctx->useFP16) {
+    if(asF16) {
       std::vector<half_t> half(bytes / sizeof(half_t), half_t(0));  // padded, zero-filled
       for(size_t i = 0; i < count; i++) {
         // Clamp finite out-of-range values to the max finite half (±65504) rather
@@ -509,9 +531,9 @@ void wgDispatch(ComputeContext* ctx, const char* entryPoint,
 }
 
 // Copy `count` storage scalars (f32 or f16) from mapped bytes into `out` as float.
-static void wgUnpack(ComputeContext* ctx, const void* mapped, size_t count, std::vector<float>& out) {
+static void wgUnpack(ComputeContext* ctx, const void* mapped, size_t count, std::vector<float>& out, bool forceF32 = false) {
   out.resize(count);
-  if(ctx->useFP16) {
+  if(ctx->useFP16 && !forceF32) {
     const half_t* h = (const half_t*)mapped;
     for(size_t i = 0; i < count; i++) out[i] = (float)h[i];
   } else {
@@ -561,7 +583,7 @@ struct WgRecorder {
 
   void dispatch(const char* entryPoint, const std::vector<wgpu::Buffer>& binds,
                 uint32_t wgX, uint32_t wgY = 1, uint32_t wgZ = 1) {
-    wgpu::ComputePipeline pipeline = ctx->getPipeline(entryPoint);
+    wgpu::ComputePipeline pipeline = ctx->getPipeline(entryPoint, tlForceF32);
     std::vector<wgpu::BindGroupEntry> entries(binds.size());
     for(size_t i = 0; i < binds.size(); i++) {
       entries[i].binding = (uint32_t)i; entries[i].buffer = binds[i];
@@ -581,12 +603,13 @@ struct WgRecorder {
   // whole frame once, map once, and split into the destination vectors. Collapses
   // the per-output readbacks into a single GPU round-trip.
   void submitAndReadback(const std::vector<std::pair<wgpu::Buffer,size_t>>& srcs,
-                         std::vector<std::vector<float>*>& outs) {
+                         std::vector<std::vector<float>*>& outs, bool forceF32 = false) {
     // Each region's byte size is padded to a multiple of 4 (also keeps the next
-    // copy offset 4-aligned, which CopyBufferToBuffer requires).
+    // copy offset 4-aligned, which CopyBufferToBuffer requires). forceF32: the head
+    // outputs are f32 buffers under selective-fp32 even when the trunk is fp16.
     std::vector<uint64_t> rbytes(srcs.size());
     uint64_t totalBytes = 0;
-    for(size_t i = 0; i < srcs.size(); i++) { rbytes[i] = wgPaddedBytes(ctx, srcs[i].second); totalBytes += rbytes[i]; }
+    for(size_t i = 0; i < srcs.size(); i++) { rbytes[i] = wgPaddedBytes(ctx, srcs[i].second, forceF32); totalBytes += rbytes[i]; }
     wgpu::BufferDescriptor d{};
     d.size = totalBytes;
     d.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
@@ -603,7 +626,7 @@ struct WgRecorder {
     if(!ok) throw StringError("WebGPU backend: coalesced readback MapAsync failed.");
     const char* base = (const char*)staging.GetConstMappedRange(0, (size_t)totalBytes);
     off = 0;
-    for(size_t i = 0; i < srcs.size(); i++) { wgUnpack(ctx, base + off, srcs[i].second, *outs[i]); off += rbytes[i]; }
+    for(size_t i = 0; i < srcs.size(); i++) { wgUnpack(ctx, base + off, srcs[i].second, *outs[i], forceF32); off += rbytes[i]; }
     staging.Unmap();
   }
 };
@@ -826,8 +849,8 @@ void NeuralNet::getOutput(
   // and uniform allocations are drawn from it and reused next eval. RAII-cleared
   // so an exception (or the one-shot test hooks) never leaves a dangling pool.
   struct PoolGuard {
-    PoolGuard(BufferPool* p) { p->reset(); tlPool = p; }
-    ~PoolGuard() { tlPool = nullptr; }
+    PoolGuard(BufferPool* p) { p->reset(); tlPool = p; tlForceF32 = false; }
+    ~PoolGuard() { tlPool = nullptr; tlForceF32 = false; }
   } poolGuard(&gpuHandle->pool);
   const int trunkC = trunk.trunkNumChannels;
 
@@ -963,6 +986,14 @@ void NeuralNet::getOutput(
   auto addInPlace = [&](wgpu::Buffer dst, wgpu::Buffer src, size_t elts) {
     AddParamsHost p{(uint32_t)elts,0u,0u,0u};
     rec.dispatch("addInPlace", {wgMakeUniform(ctx,p), src, dst}, (uint32_t)((elts+63)/64));
+  };
+  // Convert an fp16 storage buffer to a fresh fp32 buffer (selective-fp32 heads).
+  // Must run with tlForceF32 == false (convF16ToF32 lives in the f16 module).
+  auto convertToF32 = [&](wgpu::Buffer in, size_t count) {
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, count, true, true, /*forceF32=*/true);
+    AddParamsHost p{(uint32_t)count,0u,0u,0u};
+    rec.dispatch("convF16ToF32", {wgMakeUniform(ctx,p), in, out}, (uint32_t)((count+63)/64));
+    return out;
   };
   // ---- Transformer / RMSNorm primitives (modelVersion >= 15) ----
   // RMSNorm over channels per position. beta=null -> transformer preLN (weight only).
@@ -1134,6 +1165,20 @@ void NeuralNet::getOutput(
     }
   };
   applyBlocks(trunk.blocks, x, trunkC);
+
+  // Selective-fp32 heads: when the trunk ran in fp16, convert its output to fp32
+  // and run the trunk tip + policy/value heads in fp32 (the numerically sensitive
+  // part — norm reductions, pooling, head matmuls). The trunk (the bulk) keeps
+  // fp16's bandwidth win. KATAGO_WEBGPU_NO_FP32HEADS=1 stays full-fp16 (A/B).
+  const bool selectiveF32 = ctx->useFP16 && (std::getenv("KATAGO_WEBGPU_NO_FP32HEADS") == nullptr);
+  if(selectiveF32) {
+    // Convert the fp16 trunk output AND the shared mask to fp32 (both read by the
+    // fp32 head kernels). Do this before tlForceF32 — convF16ToF32 is f16-module.
+    x = convertToF32(x, (size_t)batchSize*trunkC*hw);
+    maskBuf = convertToF32(maskBuf, (size_t)batchSize*hw);
+    tlForceF32 = true;                                 // heads now run on the f32 module
+  }
+
   // Trunk tip: RMSNorm (v15+ RMSNorm nets) or BatchNorm (legacy). RMSNorm may be
   // spatial (one rms over the whole board) or per-position.
   wgpu::Buffer trunkOut;
@@ -1194,7 +1239,8 @@ void NeuralNet::getOutput(
     {ownBuf, (size_t)batchSize*numOwn*hw},
   };
   std::vector<std::vector<float>*> outs = {&policyHost, &policyPassHost, &valueHost, &svHost, &ownHost};
-  rec.submitAndReadback(srcs, outs);
+  rec.submitAndReadback(srcs, outs, /*forceF32=*/selectiveF32);  // head outputs are f32 when selective
+  tlForceF32 = false;  // restore for the next eval (PoolGuard handles the pool)
 
   // ---- Write NNOutputs (logits; NNEvaluator applies softmax/tanh) ----
   for(int row = 0; row < batchSize; row++) {

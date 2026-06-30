@@ -123,10 +123,15 @@ browser/GPU):
   shader-f16 on *all* NVIDIA Vulkan GPUs by default (a guard for f16 conformance
   failures, [crbug.com/42251215](https://crbug.com/42251215)); we opt in with the
   adapter toggle `vulkan_enable_f16_on_nvidia` (in `requestAdapterSync`). fp16
-  storage + fp32 compute then matches Eigen within tolerance: b6c96 92.04c vs
-  92.06c, b4c256 transformer **exact**, b10c128 within ~0.6c. Enable with
-  `KATAGO_WEBGPU_FP16=1` (or the caller's `useFP16Mode`). *Next:* selective-fp32
-  heads to tighten the larger-net gap (keep value head + RMSNorm reductions fp32).
+  storage + fp32 compute then matches Eigen within tolerance. Enable with
+  `KATAGO_WEBGPU_FP16=1` (or the caller's `useFP16Mode`).
+- **Selective-fp32 heads** (default on under fp16) — the trunk runs fp16 for the
+  bandwidth win, then a `convF16ToF32` converts its output + mask and the trunk
+  tip + policy/value heads run on a parallel **fp32** kernel module (the
+  numerically sensitive norm reductions / pooling / head matmuls). Tightens the
+  gap: b6c96 → 92.05c (vs 92.06), GQA transformer → 64.31c (vs 64.32), b10c128
+  74.02 vs full-fp16 74.09 (b10 is trunk-dominated, so a smaller win there).
+  `KATAGO_WEBGPU_NO_FP32HEADS=1` keeps everything fp16 (A/B).
 - **#5 subgroup reductions** — `subgroupAdd`/`subgroupShuffle` for pooling / softmax /
   GEMM dot-products; needs the WebGPU subgroups feature (absent here, and a missing
   feature would fail shader compilation, so it must be feature-gated on the device).
