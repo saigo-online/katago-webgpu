@@ -67,6 +67,7 @@
     </div>
     <div class="row">
       <button id="thinkkata" title="KataGo's real Search (PUCT heuristics + PV) on a worker thread">Search ▶</button>
+      <button id="measure" title="Search the position at growing visit budgets and show how the move/win-rate converge">Measure ▶</button>
       visits <input id="visits" type="number" value="400" min="1" max="20000" style="width:64px">
       ms <input id="ms" type="number" value="3000" min="100" max="120000" style="width:70px">
       threads <input id="threads" type="number" value="4" min="1" max="32" style="width:46px">
@@ -437,6 +438,37 @@
     }
   }
 
+  // --- measure: search the position at growing visit budgets; show convergence ---
+  // The framework for "measuring the effect" of a search change (e.g. PUCT vs Gumbel):
+  // how few visits until the chosen move + win-rate settle to the deep-search answer.
+  // Tree reuse makes it cumulative, so each step just deepens the same tree.
+  async function measureSweep() {
+    if (!ready) return;
+    try {
+      setBotState('measuring…', 'run');
+      await ensureKataWorker();
+      const threads = Math.max(1, parseInt($('threads').value) || 4);
+      const budgets = [25, 50, 100, 200, 400, 800, 1600, 3200];
+      const rows = [];
+      for (const V of budgets) {
+        const r = await kataCall({ type: 'search', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), visits: V, ms: 120000, threads });
+        if (r.superseded) return;
+        rows.push({ v: r.nv, best: r.best, wr: r.wr, score: r.score });
+        const fb = rows[rows.length - 1].best;
+        $('searchout').innerHTML = '<b>visit sweep</b> — move · win% · score:<br>' + rows.map(x =>
+          `${String(x.v).padStart(5)} → <b>${ptName(x.best)}</b> · ${(x.wr * 100).toFixed(1)}% · ${(x.score >= 0 ? '+' : '') + x.score.toFixed(1)}${x.best !== fb ? ' ·changed' : ''}`).join('<br>');
+        renderMetrics(r, threads); renderPV(r.pv); lastCand = r.cand; renderCandidates(r.cand); searchBest = r.best; drawOverlay();
+      }
+      const fb = rows[rows.length - 1].best;
+      let s = rows.length - 1; while (s > 0 && rows[s - 1].best === fb) s--;
+      setBotState('pondering…', 'live');
+      $('searchout').innerHTML += `<br><span class="muted">settled on ${ptName(fb)} by ~${rows[s].v} visits</span>`;
+    } catch (e) {
+      setBotState('error', 'run');
+      $('searchout').innerHTML = 'measure failed: <span class="bad">' + (e.message || e) + '</span>';
+    }
+  }
+
   // --- self-play: the engine plays itself (search each move), then export SGF ---
   let selfPlaying = false;
   async function selfPlay() {
@@ -561,6 +593,7 @@
     playMove(idx(x, y));
   });
   $('thinkkata').onclick = kataThink;
+  $('measure').onclick = measureSweep;
   $('selfplay').onclick = selfPlay;
   $('savesgf').onclick = saveSGF;
   $('savedata').onclick = saveData;
