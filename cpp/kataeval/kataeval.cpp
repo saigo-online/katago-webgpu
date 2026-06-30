@@ -470,7 +470,10 @@ static bool ensureKataEngine() {
     /*requireExactNNLen*/true, /*inputsUseNHWC*/false,  // WebGPU = NCHW
     /*nnCacheSizePowerOfTwo*/20, /*nnMutexPoolSizePowerofTwo*/16,
     /*debugSkipNeuralNet*/false, /*homeDataDirOverride*/"",
-    enabled_t::Auto /*fp16 when the adapter has shader-f16, else fp32 (selective-fp32 heads)*/,
+    // fp32: fp16 still overflows the trunk on g170 nets (garbage) and is 3-16c off on
+    // the test nets — the per-handle scale8 rescale for fp16 stability isn't done yet.
+    // Correctness first; re-enable per-net once fp16 is validated (KATAGO_WEBGPU_FP16).
+    enabled_t::False,
     /*numThreads (NN server)*/1, /*gpuIdxByServerThread*/std::vector<int>{-1},
     /*randSeed*/"kge-nneval", /*doRandomize*/false, /*defaultSymmetry*/0,
     /*disableWarmup*/true, cfg);
