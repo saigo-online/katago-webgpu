@@ -230,9 +230,19 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
      (arXiv:1902.10565).
    - Validated: from the empty board, 400 visits → best **D4**, ~50% win-rate, PV
      `D4 Q16 Q4 D16` (real read-ahead). Returns best move + searched win-rate + PV.
-   - *Next:* **Gumbel AlphaZero** root/selection (Danihelka 2022, arXiv:2202.…) — the
-     SOTA at low visit budgets, exactly the browser regime; selection is isolated in
-     `selectChildPUCT` for the swap. Plus NN cache + tree reuse (ponder).
+   - ✅ **Path A — KataGo's REAL `Search` in the browser** (`kgeSearchKata`, `MT=1`
+     threaded build → `kataeval-mt.wasm`, hosted in `web/demo/kata-worker.js`). An
+     `NNEvaluator` with **1 server thread owns the WebGPU device** (init deferred to
+     `createComputeHandle` so the thread-local device lives on that thread) + N search
+     threads queue **batched** evals. Validated in-browser on real silicon:
+     `KataGo: Q17 · 49.9% · 402 visits / 1615 ms · 4t · PV Q17 Q3 C4 D17 E4`. This
+     brings KataGo's actual heuristics + tree machinery (not the custom MCTS).
+     Self-signed-cert worker quirks (wasm fetch, net fetch, nested `new Worker`) are
+     tunneled via wasmBinary handoff / shared Cache API / `blob:` pthread spawn.
+   - *Next:* swap `Search` → **`AsyncBot`** for **tree reuse (`makeMove`) + ponder**;
+     then **Gumbel AlphaZero** selection (Danihelka 2022) for low-visit strength.
+     Consolidate the main-thread analysis engine into the same worker (one net load,
+     shared NN cache).
    *(Done: conv + nested-bottleneck + the full transformer stack through v17 —
    RMSNorm, RoPE, grouped-query attention, SwiGLU, optimism/q-value policy.)*
 
