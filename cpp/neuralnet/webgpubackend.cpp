@@ -156,6 +156,7 @@ struct ComputeContext {
   enabled_t useFP16Mode;
   bool useFP16 = false;       // resolved: fp16 requested AND adapter supports shader-f16
   bool useSubgroups = false;  // adapter supports the WebGPU subgroups feature
+  bool initialized = false;   // device + shaders created yet? (deferred to the handle thread)
 
 #ifdef KATAGO_HAVE_WEBGPU
   wgpu::Device device;
@@ -343,6 +344,7 @@ static void initContextGpu(ComputeContext* context, Logger* logger) {
     else
       logger->write("WebGPU backend: using fp32");
   }
+  context->initialized = true;
 }
 #endif
 
@@ -361,7 +363,11 @@ ComputeContext* NeuralNet::createComputeContext(
   ComputeContext* context = new ComputeContext(nnXLen, nnYLen, useFP16Mode);
 
 #ifdef KATAGO_HAVE_WEBGPU
-  initContextGpu(context, logger);  // resolves + logs fp16 storage on/off
+  // NB: do NOT create the device/shaders here. WebGPU objects are thread-local, and
+  // NNEvaluator constructs the context on one thread but evaluates on its server
+  // thread. Defer device+shader init to createComputeHandle, which the server thread
+  // calls. For the single-thread path both run on the same thread (no change).
+  (void)logger;
 #else
   (void)logger;
   delete context;
@@ -769,6 +775,13 @@ ComputeHandle* NeuralNet::createComputeHandle(
   int serverThreadIdx
 ) {
   (void)requireExactNNLen; (void)gpuIdxForThisThread;
+#ifdef KATAGO_HAVE_WEBGPU
+  // Lazily create the device + shaders on THIS thread (the server thread under
+  // NNEvaluator) the first time a handle is made. Thread-local WebGPU objects then
+  // live where they're used. Single-threaded callers init here on their own thread.
+  if(!context->initialized)
+    initContextGpu(context, logger);
+#endif
   if(logger != NULL)
     logger->write(
       "WebGPU backend thread " + Global::intToString(serverThreadIdx) +
