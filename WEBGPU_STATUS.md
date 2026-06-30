@@ -140,8 +140,39 @@ browser/GPU):
   no shader fails to compile. Validated byte-exact vs Eigen; composes with fp16 +
   selective-fp32 heads. `KATAGO_WEBGPU_NO_SUBGROUPS=1` for A/B.
 
-Still open (validatable here): tiled attention for big nets; larger fixed batch;
+Still open (validatable here): tiled attention for big nets;
 sharing the Winograd input transform across output channels.
+
+### 2026 deep profile — the regime is *latency-bound* (`scripts/bench-webgpu.sh`)
+
+Profiled on a GB10 with `KATAGO_WEBGPU_TIMING=1` (phase timing + dispatch histogram
++ `OnSubmittedWorkDone` split). For a tiny net the forward pass is **entirely GPU
+launch/barrier overhead**, not compute:
+
+- b6c96 @ batch 6: marshal 13µs · encode 0.8ms · **submit+readback 7.1ms** — and the
+  map round-trip is only ~0.2ms of that, so it's **~7ms of GPU-execute**.
+- Per-batch latency is **~fixed regardless of batch size** (batch 3 ≈ batch 15 ≈ 7ms):
+  ~**90 dispatches/frame** (Winograd input/matmul/output = 42, BN/act = 18, residual
+  = 6), each a tiny launch-overhead-bound kernel; Dawn inserts a storage-hazard
+  barrier between dependent dispatches.
+
+Two levers follow: **fewer dispatches** and **bigger batches** (amortize the fixed
+latency). Wins this pass (all byte-exact vs Eigen in fp32; same Dawn runs in-browser):
+
+| change | effect | flag |
+|--------|--------|------|
+| **single compute pass** for the whole forward pass (was one pass per op) | +9% (734 vs 674 @ t=16); also less encode CPU | `KGE_MULTIPASS` |
+| **fuse BN+act+mask into the Winograd input transform** (`winogradInputBnAct`) | 90→80 dispatches; +1.6% (also cuts encode CPU at high threads) | `KATAGO_WEBGPU_NO_FUSION` |
+| **batch+threads throughput** (`KGE_MAX_BATCH` 16→32, pool→33, demo threads → ~cores) | **t=4→t=32: 418→1814 nnEvals/s (4.3×)** — the dominant practical lever | — |
+
+Winograd re-confirmed **+80%** vs direct conv here (730 vs 405) — the FLOP cut wins
+even when launch-bound. `scripts/bench-webgpu.sh` reproduces the thread sweep; the
+demo's **Measure** button shows move/win-rate convergence vs visit budget.
+
+**Tensor cores:** Dawn exposes `chromium_experimental_subgroup_matrix` (cooperative
+matrix), which would accelerate the Winograd/projection GEMMs — but it's
+flag-gated/experimental in stable browsers, so **not portable yet**. It's the biggest
+future compute win once WebGPU ships cooperative matrix in stable Chrome.
 
 ## fp16
 
@@ -161,6 +192,17 @@ sentinels — e.g. the `1e9` off-board attention-mask bias — don't become
 > policy/value heads + RMSNorm reductions in fp32 even in fp16 mode — a lesson
 > from KataGo's TensorRT FP16 path, which measured ~0.08% winrate error and
 > ~2.4× throughput) is the next fp16 refinement, gated on that validation.
+
+> **2026 update — fp16 is NOT production-ready; the engine runs fp32.** On a real
+> `shader-f16` adapter (GB10), fp16 **overflows the trunk to garbage** on g170 nets
+> (`Win 100%`, the demo's b6/b10 defaults) and is **3–16c inaccurate** even on the
+> modern mish_scale8 test nets. The trunk activations exceed fp16's ±65504 range, and
+> the **per-handle scale8 rescale** that keeps them in range (KataGo's fp16 trick) is
+> *not implemented* — selective-fp32 heads can't rescue a garbage trunk. `kgeSearchKata`
+> therefore uses `enabled_t::False` (fp32). fp16 stays available per-net via
+> `KATAGO_WEBGPU_FP16` once validated; implementing the scale8 rescale is the path to
+> the ~2× fp16 win (and the single biggest remaining perf lever for fp16-stable nets
+> like a trained b5c192nbtv17q).
 
 ## Build & run
 
