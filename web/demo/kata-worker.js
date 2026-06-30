@@ -26,8 +26,8 @@ async function cachedNet(url) {
   if (cache) { try { await cache.put(url, res.clone()); } catch (_) {} }
   return await res.arrayBuffer();
 }
-let mlPtr, mcPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;  // search buffers
-let bPtr, pPtr, vPtr, oPtr;                             // analysis (kgeEvalSeq) buffers
+let mlPtr, mcPtr, bmPtr, wrPtr, scPtr, pvPtr, pvlPtr, visPtr, reusedPtr;  // search buffers
+let bPtr, pPtr, vPtr, oPtr;                             // analysis (kgeEvalSeqKata) buffers
 
 async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
   // The module is loaded via importScripts INTO this worker, so emscripten's
@@ -54,8 +54,8 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
   const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
   if (!ok) throw new Error('kgeLoad: ' + M.ccall('kgeError', 'string', [], []));
   mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4);
-  bmPtr = M._malloc(4); wrPtr = M._malloc(4); visPtr = M._malloc(4); pvlPtr = M._malloc(4);
-  pvPtr = M._malloc(PVCAP * 4);
+  bmPtr = M._malloc(4); wrPtr = M._malloc(4); scPtr = M._malloc(4); visPtr = M._malloc(4);
+  pvlPtr = M._malloc(4); reusedPtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4);
   const HW = N * N;
   bPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
   ready = true;
@@ -72,17 +72,22 @@ async function search(req) {
   M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
   const t0 = performance.now();
   const ok = await M.ccall('kgeSearchKata', 'number',
-    ['number','number','number','number','number','number','number','number','number','number','number','number','number','number'],
+    ['number','number','number','number','number','number','number','number','number','number','number','number','number','number','number','number'],
     [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, req.visits | 0, req.ms | 0, req.threads | 0,
-     bmPtr, wrPtr, pvPtr, PVCAP, pvlPtr, visPtr], { async: true });
+     bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, reusedPtr], { async: true });
   if (!ok) throw new Error('kgeSearchKata: ' + M.ccall('kgeError', 'string', [], []));
   const plen = M.HEAP32[pvlPtr >> 2];
+  const ms = Math.round(performance.now() - t0);
+  const nv = M.HEAP32[visPtr >> 2];
   return {
     best: M.HEAP32[bmPtr >> 2],
     wr: M.HEAPF32[wrPtr >> 2],
-    nv: M.HEAP32[visPtr >> 2],
+    score: M.HEAPF32[scPtr >> 2],
+    nv,
+    nps: ms > 0 ? Math.round(nv / (ms / 1000)) : 0,
+    reused: !!M.HEAP32[reusedPtr >> 2],
     pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
-    ms: Math.round(performance.now() - t0),
+    ms,
   };
 }
 
@@ -96,10 +101,10 @@ async function evalPos(req) {
   for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
   M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
   const HW = N * N;
-  const ok = await M.ccall('kgeEvalSeq', 'number',
+  const ok = await M.ccall('kgeEvalSeqKata', 'number',
     ['number','number','number','number','number','number','number','number','number'],
     [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, bPtr, pPtr, vPtr, req.owner ? oPtr : 0], { async: true });
-  if (!ok) throw new Error('kgeEvalSeq: ' + M.ccall('kgeError', 'string', [], []));
+  if (!ok) throw new Error('kgeEvalSeqKata: ' + M.ccall('kgeError', 'string', [], []));
   // Copy HEAP slices into standalone buffers we can transfer back to the page.
   return {
     board: M.HEAP32.slice(bPtr >> 2, (bPtr >> 2) + HW),

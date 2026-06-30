@@ -22,9 +22,12 @@
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/modelversion.h"
 #ifdef KGE_THREADS
+#include <utility>
 #include "../core/logger.h"
 #include "../search/search.h"
+#include "../search/asyncbot.h"
 #include "../search/searchparams.h"
+#include "../search/timecontrols.h"
 #include "../search/reportedsearchvalues.h"
 #endif
 
@@ -52,7 +55,9 @@ const int KGE_MAX_BATCH = 16;  // batched eval: many MCTS leaves per forward pas
 std::string gModelPath;            // stashed by kgeLoad so the NNEvaluator can load it
 #ifdef KGE_THREADS
 NNEvaluator* gNNEval = nullptr;    // 1 server thread owns the WebGPU device (deferred init)
-Search* gKataSearch = nullptr;     // KataGo's real search: tree reuse, heuristics, PV
+AsyncBot* gBot = nullptr;          // KataGo's real engine: tree reuse (makeMove) + ponder
+std::vector<std::pair<Loc, Player>> gBotLine;  // the bot's current line — for tree reuse
+bool gPondering = false;           // is the bot thinking in the background right now?
 #endif
 
 // ---- Batched MCTS (PUCT) ---------------------------------------------------
@@ -148,10 +153,17 @@ KATAEVAL_EXPORT int kgeLoad(const char* modelPath, int boardSize) {
     // createComputeContext picks the backend (WebGPU, else Eigen CPU); match the
     // input layout to it (Eigen only supports NHWC).
     gUseNHWC = !kgeBackendIsGpu();
+#ifndef KGE_THREADS
+    // Single-thread build: the direct handle is the backend (kgeEval / kgeEvalSeq).
     gHandle = NeuralNet::createComputeHandle(
       gCtx, gModel, /*logger*/nullptr, /*maxBatch*/KGE_MAX_BATCH,
       /*requireExactNNLen*/true, /*inputsUseNHWC*/gUseNHWC, /*gpuIdx*/-1, /*serverThread*/0);
     gInputs = NeuralNet::createInputBuffers(gModel, KGE_MAX_BATCH, gXLen, gYLen);
+#endif
+    // Threaded build: skip the direct handle — the lazily-created NNEvaluator is the
+    // SOLE backend for both analysis (kgeEvalSeqKata) and search (kgeSearchKata), so
+    // the net loads to the GPU exactly once and both share its NN cache. gCtx stays
+    // (cheap: device init is deferred) purely so kgeBackendIsGpu reports correctly.
     return 1;
   } catch(const std::exception& e) {
     gErr = e.what();
@@ -435,18 +447,18 @@ KATAEVAL_EXPORT int kgeSearch(const int* moveLocs, const int* moveCols, int numM
 
 #ifdef KGE_THREADS
 // ---- Real KataGo engine (Path A) -------------------------------------------
-// kgeSearchKata runs KataGo's actual Search (tree reuse, PUCT heuristics, PV) over
-// our WebGPU backend. The NNEvaluator owns ONE server thread; that thread creates
-// the WebGPU device (init was deferred to createComputeHandle), so the thread-local
-// device lives where it's used. The Search's numThreads worker threads only queue
-// NN requests to that server thread (batched) — they never touch WebGPU objects.
+// ONE NNEvaluator (1 server thread owns the WebGPU device — init deferred to
+// createComputeHandle so the thread-local device lives on that thread) backs BOTH
+// analysis (kgeEvalSeqKata) and search (kgeSearchKata): one net load, one shared NN
+// cache. AsyncBot adds tree reuse (makeMove) + background ponder. Search worker
+// threads only queue batched NN requests — they never touch WebGPU objects.
 static Logger& kgeLogger() {
   static Logger logger(nullptr, false, false, false, false);  // silent
   return logger;
 }
 
 static bool ensureKataEngine() {
-  if(gKataSearch != nullptr) return true;
+  if(gBot != nullptr) return true;
   ConfigParser cfg;  // consulted-only by the backend during construction; not stored
   gNNEval = new NNEvaluator(
     "kge", gModelPath, "", &kgeLogger(),
@@ -459,68 +471,136 @@ static bool ensureKataEngine() {
     /*randSeed*/"kge-nneval", /*doRandomize*/false, /*defaultSymmetry*/0,
     /*disableWarmup*/true, cfg);
   gNNEval->spawnServerThreads();
-  gKataSearch = new Search(SearchParams::basicDecentParams(), gNNEval, &kgeLogger(), "kge-search");
+  gBot = new AsyncBot(SearchParams::basicDecentParams(), gNNEval, /*humanEval*/NULL, &kgeLogger(), "kge-search");
   return true;
+}
+
+// Stop any background ponder so the engine is idle for a fresh request.
+static void stopPonder() {
+  if(gBot != nullptr && gPondering) { gBot->stopAndWait(); gPondering = false; }
 }
 
 static int locToIdx(Loc loc) {
   if(loc == Board::PASS_LOC || loc == Board::NULL_LOC) return -1;
   return Location::getY(loc, gXLen) * gXLen + Location::getX(loc, gXLen);
 }
+static Loc decodeLoc(int mv) {
+  return (mv < 0) ? Board::PASS_LOC : Location::getLoc(mv % gXLen, mv / gXLen, gXLen);
+}
+
+// Replay a move sequence into a fresh Board + BoardHistory (captures + ko/superko).
+static void replayLine(const int* moveLocs, const int* moveCols, int numMoves, double komi,
+                       Board& board, BoardHistory& hist) {
+  Rules rules = Rules::getTrompTaylorish();
+  rules.komi = (float)komi;
+  board = Board(gXLen, gYLen);
+  Player firstPla = (numMoves > 0) ? (Player)moveCols[0] : P_BLACK;
+  hist = BoardHistory(board, firstPla, rules, 0);
+  for(int i = 0; i < numMoves; i++) {
+    Loc loc = decodeLoc(moveLocs[i]);
+    Player pla = (Player)moveCols[i];
+    if(hist.isLegal(board, loc, pla)) hist.makeBoardMoveAssumeLegal(board, loc, pla, NULL);
+  }
+}
+
+// Instant analysis via the shared NNEvaluator. Returns PROBABILITIES (distinct from
+// the direct kgeEvalSeq, which gives logits): policyOut in [0,1] with illegal = -1
+// (NNPos layout, pass at index hw); valueOut = {pWhiteWin, pWhiteLoss, pNoResult,
+// whiteScoreMean (points), whiteLead}; ownerOut in [-1,1] (white positive).
+KATAEVAL_EXPORT int kgeEvalSeqKata(const int* moveLocs, const int* moveCols, int numMoves,
+                                   int toPla, double komi,
+                                   int* boardOut, float* policyOut, float* valueOut, float* ownerOut) {
+  if(gModel == nullptr) { gErr = "not loaded"; return 0; }
+  try {
+    if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
+    stopPonder();
+    Board board; BoardHistory hist;
+    replayLine(moveLocs, moveCols, numMoves, komi, board, hist);
+    MiscNNInputParams nnInputParams;
+    NNResultBuf buf;
+    gNNEval->evaluate(board, hist, (Player)toPla, nnInputParams, buf,
+                      /*skipCache*/false, /*includeOwnerMap*/ownerOut != nullptr);
+    std::shared_ptr<NNOutput> out = buf.result;
+    const int hw = gXLen * gYLen;
+    if(boardOut)
+      for(int y = 0; y < gYLen; y++) for(int x = 0; x < gXLen; x++)
+        boardOut[y*gXLen+x] = (int)board.colors[Location::getLoc(x, y, gXLen)];
+    if(policyOut) {
+      for(int i = 0; i < hw; i++) policyOut[i] = out->policyProbs[i];
+      policyOut[hw] = out->policyProbs[NNPos::locToPos(Board::PASS_LOC, gXLen, gXLen, gYLen)];
+    }
+    if(valueOut) {
+      valueOut[0] = out->whiteWinProb; valueOut[1] = out->whiteLossProb; valueOut[2] = out->whiteNoResultProb;
+      valueOut[3] = out->whiteScoreMean; valueOut[4] = out->whiteLead;
+    }
+    if(ownerOut && out->whiteOwnerMap != NULL)
+      for(int i = 0; i < hw; i++) ownerOut[i] = out->whiteOwnerMap[i];
+    return 1;
+  } catch(const std::exception& e) { gErr = e.what(); return 0; }
+}
 
 KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
                                   int toPla, double komi, int maxVisits, double maxTimeMs,
                                   int numSearchThreads,
-                                  int* bestMoveOut, float* winrateOut,
-                                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut) {
+                                  int* bestMoveOut, float* winrateOut, float* scoreOut,
+                                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut) {
   if(gModel == nullptr) { gErr = "not loaded"; return 0; }
   try {
     if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
-    Rules rules = Rules::getTrompTaylorish();
-    rules.komi = (float)komi;
-    Board board(gXLen, gYLen);
-    Player firstPla = (numMoves > 0) ? (Player)moveCols[0] : P_BLACK;
-    BoardHistory hist(board, firstPla, rules, 0);
-    for(int i = 0; i < numMoves; i++) {
-      Player pla = (Player)moveCols[i];
-      Loc loc = (moveLocs[i] < 0) ? Board::PASS_LOC : Location::getLoc(moveLocs[i] % gXLen, moveLocs[i] / gXLen, gXLen);
-      if(hist.isLegal(board, loc, pla)) hist.makeBoardMoveAssumeLegal(board, loc, pla, NULL);
-    }
+    stopPonder();
     Player rootPla = (Player)toPla;
 
+    // Tree reuse: when the requested line forward-extends the bot's current line, advance
+    // via makeMove (keeps the explored subtree). Otherwise rebuild from scratch.
+    std::vector<std::pair<Loc,Player>> newLine;
+    for(int i = 0; i < numMoves; i++) newLine.push_back({ decodeLoc(moveLocs[i]), (Player)moveCols[i] });
+    size_t common = 0;
+    while(common < gBotLine.size() && common < newLine.size() && gBotLine[common] == newLine[common]) common++;
+    bool reused = false;
+    if(gBot->getSearch()->getRootNode() != NULL && common == gBotLine.size()) {
+      reused = true;
+      for(size_t i = common; i < newLine.size() && reused; i++)
+        if(!gBot->makeMove(newLine[i].first, newLine[i].second)) reused = false;
+    }
+    if(!reused) {
+      Board board; BoardHistory hist;
+      replayLine(moveLocs, moveCols, numMoves, komi, board, hist);
+      gBot->setPosition(rootPla, board, hist);
+    }
+    gBotLine = newLine;
+
     SearchParams params = SearchParams::basicDecentParams();
-    params.maxVisits = maxVisits;
-    params.maxPlayouts = maxVisits;
+    params.maxVisits = maxVisits; params.maxPlayouts = maxVisits;
     params.maxTime = maxTimeMs / 1000.0;
     params.numThreads = numSearchThreads > 0 ? numSearchThreads : 1;
-    gKataSearch->setParams(params);
-    gKataSearch->setPosition(rootPla, board, hist);
+    gBot->setParamsNoClearing(params);  // keep the reused tree
 
-    Loc best = gKataSearch->runWholeSearchAndGetMove(rootPla);
+    TimeControls tc;
+    Loc best = gBot->genMoveSynchronous(rootPla, tc);
     if(bestMoveOut) *bestMoveOut = locToIdx(best);
+    if(reusedOut) *reusedOut = reused ? 1 : 0;
 
+    const Search* s = gBot->getSearch();
     ReportedSearchValues vals;
-    double winrate = 0.5; int64_t visits = 0;
-    if(gKataSearch->getRootValues(vals)) {
-      // winValue is white-perspective P(win); convert to the side to move.
-      winrate = (rootPla == P_WHITE) ? vals.winValue : vals.lossValue;
-      visits = vals.visits;
+    if(s->getRootValues(vals)) {
+      if(winrateOut) *winrateOut = (float)((rootPla == P_WHITE) ? vals.winValue : vals.lossValue);
+      if(scoreOut)   *scoreOut   = (float)((rootPla == P_WHITE) ? vals.lead : -vals.lead);
+      if(visitsOut)  *visitsOut  = (int)vals.visits;
     }
-    if(winrateOut) *winrateOut = (float)winrate;
-    if(visitsOut) *visitsOut = (int)visits;
-
     int pvLen = 0;
     if(pvOut && pvCap > 0) {
       std::vector<Loc> pvBuf; std::vector<int64_t> vb, eb; std::vector<Loc> sl; std::vector<double> sv;
-      gKataSearch->appendPV(pvBuf, vb, eb, sl, sv, gKataSearch->getRootNode(), pvCap);
+      s->appendPV(pvBuf, vb, eb, sl, sv, s->getRootNode(), pvCap);
       for(size_t i = 0; i < pvBuf.size() && pvLen < pvCap; i++) pvOut[pvLen++] = locToIdx(pvBuf[i]);
     }
     if(pvLenOut) *pvLenOut = pvLen;
+
+    // Keep thinking in the background: a re-search reuses the deeper tree, and if the
+    // user plays a move we makeMove straight into an already-explored subtree.
+    gBot->ponder();
+    gPondering = true;
     return 1;
-  } catch(const std::exception& e) {
-    gErr = e.what();
-    return 0;
-  }
+  } catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 #endif  // KGE_THREADS
 

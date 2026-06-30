@@ -21,6 +21,17 @@
   .bar .b { background: #111; } .bar .w { background: #eee; }
   .bar span { color: transparent; }
   .wr { display: flex; justify-content: space-between; font-weight: 600; }
+  .metrics { width: 250px; }
+  .metrics h2 { font-size: 16px; margin: 0 0 4px; display: flex; justify-content: space-between; align-items: baseline; }
+  .pill { font: 600 11px/1 ui-monospace, monospace; padding: 3px 7px; border-radius: 999px; background: #8883; }
+  .pill.live { background: #1a891722; color: #1a8917; }
+  .pill.run { background: #c0780022; color: #c07800; }
+  .metricgrid { display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; margin: 10px 0; }
+  .metricgrid > div:nth-child(odd) { opacity: .6; }
+  .metricgrid > div:nth-child(even) { text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; }
+  .gbar { height: 22px; border-radius: 6px; overflow: hidden; display: flex; border: 1px solid #8884; background: #8882; }
+  .gbar .adv { background: #1a8917; }
+  #m_pv { word-spacing: 4px; line-height: 1.7; opacity: .9; }
 </style>
 </head>
 <body>
@@ -64,6 +75,24 @@
     <div class="row muted">Powered by <span class="mono">kataeval</span> (cpp/kataeval) — the clean
       KataGo-eval dependency compiled to WASM. Same forward pass that's validated byte-identical
       to the Eigen CPU backend natively.</div>
+  </div>
+
+  <div class="panel metrics">
+    <h2>Bot thinking <span class="pill" id="m_state">idle</span></h2>
+    <div class="row">
+      <div class="wr"><span>best <span class="mono" id="m_best">–</span></span><span class="mono" id="m_score">–</span></div>
+      <div class="gbar"><div class="adv" id="m_adv" style="width:50%"></div></div>
+      <div class="muted" id="m_wrlabel" style="margin-top:4px;">win-rate (to move) <span class="mono" id="m_wr">–</span></div>
+    </div>
+    <div class="metricgrid">
+      <div>visits</div><div id="m_visits">–</div>
+      <div>speed</div><div id="m_nps">–</div>
+      <div>time</div><div id="m_time">–</div>
+      <div>threads</div><div id="m_threads">–</div>
+      <div>tree</div><div id="m_reuse">–</div>
+    </div>
+    <div class="muted">principal variation</div>
+    <div class="row mono" id="m_pv" style="min-height:3.4em;">–</div>
   </div>
 
 <script src="vendor/wgo.min.js"></script>
@@ -144,6 +173,7 @@
   async function analyze() {
     if (!ready) return;
     try {
+      setBotState('idle');   // an eval stops any background ponder (position changed)
       const t0 = performance.now();
       // Worker replays the sequence (captures + ko/superko + recent-move features) and
       // returns the board + raw policy/value/ownership.
@@ -154,23 +184,18 @@
       for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) grid[x][y] = r.board[idx(x, y)];
       renderBoard();
 
-      // value: white-perspective softmax(win,loss,noResult)
-      const [pWin, pLoss] = softmax([val[0], val[1], val[2]]);
-      const wWhite = pWin * 100, wBlack = pLoss * 100;
+      // value: probabilities straight from the net (P white win / loss); lead in points.
+      const wWhite = val[0] * 100, wBlack = val[1] * 100;
       $('wwr').textContent = wWhite.toFixed(1) + '%'; $('bwr').textContent = wBlack.toFixed(1) + '%';
       $('barW').style.width = wWhite + '%'; $('barB').style.width = wBlack + '%';
-      $('score').textContent = (val[3] * 20).toFixed(1) + ' (W)';  // raw*~20 -> points (approx)
+      $('score').textContent = (val[4] >= 0 ? '+' : '') + val[4].toFixed(1) + ' (W)';  // white lead (points)
       $('evtime').textContent = dt + ' ms';
       $('tomove').textContent = toPlay === 1 ? 'Black' : 'White';
 
-      // policy: softmax over legal (empty) points + pass
-      const legalLogits = [], legalPos = [];
-      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (grid[x][y] === 0) { legalLogits.push(pol[idx(x, y)]); legalPos.push(idx(x, y)); }
-      legalLogits.push(pol[HW]); legalPos.push(HW); // pass
-      const probs = softmax(legalLogits);
+      // policy: already probabilities (illegal = -1); pick the argmax over legal moves.
       lastPolicy = new Float32Array(HW + 1);
       let best = -1, bestP = -1;
-      for (let i = 0; i < legalPos.length; i++) { lastPolicy[legalPos[i]] = probs[i]; if (probs[i] > bestP) { bestP = probs[i]; best = legalPos[i]; } }
+      for (let i = 0; i <= HW; i++) { const p = pol[i]; if (p < 0) continue; lastPolicy[i] = p; if (p > bestP) { bestP = p; best = i; } }
       lastBest = best;
       $('best').textContent = best === HW ? `pass (${(bestP*100).toFixed(1)}%)`
         : `${'ABCDEFGHJKLMNOPQRST'[best % N]}${N - Math.floor(best / N)} (${(bestP*100).toFixed(1)}%)`;
@@ -252,9 +277,25 @@
     }
     return kataInfo;
   }
+  const ptName = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
+  function setBotState(text, cls) { const e = $('m_state'); e.textContent = text; e.className = 'pill' + (cls ? ' ' + cls : ''); }
+  function renderMetrics(r, threads) {
+    const wr = r.wr * 100;
+    $('m_best').textContent = ptName(r.best);
+    $('m_score').textContent = (r.score >= 0 ? '+' : '') + r.score.toFixed(1);
+    $('m_adv').style.width = wr.toFixed(1) + '%';
+    $('m_wr').textContent = wr.toFixed(1) + '%';
+    $('m_visits').textContent = r.nv.toLocaleString();
+    $('m_nps').textContent = r.nps.toLocaleString() + '/s';
+    $('m_time').textContent = r.ms.toLocaleString() + ' ms';
+    $('m_threads').textContent = threads;
+    $('m_reuse').textContent = r.reused ? 'reused ✓' : 'fresh';
+    $('m_pv').textContent = r.pv.map(ptName).join(' ') || '–';
+  }
   async function kataThink() {
     if (!ready) return null;
     try {
+      setBotState('searching…', 'run');
       $('searchout').textContent = 'KataGo: starting engine…';
       await ensureKataWorker();
       const visits = Math.max(1, parseInt($('visits').value) || 400);
@@ -262,12 +303,13 @@
       const threads = Math.max(1, parseInt($('threads').value) || 4);
       $('searchout').textContent = 'KataGo thinking…';
       const r = await kataCall({ type: 'search', moves: moves.slice(0, MAXMV), toPlay, komi: 7.5, visits, ms, threads });
-      const mv = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
-      const pv = r.pv.map(mv);
-      $('searchout').innerHTML = `KataGo: <b>${mv(r.best)}</b> · ${(r.wr * 100).toFixed(1)}% · ${r.nv} visits / ${r.ms} ms · ${threads}t · PV ${pv.slice(0, 8).join(' ')}`;
+      renderMetrics(r, threads);
+      setBotState('pondering…', 'live');   // the engine keeps thinking in the background
+      $('searchout').innerHTML = `KataGo: <b>${ptName(r.best)}</b> · ${(r.wr * 100).toFixed(1)}% · ${r.nv} visits · ${r.nps.toLocaleString()}/s · ${threads}t${r.reused ? ' · reused' : ''}`;
       searchBest = r.best; drawOverlay();
       return r.best;
     } catch (e) {
+      setBotState('error', 'run');
       $('searchout').innerHTML = 'KataGo search failed: <span class="bad">' + (e.message || e) + '</span>';
       return null;
     }

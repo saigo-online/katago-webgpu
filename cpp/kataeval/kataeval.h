@@ -63,15 +63,23 @@ int kgeSearch(const int* moveLocs, const int* moveCols, int numMoves,
               int* bestMoveOut, float* winrateOut,
               int* pvOut, int pvCap, int* pvLenOut, int* visitsOut);
 
-// kgeSearchKata: KataGo's REAL Search (tree reuse, PUCT heuristics, PV) over the
-// WebGPU backend, via an NNEvaluator (1 server thread owns the device) + numSearchThreads
-// worker threads queueing batched NN requests. Same outputs as kgeSearch, plus a
-// numSearchThreads knob. Requires the threaded build (-pthread). See Path A.
+// kgeEvalSeqKata: instant analysis through the SAME NNEvaluator that backs search (one
+// net load, shared cache). Returns probabilities: policyOut[hw+1] in [0,1] (illegal=-1,
+// pass at hw); valueOut[5] = {pWhiteWin,pWhiteLoss,pNoResult,whiteScoreMean,whiteLead};
+// ownerOut[hw] in [-1,1] (pass NULL to skip). Threaded build only.
+int kgeEvalSeqKata(const int* moveLocs, const int* moveCols, int numMoves,
+                   int toPla, double komi,
+                   int* boardOut, float* policyOut, float* valueOut, float* ownerOut);
+
+// kgeSearchKata: KataGo's REAL engine (AsyncBot — tree reuse + ponder) over the WebGPU
+// backend, via an NNEvaluator (1 server thread owns the device) + numSearchThreads worker
+// threads queueing batched NN requests. winrateOut/scoreOut are side-to-move; reusedOut=1
+// if the tree was reused. Requires the threaded build (-pthread). See Path A.
 int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
                   int toPla, double komi, int maxVisits, double maxTimeMs,
                   int numSearchThreads,
-                  int* bestMoveOut, float* winrateOut,
-                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut);
+                  int* bestMoveOut, float* winrateOut, float* scoreOut,
+                  int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut);
 
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size
