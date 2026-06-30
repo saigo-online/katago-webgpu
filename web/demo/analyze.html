@@ -49,7 +49,9 @@
 
   <div class="panel">
     <div class="row status" id="status">loading engine…</div>
-    <div class="row">Net: <select id="net"></select> Size: <select id="size"></select> <span class="muted" id="netnote"></span></div>
+    <div class="row">Net: <select id="net"></select> Size: <select id="size"></select>
+      Handi: <select id="hc"></select> Komi: <input id="komi" type="number" value="7.5" step="0.5" style="width:54px">
+      <span class="muted" id="netnote"></span></div>
     <div class="row">
       <div class="wr"><span>Black <span id="bwr">–</span></span><span><span id="wwr">–</span> White</span></div>
       <div class="bar"><div class="b" id="barB" style="width:50%">.</div><div class="w" id="barW" style="width:50%">.</div></div>
@@ -186,6 +188,27 @@
   for (const s of [19, 13, 9]) { const o = document.createElement('option'); o.value = s; o.textContent = s + '×' + s; if (s === N) o.selected = true; szSel.appendChild(o); }
   szSel.onchange = () => { const u = new URLSearchParams(location.search); u.set('size', szSel.value); location.search = u.toString(); }; // reload with new size
 
+  // Handicap: black setup stones on the star points (white moves first). ?hc= reloads.
+  function handicapStones(n, sz) {
+    if (n < 1) return [];
+    const m = sz >= 13 ? 3 : 2, lo = m, hi = sz - 1 - m, mid = (sz - 1) / 2;
+    const UL = [lo,lo], UR = [hi,lo], LL = [lo,hi], LR = [hi,hi], C = [mid,mid],
+          T = [mid,lo], B = [mid,hi], L = [lo,mid], R = [hi,mid];
+    return ({ 1:[UR], 2:[UR,LL], 3:[UR,LL,LR], 4:[UL,UR,LL,LR], 5:[UL,UR,LL,LR,C],
+              6:[UL,UR,LL,LR,L,R], 7:[UL,UR,LL,LR,L,R,C], 8:[UL,UR,LL,LR,L,R,T,B],
+              9:[UL,UR,LL,LR,L,R,T,B,C] })[n] || [];
+  }
+  const hc = (() => { const h = parseInt(qs.get('hc')); return (h >= 1 && h <= 9) ? h : 0; })();
+  const hcSel = $('hc');
+  for (const h of [0,1,2,3,4,5,6,7,8,9]) { const o = document.createElement('option'); o.value = h; o.textContent = h === 0 ? 'none' : h; if (h === hc) o.selected = true; hcSel.appendChild(o); }
+  hcSel.onchange = () => { const u = new URLSearchParams(location.search); u.set('hc', hcSel.value); location.search = u.toString(); };
+  // handicap black stones precede the game; the engine sees them before the played moves.
+  const hcMoves = handicapStones(hc, N).map(([x, y]) => ({ loc: y * N + x, col: 1 }));
+  const engineMoves = () => hcMoves.concat(moves);
+  $('komi').value = hc > 0 ? 0.5 : 7.5;   // handicap games conventionally use 0.5 komi
+  const komiVal = () => { const k = parseFloat($('komi').value); return isNaN(k) ? 0 : k; };
+  toPlay = hc > 0 ? 2 : 1;                 // white moves first under handicap
+
   // Fetch a net with persistent caching (Cache API) — shared with the search worker
   // (same origin), so each net downloads once and survives refreshes. The big nets
   // (b20c256 = 87 MB) then load instantly on reload. Falls back to a plain fetch if
@@ -225,7 +248,7 @@
       const t0 = performance.now();
       // Worker replays the sequence (captures + ko/superko + recent-move features) and
       // returns the board + raw policy/value/ownership.
-      const r = await kataCall({ type: 'eval', moves: moves.slice(0, MAXMV), toPlay, komi: 7.5, owner: $('owner').checked });
+      const r = await kataCall({ type: 'eval', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), owner: $('owner').checked });
       const dt = (performance.now() - t0).toFixed(0);
       const pol = r.policy, val = r.value;
       // Sync the displayed board to the replayed position (shows captures), then redraw.
@@ -389,7 +412,7 @@
       const ms = Math.max(100, parseInt($('ms').value) || 3000);
       const threads = Math.max(1, parseInt($('threads').value) || 4);
       $('searchout').textContent = 'KataGo thinking…';
-      const r = await kataCall({ type: 'search', moves: moves.slice(0, MAXMV), toPlay, komi: 7.5, visits, ms, threads });
+      const r = await kataCall({ type: 'search', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), visits, ms, threads });
       if (r.superseded) return null;   // a newer request took over and owns the panel now
       renderMetrics(r, threads);
       setBotState('pondering…', 'live');   // the engine keeps thinking in the background
@@ -426,13 +449,11 @@
   // Standard SGF from the move list (coords a–s, row a = top, matching the board).
   function gameSGF() {
     const lt = i => 'abcdefghijklmnopqrs'[i];
-    let sgf = `(;GM[1]FF[4]CA[UTF-8]SZ[${N}]KM[7.5]RU[Tromp-Taylor]` +
+    const co = loc => lt(loc % N) + lt(Math.floor(loc / N));
+    let sgf = `(;GM[1]FF[4]CA[UTF-8]SZ[${N}]KM[${komiVal()}]RU[Tromp-Taylor]` +
               `AP[saigo-katago-webgpu]PB[KataGo ${netKey}]PW[KataGo ${netKey}]`;
-    for (const m of moves) {
-      const c = m.col === 1 ? 'B' : 'W';
-      const co = m.loc < 0 ? '' : lt(m.loc % N) + lt(Math.floor(m.loc / N));  // pass = empty
-      sgf += `;${c}[${co}]`;
-    }
+    if (hcMoves.length) sgf += `HA[${hcMoves.length}]AB` + hcMoves.map(m => `[${co(m.loc)}]`).join('');  // handicap setup
+    for (const m of moves) sgf += `;${m.col === 1 ? 'B' : 'W'}[${m.loc < 0 ? '' : co(m.loc)}]`;  // pass = empty
     return sgf + ')';
   }
   function saveSGF() {
@@ -477,7 +498,8 @@
   };
   $('pass').onclick = () => playMove(-1);
   $('undo').onclick = () => { if (ready && moves.length) { moves.pop(); toPlay = toPlay === 1 ? 2 : 1; analyze(); } };
-  $('clear').onclick = () => { if (ready) { moves.length = 0; toPlay = 1; analyze(); } };
+  $('clear').onclick = () => { if (ready) { moves.length = 0; toPlay = hc > 0 ? 2 : 1; analyze(); } };
+  $('komi').onchange = analyze;   // komi affects the eval (score + win-rate)
   $('owner').onchange = analyze;
   window.addEventListener('resize', () => { syncOverlay(); if (lastPolicy) drawOverlay(); });
 })();
