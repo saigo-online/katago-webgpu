@@ -69,7 +69,7 @@
       <button id="thinkkata" title="KataGo's real Search (PUCT heuristics + PV) on a worker thread">Search ▶</button>
       visits <input id="visits" type="number" value="400" min="1" max="20000" style="width:64px">
       ms <input id="ms" type="number" value="3000" min="100" max="120000" style="width:70px">
-      threads <input id="threads" type="number" value="4" min="1" max="8" style="width:46px">
+      threads <input id="threads" type="number" value="4" min="1" max="32" style="width:46px">
       <label style="margin-left:6px;"><input type="checkbox" id="searchplay"> engine searches</label>
     </div>
     <div class="row mono" id="searchout" style="min-height:1.4em"></div>
@@ -213,6 +213,9 @@
   const hcMoves = handicapStones(hc, N).map(([x, y]) => ({ loc: y * N + x, col: 1 }));
   const engineMoves = () => hcMoves.concat(moves);
   $('komi').value = hc > 0 ? 0.5 : 7.5;   // handicap games conventionally use 0.5 komi
+  // Per-batch GPU latency is ~fixed, so more search threads -> bigger batches -> more
+  // nnEvals/s — up to ~one per core (oversubscription then hurts the NN server thread).
+  $('threads').value = Math.max(2, Math.min(16, (navigator.hardwareConcurrency || 4) - 1));
   const komiVal = () => { const k = parseFloat($('komi').value); return isNaN(k) ? 0 : k; };
   toPlay = hc > 0 ? 2 : 1;                 // white moves first under handicap
 

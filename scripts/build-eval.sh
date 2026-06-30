@@ -31,7 +31,7 @@ if [ "${MT:-0}" = 1 ]; then
   MANIFESTS+=( kataeval/sources-search.txt )
   OUTNAME=kataeval-mt
   EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePoll,_kgePonderBegin,_kgeStopSearch,_kgeCandidates"
-  LINKEXTRA=( -pthread -sPTHREAD_POOL_SIZE=8 -sINITIAL_MEMORY=256MB )
+  LINKEXTRA=( -pthread -sPTHREAD_POOL_SIZE=33 -sINITIAL_MEMORY=256MB )  # 1 NN server + up to 32 search threads
 fi
 
 # Read the canonical dependency manifest(s) (one clean dep, one source of truth).

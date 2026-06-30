@@ -51,7 +51,9 @@ InputBuffers* gInputs = nullptr;
 int gXLen = 19, gYLen = 19, gModelVersion = 0;
 bool gUseNHWC = false;  // WebGPU wants NCHW (false); the Eigen CPU backend wants NHWC (true)
 std::string gErr = "";
-const int KGE_MAX_BATCH = 16;  // batched eval: many MCTS leaves per forward pass
+const int KGE_MAX_BATCH = 32;  // batched eval: per-batch GPU latency is ~fixed, so a
+                               // bigger batch (more search threads in flight) ~linearly
+                               // raises nnEvals/s. Validated to batch 64 natively.
 
 // ---- Real KataGo engine (Path A): NNEvaluator + Search ---------------------
 std::string gModelPath;            // stashed by kgeLoad so the NNEvaluator can load it
