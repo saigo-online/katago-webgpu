@@ -76,6 +76,7 @@
     <div class="row">
       <button id="selfplay" title="The engine plays itself, searching each move">Self-play ▶</button>
       <button id="savesgf" title="Download the current game as SGF">Save SGF ⤓</button>
+      <button id="savedata" title="Download self-play training data (policy + value targets) as JSON">Save data ⤓</button>
       <span class="muted mono" id="gameinfo"></span>
     </div>
     <div class="row muted" id="adapter">adapter: –</div>
@@ -163,7 +164,8 @@
   // helpers / state declared before the load block (which calls analyze()).
   const idx = (x, y) => y * N + x;
   function softmax(arr) { let m = -1e30; for (const v of arr) m = Math.max(m, v); let s = 0; const o = arr.map(v => { const e = Math.exp(v - m); s += e; return e; }); return o.map(v => v / s); }
-  let lastPolicy = null, lastBest = -1, lastOwner = null, lastCand = null;
+  let lastPolicy = null, lastBest = -1, lastOwner = null, lastCand = null, lastSearch = null;
+  let trainRecord = [];  // per-move {policy target = visit dist, value = searched win-rate} for training export
   const ptName = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
   // The single engine lives in a worker (threaded kataeval-mt): analysis + search both
   // go through it — one net load, shared NN cache, main thread free. Declared up here
@@ -414,6 +416,7 @@
       $('searchout').textContent = 'KataGo thinking…';
       const r = await kataCall({ type: 'search', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), visits, ms, threads });
       if (r.superseded) return null;   // a newer request took over and owns the panel now
+      lastSearch = r;                  // remember for training-data capture (self-play)
       renderMetrics(r, threads);
       setBotState('pondering…', 'live');   // the engine keeps thinking in the background
       $('searchout').innerHTML = `KataGo: <b>${ptName(r.best)}</b> · ${(r.wr * 100).toFixed(1)}% · ${r.nv} visits · ${r.nps.toLocaleString()}/s · ${threads}t${r.reused ? ' · reused' : ''}`;
@@ -432,10 +435,18 @@
     if (!ready) return;
     if (selfPlaying) { selfPlaying = false; $('selfplay').textContent = 'Self-play ▶'; return; }  // toggle off
     selfPlaying = true; $('selfplay').textContent = 'Stop ⏹';
+    trainRecord = [];                                // fresh game = fresh training record
     let passes = 0; const cap = N * N * 2;  // safety cap; normally ends on two passes
     while (selfPlaying && moves.length < cap) {
       const mv = await kataThink();                 // search the current position
       if (!selfPlaying || mv === null) break;        // stopped, or error/superseded
+      // capture the search as a training sample BEFORE playing: policy target = the visit
+      // distribution over candidate moves; value target = the searched win-rate/score.
+      if (lastSearch) trainRecord.push({
+        n: moves.length, toPlay, played: mv,
+        winrate: +lastSearch.wr.toFixed(4), score: +lastSearch.score.toFixed(2), visits: lastSearch.nv,
+        policy: (lastSearch.cand || []).map(c => ({ loc: c.loc, visits: c.visits })),
+      });
       playMove(mv);                                  // play it (mv = loc, or -1 for pass)
       passes = mv < 0 ? passes + 1 : 0;
       $('gameinfo').textContent = `playing… ${moves.length} moves`;
@@ -443,7 +454,26 @@
       await new Promise(r => setTimeout(r, 60));      // let the UI breathe
     }
     selfPlaying = false; $('selfplay').textContent = 'Self-play ▶';
-    $('gameinfo').textContent = `game: ${moves.length} moves${passes >= 2 ? ' · both passed (end)' : ''}`;
+    $('gameinfo').textContent = `game: ${moves.length} moves${passes >= 2 ? ' · both passed (end)' : ''} · ${trainRecord.length} samples`;
+  }
+
+  // Training sidecar: positions + policy targets (visit distributions) + value targets,
+  // enough to convert to KataGo npz offline (recompute inputs from the move sequence).
+  function trainJSON() {
+    return JSON.stringify({
+      format: 'saigo-train-v1', net: netKey, size: N, komi: komiVal(),
+      handicap: hcMoves.length, handicapStones: hcMoves.map(m => m.loc),
+      finalScore: lastSearch ? +lastSearch.score.toFixed(2) : null,  // white lead estimate at end
+      moves: trainRecord,
+    });
+  }
+  function saveData() {
+    if (!trainRecord.length) { $('gameinfo').textContent = 'no self-play data yet — run self-play first'; return; }
+    const blob = new Blob([trainJSON()], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `saigo-${netKey}-${N}x${N}-${trainRecord.length}samples.json`;
+    a.click(); URL.revokeObjectURL(a.href);
   }
 
   // Standard SGF from the move list (coords a–s, row a = top, matching the board).
@@ -491,6 +521,7 @@
   $('thinkkata').onclick = kataThink;
   $('selfplay').onclick = selfPlay;
   $('savesgf').onclick = saveSGF;
+  $('savedata').onclick = saveData;
   $('play').onclick = async () => {
     if (!ready) return;
     if ($('searchplay').checked) { const mv = await kataThink(); if (mv !== null) playMove(mv); }   // searched move (loc or -1)
