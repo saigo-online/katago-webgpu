@@ -323,6 +323,34 @@ struct ConvParamsHost {
 struct Conv1x1ParamsHost { uint32_t n, inC, outC, hw; };
 struct SBMAParamsHost { uint32_t n, c, hw, act; };
 struct AddParamsHost { uint32_t total, pad0, pad1, pad2; };
+struct WgParamsHost { uint32_t n, inC, outC, h, w, nTilesX, nTilesY, xi; };
+
+// Winograd F(2x2,3x3) filter transform U = G g G^T per (oc,ic).
+// w: [outC][inC][3][3] (ConvLayerDesc order) -> U: [16][outC][inC] (xi-major,
+// matching the winogradMatmul kernel's U[xi][oc][ic] layout).
+static std::vector<float> winogradFilterTransform(const std::vector<float>& w, int outC, int inC) {
+  static const float G[4][3] = {{1.f,0.f,0.f},{0.5f,0.5f,0.5f},{0.5f,-0.5f,0.5f},{0.f,0.f,1.f}};
+  std::vector<float> U((size_t)16 * outC * inC);
+  for(int oc = 0; oc < outC; oc++) {
+    for(int ic = 0; ic < inC; ic++) {
+      const float* g = w.data() + (size_t)(oc * inC + ic) * 9;
+      float Gg[4][3];
+      for(int i = 0; i < 4; i++)
+        for(int j = 0; j < 3; j++) {
+          float s = 0.f;
+          for(int k = 0; k < 3; k++) s += G[i][k] * g[k * 3 + j];
+          Gg[i][j] = s;
+        }
+      for(int i = 0; i < 4; i++)
+        for(int j = 0; j < 4; j++) {
+          float s = 0.f;
+          for(int k = 0; k < 3; k++) s += Gg[i][k] * G[j][k];
+          U[(size_t)(i * 4 + j) * outC * inC + oc * inC + ic] = s;
+        }
+    }
+  }
+  return U;
+}
 struct GPParamsHost { uint32_t n, c, hw, pad; };
 struct MMParamsHost { uint32_t m, k, o, act, hasBias, pad0, pad1, pad2; };
 struct AddBiasParamsHost { uint32_t n, c, hw, pad; };
@@ -334,6 +362,7 @@ struct RopeParamsHost { uint32_t n, numHeads, headDim, numPairs, hw, numKVHeads,
 struct AttnSParamsHost { uint32_t n, numHeads, numKVHeads, headDim, hw, kvGroupSize; float scale; uint32_t pad0; };
 struct AttnSMParamsHost { uint32_t n, numHeads, hw, pad0; };
 struct AttnOParamsHost { uint32_t n, numHeads, numKVHeads, vHeadDim, hw, kvGroupSize, pad0, pad1; };
+struct FlashParamsHost { uint32_t n, numHeads, numKVHeads, qHeadDim, vHeadDim, hw, kvGroupSize; float scale; };
 struct SwiParamsHost { uint32_t total, pad0, pad1, pad2; };
 struct RMSRParamsHost { uint32_t n, c, hw, pad0; float eps; uint32_t pad1, pad2, pad3; };
 struct RMSAParamsHost { uint32_t n, c, hw, act, hasBeta, pad0, pad1, pad2; };
@@ -585,8 +614,13 @@ static void assertSupportedArchitectureOrThrow(const ModelDesc& desc) {
       int kind = kb.first;
       if(kind == NESTED_BOTTLENECK_BLOCK_KIND)
         check(((const NestedBottleneckResidualBlockDesc*)kb.second.get())->blocks);
+      else if(kind == TRANSFORMER_ATTENTION_BLOCK_KIND) {
+        if(((const TransformerAttentionDesc*)kb.second.get())->vHeadDim > 64)
+          throw StringError("WebGPU backend: attention vHeadDim > 64 not supported "
+            "(flash-attention accumulator). See WEBGPU_STATUS.md.");
+      }
       else if(kind != ORDINARY_BLOCK_KIND && kind != GLOBAL_POOLING_BLOCK_KIND &&
-              kind != TRANSFORMER_ATTENTION_BLOCK_KIND && kind != TRANSFORMER_FFN_BLOCK_KIND)
+              kind != TRANSFORMER_FFN_BLOCK_KIND)
         throw StringError("WebGPU backend: unsupported block kind " +
           Global::intToString(kind) + ". See WEBGPU_STATUS.md.");
     }
@@ -628,6 +662,7 @@ struct ComputeHandle {
   // immutable for the handle's lifetime, so these pointers are stable keys.
   std::unordered_map<const void*, wgpu::Buffer> weightCache;
   std::unordered_map<const void*, std::pair<wgpu::Buffer, wgpu::Buffer>> bnCache;
+  std::unordered_map<const void*, wgpu::Buffer> winogradCache;  // Winograd-transformed 3x3 filters
   BufferPool pool;  // reused intermediate/uniform buffers across evals
 #endif
 
@@ -823,6 +858,17 @@ void NeuralNet::getOutput(
   // Outputs are created CopySrc-capable so any of them can be read back; for a
   // tiny-board eval the extra usage flag is free. (Only the 5 head outputs
   // strictly need it; intermediate-buffer pooling is a later perf step.)
+  // Winograd-transformed 3x3 filters, transformed once on host and cached on the handle.
+  auto wbufWino = [&](const ConvLayerDesc& cd, int outC, int inC) {
+    auto& cache = gpuHandle->winogradCache;
+    const void* key = cd.weights.data();
+    auto it = cache.find(key);
+    if(it != cache.end()) return it->second;
+    std::vector<float> U = winogradFilterTransform(cd.weights, outC, inC);
+    wgpu::Buffer b = wgMakeStorage(ctx, U.data(), U.size(), false);
+    cache.emplace(key, b);
+    return b;
+  };
   auto conv = [&](wgpu::Buffer in, int inC, int outC, const ConvLayerDesc& cd) {
     size_t outElts = (size_t)batchSize * outC * hw;
     wgpu::Buffer out = wgMakeStorage(ctx, nullptr, outElts, true);
@@ -830,6 +876,19 @@ void NeuralNet::getOutput(
       // 1x1 fast path (per-pixel channel GEMM): no spatial window/padding.
       Conv1x1ParamsHost p{(uint32_t)batchSize, (uint32_t)inC, (uint32_t)outC, (uint32_t)hw};
       rec.dispatch("conv1x1NCHW", {wgMakeUniform(ctx,p), in, wbuf(cd.weights), out}, (uint32_t)((outElts+63)/64));
+    } else if(!std::getenv("KATAGO_WEBGPU_NO_WINOGRAD")
+              && cd.convXSize == 3 && cd.convYSize == 3 && cd.dilationX == 1 && cd.dilationY == 1) {
+      // Winograd F(2,3): 4 mults/output vs 9 (validated by testEvaluateConv).
+      // KATAGO_WEBGPU_NO_WINOGRAD=1 forces the direct conv (for A/B benchmarking).
+      const int nTilesX = (nnXLen+1)/2, nTilesY = (nnYLen+1)/2, nTiles = nTilesX*nTilesY;
+      WgParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)nnYLen,(uint32_t)nnXLen,
+                     (uint32_t)nTilesX,(uint32_t)nTilesY,0u};
+      wgpu::Buffer pbuf = wgMakeUniform(ctx, p);
+      wgpu::Buffer V = wgMakeStorage(ctx, nullptr, (size_t)16*batchSize*inC*nTiles, false);
+      wgpu::Buffer M = wgMakeStorage(ctx, nullptr, (size_t)16*batchSize*outC*nTiles, false);
+      rec.dispatch("winogradInput",  {pbuf, in, V}, (uint32_t)(((size_t)batchSize*inC*nTiles+63)/64));
+      rec.dispatch("winogradMatmul", {pbuf, wbufWino(cd,outC,inC), V, M}, (uint32_t)(((size_t)16*batchSize*outC*nTiles+63)/64));
+      rec.dispatch("winogradOutput", {pbuf, M, out}, (uint32_t)(((size_t)batchSize*outC*nTiles+63)/64));
     } else {
       ConvParamsHost p{}; p.n=batchSize; p.inC=(uint32_t)inC; p.outC=(uint32_t)outC; p.h=(uint32_t)nnYLen; p.w=(uint32_t)nnXLen;
       p.fy=(uint32_t)cd.convYSize; p.fx=(uint32_t)cd.convXSize; p.dilY=(uint32_t)cd.dilationY; p.dilX=(uint32_t)cd.dilationX;
@@ -908,6 +967,15 @@ void NeuralNet::getOutput(
     size_t total = (size_t)batchSize*nH*vHeadDim*hw;
     wgpu::Buffer out = wgMakeStorage(ctx, nullptr, total, true);
     rec.dispatch("attnOutput", {wgMakeUniform(ctx,p), scores, v, out}, (uint32_t)((total+63)/64));
+    return out;
+  };
+  // Flash Attention: fused single-kernel attention (online softmax), no [seq x seq]
+  // score matrix. KATAGO_WEBGPU_NO_FLASHATTN=1 forces the 3-kernel path (A/B).
+  const bool useFlashAttn = (std::getenv("KATAGO_WEBGPU_NO_FLASHATTN") == nullptr);
+  auto flashAttn = [&](wgpu::Buffer q, wgpu::Buffer k, wgpu::Buffer v, int nH, int nKV, int qHD, int vHD, int kvGroup, float scale) {
+    FlashParamsHost p{(uint32_t)batchSize,(uint32_t)nH,(uint32_t)nKV,(uint32_t)qHD,(uint32_t)vHD,(uint32_t)hw,(uint32_t)kvGroup, scale};
+    wgpu::Buffer out = wgMakeStorage(ctx, nullptr, (size_t)batchSize*nH*vHD*hw, true);
+    rec.dispatch("flashAttention", {wgMakeUniform(ctx,p), q, k, v, maskBuf, out}, (uint32_t)(((size_t)batchSize*nH*hw+63)/64));
     return out;
   };
   auto swiglu = [&](wgpu::Buffer a, wgpu::Buffer gate, size_t total) {
@@ -995,9 +1063,15 @@ void NeuralNet::getOutput(
           rope(k, nKV, qHD, numPairs, nKV, a->learnableRope, cosB, sinB);
         }
         int kvGroup = nH / nKV;
-        wgpu::Buffer scores = attnScores(q, k, nH, nKV, qHD, kvGroup, 1.0f/std::sqrt((float)qHD));
-        attnSoftmax(scores, nH);
-        wgpu::Buffer attnOut = attnOutput(scores, v, nH, nKV, vHD, kvGroup);  // [n, nH*vHD, hw]
+        float scale = 1.0f/std::sqrt((float)qHD);
+        wgpu::Buffer attnOut;
+        if(useFlashAttn) {
+          attnOut = flashAttn(q, k, v, nH, nKV, qHD, vHD, kvGroup, scale);  // fused, no score matrix
+        } else {
+          wgpu::Buffer scores = attnScores(q, k, nH, nKV, qHD, kvGroup, scale);
+          attnSoftmax(scores, nH);
+          attnOut = attnOutput(scores, v, nH, nKV, vHD, kvGroup);
+        }  // [n, nH*vHD, hw]
         // outProj input is numHeads*vHeadDim (concatenated heads) — NOT vTot
         // (numKVHeads*vHeadDim); they differ under grouped-query attention.
         wgpu::Buffer projOut = proj(attnOut, nH*vHD, C, a->outProj.weights);  // -> trunk width
@@ -1144,6 +1218,31 @@ bool NeuralNet::testEvaluateConv(
 
   std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, enabled_t::False));
   initContextGpu(ctx.get(), NULL);
+
+  // 3x3 stride-1 dil-1 -> Winograd F(2,3). Validates the 3-stage winograd kernels
+  // against the CPU reference (the layer test's 3x3 conv case routes through here).
+  if(desc->convXSize == 3 && desc->convYSize == 3 && desc->dilationX == 1 && desc->dilationY == 1) {
+    const int inC = desc->inChannels, outC = desc->outChannels;
+    const int nTilesX = (nnXLen + 1) / 2, nTilesY = (nnYLen + 1) / 2;
+    const int nTiles = nTilesX * nTilesY;
+    std::vector<float> U = winogradFilterTransform(desc->weights, outC, inC);
+    WgParamsHost wp{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)nnYLen,(uint32_t)nnXLen,
+                    (uint32_t)nTilesX,(uint32_t)nTilesY,0u};
+    wgpu::Buffer wpBuf = wgMakeUniform(ctx.get(), wp);
+    wgpu::Buffer inBuf = wgMakeStorage(ctx.get(), inputBuffer.data(), inElts, false);
+    wgpu::Buffer Ubuf  = wgMakeStorage(ctx.get(), U.data(), U.size(), false);
+    wgpu::Buffer Vbuf  = wgMakeStorage(ctx.get(), nullptr, (size_t)16 * batchSize * inC * nTiles, false);
+    wgpu::Buffer Mbuf  = wgMakeStorage(ctx.get(), nullptr, (size_t)16 * batchSize * outC * nTiles, false);
+    wgpu::Buffer outBuf = wgMakeStorage(ctx.get(), nullptr, outElts, true);
+    wgDispatch(ctx.get(), "winogradInput",  {wpBuf, inBuf, Vbuf},
+               (uint32_t)(((size_t)batchSize * inC * nTiles + 63) / 64));
+    wgDispatch(ctx.get(), "winogradMatmul", {wpBuf, Ubuf, Vbuf, Mbuf},
+               (uint32_t)(((size_t)16 * batchSize * outC * nTiles + 63) / 64));
+    wgDispatch(ctx.get(), "winogradOutput", {wpBuf, Mbuf, outBuf},
+               (uint32_t)(((size_t)batchSize * outC * nTiles + 63) / 64));
+    wgReadFloats(ctx.get(), outBuf, outElts, outputBuffer);
+    return true;
+  }
 
   ConvParamsHost p{};
   p.n = (uint32_t)batchSize;

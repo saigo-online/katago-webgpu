@@ -378,6 +378,145 @@ fn conv1x1NCHW(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 
 // ===========================================================================
+// Winograd F(2x2, 3x3) convolution — 3 stages (SAME padding, stride 1, dil 1).
+// Reduces the 3x3 conv's per-output multiplies from 9 to 4 by transforming
+// 4x4 input tiles and 3x3 filters into a 4x4 elementwise (Hadamard) domain.
+//
+//   B^T = [[1,0,-1,0],[0,1,1,0],[0,-1,1,0],[0,1,0,-1]]   (input transform V = B^T d B)
+//   G   = [[1,0,0],[.5,.5,.5],[.5,-.5,.5],[0,0,1]]        (filter transform U = G g G^T, on host)
+//   A^T = [[1,1,1,0],[0,1,-1,-1]]                          (output transform Y = A^T M A)
+//
+// Tiling: nTilesY=ceil(H/2), nTilesX=ceil(W/2), tile=ty*nTilesX+tx.
+// Buffers (STO):
+//   V : [16][n][inC ][nTiles]   M : [16][n][outC][nTiles]   U(host) : [16][outC][inC]
+// ===========================================================================
+
+struct WgParams {
+  n : u32, inC : u32, outC : u32,
+  h : u32, w : u32, nTilesX : u32, nTilesY : u32, xi : u32,
+};
+
+// --- Stage 1: input transform.  thread per (n, ic, tile) ---
+@group(0) @binding(0) var<uniform> wgi : WgParams;
+@group(0) @binding(1) var<storage, read>       wgiIn : array<STO>;
+@group(0) @binding(2) var<storage, read_write> wgiV  : array<STO>;
+
+@compute @workgroup_size(64)
+fn winogradInput(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let nTiles = wgi.nTilesX * wgi.nTilesY;
+  let idx = gid.x;
+  if (idx >= wgi.n * wgi.inC * nTiles) { return; }
+  let tile = idx % nTiles;
+  let ic   = (idx / nTiles) % wgi.inC;
+  let nn   = idx / (nTiles * wgi.inC);
+  let ty   = tile / wgi.nTilesX;
+  let tx   = tile % wgi.nTilesX;
+
+  // Load 4x4 input tile d (top-left at 2*tile-1 for SAME pad=1), 0 out of bounds.
+  let chanBase = (nn * wgi.inC + ic) * wgi.h * wgi.w;
+  var d : array<f32, 16>;
+  for (var a = 0u; a < 4u; a = a + 1u) {
+    let iy = i32(2u * ty + a) - 1;
+    for (var b = 0u; b < 4u; b = b + 1u) {
+      let ix = i32(2u * tx + b) - 1;
+      var v = 0.0;
+      if (iy >= 0 && iy < i32(wgi.h) && ix >= 0 && ix < i32(wgi.w)) {
+        v = f32(wgiIn[chanBase + u32(iy) * wgi.w + u32(ix)]);
+      }
+      d[a * 4u + b] = v;
+    }
+  }
+  // t = B^T d   (rows: d0-d2, d1+d2, -d1+d2, d1-d3)
+  var t : array<f32, 16>;
+  for (var j = 0u; j < 4u; j = j + 1u) {
+    let d0 = d[0u*4u+j]; let d1 = d[1u*4u+j]; let d2 = d[2u*4u+j]; let d3 = d[3u*4u+j];
+    t[0u*4u+j] = d0 - d2;
+    t[1u*4u+j] = d1 + d2;
+    t[2u*4u+j] = -d1 + d2;
+    t[3u*4u+j] = d1 - d3;
+  }
+  // V = t B   (cols: t0-t2, t1+t2, -t1+t2, t1-t3)
+  let nTilesAll = wgi.n * wgi.inC * nTiles;
+  let vOff = (nn * wgi.inC + ic) * nTiles + tile;
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    let t0 = t[i*4u+0u]; let t1 = t[i*4u+1u]; let t2 = t[i*4u+2u]; let t3 = t[i*4u+3u];
+    wgiV[( (i*4u+0u) ) * nTilesAll + vOff] = STO(t0 - t2);
+    wgiV[( (i*4u+1u) ) * nTilesAll + vOff] = STO(t1 + t2);
+    wgiV[( (i*4u+2u) ) * nTilesAll + vOff] = STO(-t1 + t2);
+    wgiV[( (i*4u+3u) ) * nTilesAll + vOff] = STO(t1 - t3);
+  }
+}
+
+// --- Stage 2: per-component matmul  M[xi] = U[xi](outC x inC) . V[xi](inC x nTiles)
+// thread per (xi, n, oc, tile) ---
+@group(0) @binding(0) var<uniform> wgm : WgParams;
+@group(0) @binding(1) var<storage, read>       wgmU : array<STO>;
+@group(0) @binding(2) var<storage, read>       wgmV : array<STO>;
+@group(0) @binding(3) var<storage, read_write> wgmM : array<STO>;
+
+@compute @workgroup_size(64)
+fn winogradMatmul(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let nTiles = wgm.nTilesX * wgm.nTilesY;
+  let perComp = wgm.n * wgm.outC * nTiles;
+  let idx = gid.x;
+  if (idx >= 16u * perComp) { return; }
+  let xi   = idx / perComp;
+  let rem  = idx % perComp;
+  let tile = rem % nTiles;
+  let oc   = (rem / nTiles) % wgm.outC;
+  let nn   = rem / (nTiles * wgm.outC);
+
+  let vAll = wgm.n * wgm.inC * nTiles;
+  let uBase = xi * (wgm.outC * wgm.inC) + oc * wgm.inC;     // U[xi][oc][*]
+  let vBase = xi * vAll + nn * wgm.inC * nTiles + tile;     // V[xi][nn][*][tile]
+  var acc = 0.0;
+  for (var ic = 0u; ic < wgm.inC; ic = ic + 1u) {
+    acc = acc + f32(wgmU[uBase + ic]) * f32(wgmV[vBase + ic * nTiles]);
+  }
+  wgmM[idx] = STO(acc);
+}
+
+// --- Stage 3: output transform.  thread per (n, oc, tile) ---
+@group(0) @binding(0) var<uniform> wgo : WgParams;
+@group(0) @binding(1) var<storage, read>       wgoM   : array<STO>;
+@group(0) @binding(2) var<storage, read_write> wgoOut : array<STO>;
+
+@compute @workgroup_size(64)
+fn winogradOutput(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let nTiles = wgo.nTilesX * wgo.nTilesY;
+  let idx = gid.x;
+  if (idx >= wgo.n * wgo.outC * nTiles) { return; }
+  let tile = idx % nTiles;
+  let oc   = (idx / nTiles) % wgo.outC;
+  let nn   = idx / (nTiles * wgo.outC);
+  let ty   = tile / wgo.nTilesX;
+  let tx   = tile % wgo.nTilesX;
+
+  let perComp = wgo.n * wgo.outC * nTiles;
+  let mOff = nn * wgo.outC * nTiles + oc * nTiles + tile;   // within a component
+  var m : array<f32, 16>;
+  for (var k = 0u; k < 16u; k = k + 1u) { m[k] = f32(wgoM[k * perComp + mOff]); }
+
+  // s = A^T m   (2x4): row0 = m0+m1+m2 ; row1 = m1-m2-m3
+  var s : array<f32, 8>;
+  for (var j = 0u; j < 4u; j = j + 1u) {
+    s[0u*4u+j] = m[0u*4u+j] + m[1u*4u+j] + m[2u*4u+j];
+    s[1u*4u+j] = m[1u*4u+j] - m[2u*4u+j] - m[3u*4u+j];
+  }
+  // Y = s A   (2x2): col0 = s0+s1+s2 ; col1 = s1-s2-s3
+  let outChanBase = (nn * wgo.outC + oc) * wgo.h * wgo.w;
+  for (var i = 0u; i < 2u; i = i + 1u) {
+    let s0 = s[i*4u+0u]; let s1 = s[i*4u+1u]; let s2 = s[i*4u+2u]; let s3 = s[i*4u+3u];
+    let oy = 2u * ty + i;
+    if (oy < wgo.h) {
+      let ox0 = 2u * tx;
+      if (ox0 < wgo.w)      { wgoOut[outChanBase + oy * wgo.w + ox0]      = STO(s0 + s1 + s2); }
+      if (ox0 + 1u < wgo.w) { wgoOut[outChanBase + oy * wgo.w + ox0 + 1u] = STO(s1 - s2 - s3); }
+    }
+  }
+}
+
+// ===========================================================================
 // rmsNorm: per-position RMSNorm across channels (transformer preLN + trunk tip).
 //   ms = sum_c in[n,c,xy]^2 / C ;  r = 1/sqrt(ms + eps)
 //   out[n,c,xy] = act(in[n,c,xy] * r * gamma[c] (+ beta[c])) * mask[n,xy]
@@ -575,6 +714,59 @@ fn attnOutput(@builtin(global_invocation_id) gid : vec3<u32>) {
     acc = acc + f32(aoScores[rowBase + ki]) * f32(aoV[vBase + ki]);
   }
   aoOut[(n * aoP.numHeads * aoP.vHeadDim + h * aoP.vHeadDim + e) * aoP.hw + qi] = STO(acc);
+}
+
+// ===========================================================================
+// flashAttention: fused scaled-dot-product attention with ONLINE softmax — never
+// materializes the [seq x seq] score matrix (vs attnScores/Softmax/Output). One
+// thread per (n, head, qi); streams over keys keeping running max m, sum l, and a
+// vHeadDim accumulator. Mathematically equal to the 3-kernel path (the running
+// sum reorders additions -> float-rounding only). vHeadDim must be <= 64.
+// ===========================================================================
+
+struct FlashParams { n : u32, numHeads : u32, numKVHeads : u32, qHeadDim : u32, vHeadDim : u32, hw : u32, kvGroupSize : u32, scale : f32, };
+
+@group(0) @binding(0) var<uniform> fa : FlashParams;
+@group(0) @binding(1) var<storage, read>       faQ    : array<STO>;
+@group(0) @binding(2) var<storage, read>       faK    : array<STO>;
+@group(0) @binding(3) var<storage, read>       faV    : array<STO>;
+@group(0) @binding(4) var<storage, read>       faMask : array<STO>;
+@group(0) @binding(5) var<storage, read_write> faOut  : array<STO>;
+
+@compute @workgroup_size(64)
+fn flashAttention(@builtin(global_invocation_id) gid : vec3<u32>) {
+  let idx = gid.x;
+  if (idx >= fa.n * fa.numHeads * fa.hw) { return; }
+  let qi = idx % fa.hw;
+  let h  = (idx / fa.hw) % fa.numHeads;
+  let n  = idx / (fa.hw * fa.numHeads);
+  let outBase = (n * fa.numHeads * fa.vHeadDim + h * fa.vHeadDim) * fa.hw + qi;
+  if (f32(faMask[n * fa.hw + qi]) == 0.0) {
+    for (var e : u32 = 0u; e < fa.vHeadDim; e = e + 1u) { faOut[outBase + e * fa.hw] = STO(0.0); }
+    return;
+  }
+  let kvh = h / fa.kvGroupSize;
+  let qBase = (n * fa.numHeads * fa.qHeadDim + h * fa.qHeadDim) * fa.hw + qi;
+  var acc : array<f32, 64>;
+  for (var e : u32 = 0u; e < fa.vHeadDim; e = e + 1u) { acc[e] = 0.0; }
+  var m : f32 = -3.0e38;
+  var l : f32 = 0.0;
+  for (var ki : u32 = 0u; ki < fa.hw; ki = ki + 1u) {
+    if (f32(faMask[n * fa.hw + ki]) == 0.0) { continue; }
+    let kBase = (n * fa.numKVHeads * fa.qHeadDim + kvh * fa.qHeadDim) * fa.hw + ki;
+    var s : f32 = 0.0;
+    for (var d : u32 = 0u; d < fa.qHeadDim; d = d + 1u) { s = s + f32(faQ[qBase + d * fa.hw]) * f32(faK[kBase + d * fa.hw]); }
+    s = s * fa.scale;
+    let newMax = max(m, s);
+    let corr = exp(m - newMax);
+    let p = exp(s - newMax);
+    l = l * corr + p;
+    let vBase = (n * fa.numKVHeads * fa.vHeadDim + kvh * fa.vHeadDim) * fa.hw + ki;
+    for (var e : u32 = 0u; e < fa.vHeadDim; e = e + 1u) { acc[e] = acc[e] * corr + p * f32(faV[vBase + e * fa.hw]); }
+    m = newMax;
+  }
+  let inv = 1.0 / l;
+  for (var e : u32 = 0u; e < fa.vHeadDim; e = e + 1u) { faOut[outBase + e * fa.hw] = STO(acc[e] * inv); }
 }
 
 // ===========================================================================
