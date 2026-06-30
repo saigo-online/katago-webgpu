@@ -30,9 +30,15 @@ echo "==> Open https://<this-host-ip>:$PORT/ in Chrome/Edge; accept the cert war
 cd "$DIR"
 exec python3 -c "
 import http.server, socketserver, ssl
-H = http.server.SimpleHTTPRequestHandler
-H.extensions_map['.wasm'] = 'application/wasm'
-H.extensions_map['.js'] = 'text/javascript'
+class H(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {**http.server.SimpleHTTPRequestHandler.extensions_map,
+                      '.wasm': 'application/wasm', '.js': 'text/javascript'}
+    def end_headers(self):
+        # COOP/COEP -> cross-origin isolation -> SharedArrayBuffer -> wasm pthreads
+        # (needed for the threaded WebGPU path; harmless for the single-thread demo).
+        self.send_header('Cross-Origin-Opener-Policy', 'same-origin')
+        self.send_header('Cross-Origin-Embedder-Policy', 'require-corp')
+        super().end_headers()
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain('$CERTDIR/cert.pem', '$CERTDIR/key.pem')
 httpd = socketserver.TCPServer(('', $PORT), H)

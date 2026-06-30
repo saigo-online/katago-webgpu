@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>WebGPU on a worker thread — Path A runtime gate</title>
+<style>body{font:16px/1.5 system-ui;margin:40px;max-width:680px} .ok{color:#1a8917;font-weight:600} .bad{color:#c0392b;font-weight:600} code{background:#8882;padding:1px 4px;border-radius:4px}</style>
+</head><body>
+<h2>KataGo-in-browser, Path A — runtime gate</h2>
+<p>Tests whether WebGPU (device + a compute shader + readback) works on a <b>dedicated worker thread</b>
+(emscripten <code>-pthread</code>, the NN-server-thread model). The whole point of Path A.</p>
+<div id="iso" class="bad">checking cross-origin isolation…</div>
+<div id="out">loading WASM…</div>
+<script>
+  window.__tt = (status, val) => {
+    const m = { 0: ['ok','✅ PASS — WebGPU device + compute ran on a worker thread (o[0]=' + val + '). Path A runtime is viable.'],
+                1: ['bad','⚠️ ran but wrong result (o[0]=' + val + ')'],
+                2: ['bad','❌ no WebGPU adapter on the worker thread'],
+                3: ['bad','❌ got adapter but no device on the worker thread'] }[status] || ['bad','status ' + status];
+    const o = document.getElementById('out'); o.className = m[0]; o.textContent = m[1];
+  };
+  document.getElementById('iso').textContent = 'crossOriginIsolated = ' + self.crossOriginIsolated +
+    (self.crossOriginIsolated ? ' (good — threads enabled)' : ' (NO — COOP/COEP headers missing; threads/SharedArrayBuffer unavailable)');
+  document.getElementById('iso').className = self.crossOriginIsolated ? 'ok' : 'bad';
+</script>
+<script src="threadtest.js"></script>
+<script>createTT().then(() => { document.getElementById('out').textContent = 'WASM loaded; running on worker thread…'; }).catch(e => { document.getElementById('out').textContent = 'load error: ' + e; });</script>
+</body></html>

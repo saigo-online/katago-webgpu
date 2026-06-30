@@ -117,3 +117,9 @@ web/.certs/
 web/demo/model.bin.gz
 web/demo/model-*.bin.gz
 
+
+# Path-A threaded WebGPU PoC build artifacts
+web/demo/threadtest.js
+web/demo/threadtest.wasm
+web/demo/threadtest*.js
+web/demo/threadtest*.wasm
