@@ -71,6 +71,11 @@
       <label style="margin-left:6px;"><input type="checkbox" id="searchplay"> engine searches</label>
     </div>
     <div class="row mono" id="searchout" style="min-height:1.4em"></div>
+    <div class="row">
+      <button id="selfplay" title="The engine plays itself, searching each move">Self-play ▶</button>
+      <button id="savesgf" title="Download the current game as SGF">Save SGF ⤓</button>
+      <span class="muted mono" id="gameinfo"></span>
+    </div>
     <div class="row muted" id="adapter">adapter: –</div>
     <div class="row muted">Powered by <span class="mono">kataeval</span> (cpp/kataeval) — the clean
       KataGo-eval dependency compiled to WASM. Same forward pass that's validated byte-identical
@@ -389,6 +394,47 @@
     }
   }
 
+  // --- self-play: the engine plays itself (search each move), then export SGF ---
+  let selfPlaying = false;
+  async function selfPlay() {
+    if (!ready) return;
+    if (selfPlaying) { selfPlaying = false; $('selfplay').textContent = 'Self-play ▶'; return; }  // toggle off
+    selfPlaying = true; $('selfplay').textContent = 'Stop ⏹';
+    let passes = 0; const cap = N * N * 2;  // safety cap; normally ends on two passes
+    while (selfPlaying && moves.length < cap) {
+      const mv = await kataThink();                 // search the current position
+      if (!selfPlaying || mv === null) break;        // stopped, or error/superseded
+      playMove(mv);                                  // play it (mv = loc, or -1 for pass)
+      passes = mv < 0 ? passes + 1 : 0;
+      $('gameinfo').textContent = `playing… ${moves.length} moves`;
+      if (passes >= 2) break;                        // both passed -> game over
+      await new Promise(r => setTimeout(r, 60));      // let the UI breathe
+    }
+    selfPlaying = false; $('selfplay').textContent = 'Self-play ▶';
+    $('gameinfo').textContent = `game: ${moves.length} moves${passes >= 2 ? ' · both passed (end)' : ''}`;
+  }
+
+  // Standard SGF from the move list (coords a–s, row a = top, matching the board).
+  function gameSGF() {
+    const lt = i => 'abcdefghijklmnopqrs'[i];
+    let sgf = `(;GM[1]FF[4]CA[UTF-8]SZ[${N}]KM[7.5]RU[Tromp-Taylor]` +
+              `AP[saigo-katago-webgpu]PB[KataGo ${netKey}]PW[KataGo ${netKey}]`;
+    for (const m of moves) {
+      const c = m.col === 1 ? 'B' : 'W';
+      const co = m.loc < 0 ? '' : lt(m.loc % N) + lt(Math.floor(m.loc / N));  // pass = empty
+      sgf += `;${c}[${co}]`;
+    }
+    return sgf + ')';
+  }
+  function saveSGF() {
+    if (!moves.length) { $('gameinfo').textContent = 'no moves to save yet'; return; }
+    const blob = new Blob([gameSGF()], { type: 'application/x-go-sgf' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `saigo-${netKey}-${moves.length}moves.sgf`;
+    a.click(); URL.revokeObjectURL(a.href);
+  }
+
   // Redraw all stones from the displayed grid (captures appear/disappear).
   function renderBoard() {
     board.removeAllObjects();
@@ -410,6 +456,8 @@
     playMove(idx(x, y));
   });
   $('thinkkata').onclick = kataThink;
+  $('selfplay').onclick = selfPlay;
+  $('savesgf').onclick = saveSGF;
   $('play').onclick = async () => {
     if (!ready) return;
     if ($('searchplay').checked) { const mv = await kataThink(); if (mv !== null) playMove(mv); }   // searched move (loc or -1)
