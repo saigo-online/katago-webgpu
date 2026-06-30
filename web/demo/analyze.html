@@ -121,6 +121,9 @@
   const WOOD = '#e8c887';
   const board = new WGo.Board($('board'), { size: N, width: BOARD_PX, background: WOOD });
   const pvBoard = new WGo.Board($('pvboard'), { size: N, width: 360, background: WOOD });
+  // A–T / 1–N coordinates around both boards. WGo draws them ~0.75 field outside the
+  // grid, so widen the visible section by a field to make room (else they'd clip).
+  if (WGo.coordinates) for (const b of [board, pvBoard]) { b.setSection(-1); b.addCustomObject(WGo.coordinates); }
   // Render the engine's principal variation on the 2nd board: current stones, then the
   // PV played out as numbered, alternating moves from the side to move (its read-ahead).
   function renderPV(pv) {
@@ -440,6 +443,9 @@
     board.removeAllObjects();
     for (let y = 0; y < N; y++) for (let x = 0; x < N; x++)
       if (grid[x][y]) board.addObject({ x, y, c: grid[x][y] === 1 ? WGo.B : WGo.W });
+    // circle-mark the last move played (WGo 'CR' markup, auto-contrasting on the stone)
+    const last = moves.length ? moves[moves.length - 1] : null;
+    if (last && last.loc >= 0) board.addObject({ x: last.loc % N, y: Math.floor(last.loc / N), type: 'CR' });
   }
   // Append a move to the game sequence (loc = y*N+x, or -1 for pass) and re-eval.
   function playMove(loc) {
