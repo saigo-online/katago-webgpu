@@ -12,7 +12,7 @@ const diag = (m) => { try { postMessage({ diag: m }); } catch (_) {} };
 self.onerror = (e) => diag('worker.onerror: ' + ((e && e.message) || e));
 self.addEventListener('unhandledrejection', (e) => diag('unhandledrejection: ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason)));
 
-const MAXMV = 1024, PVCAP = 32;
+const MAXMV = 1024, PVCAP = 32, MAXCAND = 8;
 let M = null, N = 19, ready = false;
 
 // Net caching (Cache API), shared with the page — a net downloads once across both
@@ -28,6 +28,7 @@ async function cachedNet(url) {
 }
 let mlPtr, mcPtr, bmPtr, wrPtr, scPtr, pvPtr, pvlPtr, visPtr, reusedPtr, donePtr;  // search buffers
 let bPtr, pPtr, vPtr, oPtr;                             // analysis (kgeEvalSeqKata) buffers
+let candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr;  // candidate-move buffers
 
 async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
   // The module is loaded via importScripts INTO this worker, so emscripten's
@@ -58,6 +59,8 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
   pvlPtr = M._malloc(4); reusedPtr = M._malloc(4); donePtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4);
   const HW = N * N;
   bPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
+  candLocPtr = M._malloc(MAXCAND * 4); candVisPtr = M._malloc(MAXCAND * 4);
+  candWrPtr = M._malloc(MAXCAND * 4); candScPtr = M._malloc(MAXCAND * 4); candPrPtr = M._malloc(MAXCAND * 4);
   ready = true;
   const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen)';
   return { backend, version: M.ccall('kgeModelVersion', 'number', [], []) };
@@ -72,6 +75,16 @@ function pollStats() {
     [bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, donePtr, reusedPtr]);
   if (!ok) throw new Error('kgePoll: ' + M.ccall('kgeError', 'string', [], []));
   const plen = M.HEAP32[pvlPtr >> 2];
+  // top-N candidate moves (best-first), each with its own visits/win-rate/score/prior
+  const ncand = M.ccall('kgeCandidates', 'number',
+    ['number','number','number','number','number','number'],
+    [MAXCAND, candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr]);
+  const cand = [];
+  for (let i = 0; i < ncand; i++) cand.push({
+    loc: M.HEAP32[(candLocPtr >> 2) + i], visits: M.HEAP32[(candVisPtr >> 2) + i],
+    wr: M.HEAPF32[(candWrPtr >> 2) + i], score: M.HEAPF32[(candScPtr >> 2) + i],
+    prior: M.HEAPF32[(candPrPtr >> 2) + i],
+  });
   return {
     best: M.HEAP32[bmPtr >> 2],
     wr: M.HEAPF32[wrPtr >> 2],
@@ -80,6 +93,7 @@ function pollStats() {
     done: !!M.HEAP32[donePtr >> 2],
     reused: !!M.HEAP32[reusedPtr >> 2],
     pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
+    cand,
     mem: M.HEAP32.buffer.byteLength,   // total wasm memory (HEAP8 isn't exported)
   };
 }

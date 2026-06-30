@@ -92,7 +92,9 @@
       <div>tree</div><div id="m_reuse">–</div>
       <div>memory</div><div id="m_mem">–</div>
     </div>
-    <div class="muted">principal variation</div>
+    <div class="muted" style="margin-top:8px;">candidate moves <span style="font-weight:400;">(win% · score · visits)</span></div>
+    <div id="m_cand" class="mono" style="font-size:13px; min-height:2em;"><span class="muted">play Search to rank moves</span></div>
+    <div class="muted" style="margin-top:8px;">principal variation</div>
     <div class="row mono" id="m_pv" style="min-height:3.4em;">–</div>
   </div>
 
@@ -148,7 +150,7 @@
   // helpers / state declared before the load block (which calls analyze()).
   const idx = (x, y) => y * N + x;
   function softmax(arr) { let m = -1e30; for (const v of arr) m = Math.max(m, v); let s = 0; const o = arr.map(v => { const e = Math.exp(v - m); s += e; return e; }); return o.map(v => v / s); }
-  let lastPolicy = null, lastBest = -1, lastOwner = null;
+  let lastPolicy = null, lastBest = -1, lastOwner = null, lastCand = null;
   const ptName = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
   // The single engine lives in a worker (threaded kataeval-mt): analysis + search both
   // go through it — one net load, shared NN cache, main thread free. Declared up here
@@ -233,6 +235,7 @@
         : `${'ABCDEFGHJKLMNOPQRST'[best % N]}${N - Math.floor(best / N)} (${(bestP*100).toFixed(1)}%)`;
 
       lastOwner = r.owner;
+      lastCand = null; renderCandidates(null);  // position changed — clear search candidates
       drawOverlay();
       renderPV([]);   // position changed — reset the 2nd board to the current stones
     } catch (e) {
@@ -253,14 +256,32 @@
         octx.fillRect(board.getX(x) - sr, board.getY(y) - sr, sr*2, sr*2);
       }
     }
-    // policy dots on empty points
-    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-      if (grid[x][y] !== 0) continue;
-      const p = lastPolicy ? lastPolicy[idx(x, y)] : 0; if (p < 0.002) continue;
-      const r = Math.max(2, Math.min(sr * 0.95, sr * Math.sqrt(p) * 2.2));
-      octx.beginPath(); octx.arc(board.getX(x), board.getY(y), r, 0, 7);
-      octx.fillStyle = (idx(x, y) === lastBest) ? 'rgba(40,140,250,0.85)' : 'rgba(40,140,250,0.40)';
-      octx.fill();
+    if (lastCand && lastCand.length) {
+      // candidate moves (after a search): a disc per move, sized by visit share and
+      // colored by win-rate (red→yellow→green for the side to move), labelled win-rate%.
+      const maxV = Math.max(...lastCand.map(c => c.visits), 1);
+      for (const c of lastCand) {
+        if (c.loc < 0) continue;
+        const x = c.loc % N, y = Math.floor(c.loc / N);
+        const r = Math.max(sr * 0.42, sr * (0.5 + 0.5 * Math.sqrt(c.visits / maxV)));
+        const hue = Math.round(Math.max(0, Math.min(1, c.wr)) * 120);
+        octx.beginPath(); octx.arc(board.getX(x), board.getY(y), r, 0, 7);
+        octx.fillStyle = `hsla(${hue},62%,44%,0.82)`; octx.fill();
+        octx.fillStyle = 'rgba(255,255,255,0.96)';
+        octx.font = `600 ${Math.round(r * 0.8)}px ui-monospace, monospace`;
+        octx.textAlign = 'center'; octx.textBaseline = 'middle';
+        octx.fillText((c.wr * 100).toFixed(0), board.getX(x), board.getY(y));
+      }
+    } else {
+      // policy dots on empty points (no search yet — raw net intuition)
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
+        if (grid[x][y] !== 0) continue;
+        const p = lastPolicy ? lastPolicy[idx(x, y)] : 0; if (p < 0.002) continue;
+        const r = Math.max(2, Math.min(sr * 0.95, sr * Math.sqrt(p) * 2.2));
+        octx.beginPath(); octx.arc(board.getX(x), board.getY(y), r, 0, 7);
+        octx.fillStyle = (idx(x, y) === lastBest) ? 'rgba(40,140,250,0.85)' : 'rgba(40,140,250,0.40)';
+        octx.fill();
+      }
     }
     // searched best move — red ring
     if (searchBest >= 0) {
@@ -286,6 +307,7 @@
         if (e.data.progress) {   // live search/ponder stats — stream them into the panel
           renderMetrics(e.data, e.data.threads);
           renderPV(e.data.pv);   // play the engine's current line on the 2nd board
+          lastCand = e.data.cand; renderCandidates(e.data.cand);  // live candidate moves
           setBotState(e.data.state + '…', e.data.state === 'pondering' ? 'live' : 'run');
           searchBest = e.data.best; drawOverlay();
           return;
@@ -332,6 +354,16 @@
     $('m_reuse').textContent = r.reused ? 'reused ✓' : 'fresh';
     if (r.mem) $('m_mem').textContent = (r.mem / 1048576).toFixed(0) + ' MB';
     $('m_pv').textContent = r.pv.map(ptName).join(' ') || '–';
+  }
+  function renderCandidates(cand) {
+    const el = $('m_cand');
+    if (!cand || !cand.length) { el.innerHTML = '<span class="muted">play Search to rank moves</span>'; return; }
+    el.innerHTML = cand.slice(0, 6).map((c, i) => {
+      const hue = Math.round(Math.max(0, Math.min(1, c.wr)) * 120);
+      return `<div style="display:flex; justify-content:space-between; gap:8px; padding:1px 0;">
+        <span><span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:hsl(${hue},62%,44%); margin-right:5px;"></span>${i + 1}. <b>${ptName(c.loc)}</b></span>
+        <span>${(c.wr * 100).toFixed(1)}% · ${(c.score >= 0 ? '+' : '') + c.score.toFixed(1)} · ${c.visits.toLocaleString()}v</span></div>`;
+    }).join('');
   }
   async function kataThink() {
     if (!ready) return null;

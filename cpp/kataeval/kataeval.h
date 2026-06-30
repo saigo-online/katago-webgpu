@@ -92,6 +92,10 @@ int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
             int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* doneOut, int* reusedOut);
 int kgePonderBegin(void);
 int kgeStopSearch(void);
+// Top-N root candidate moves (best-first), each with visits / side-to-move win-rate /
+// score lead / policy prior. Live-pollable during search. Returns the count (or -1).
+int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
+                  float* winrateOut, float* scoreOut, float* priorOut);
 
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size

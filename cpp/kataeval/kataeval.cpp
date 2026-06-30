@@ -30,6 +30,7 @@
 #include "../search/searchparams.h"
 #include "../search/timecontrols.h"
 #include "../search/reportedsearchvalues.h"
+#include "../search/analysisdata.h"
 #endif
 
 #ifdef __EMSCRIPTEN__
@@ -467,7 +468,7 @@ static bool ensureKataEngine() {
     /*requireExactNNLen*/true, /*inputsUseNHWC*/false,  // WebGPU = NCHW
     /*nnCacheSizePowerOfTwo*/20, /*nnMutexPoolSizePowerofTwo*/16,
     /*debugSkipNeuralNet*/false, /*homeDataDirOverride*/"",
-    enabled_t::False /*fp32 for now*/,
+    enabled_t::Auto /*fp16 when the adapter has shader-f16, else fp32 (selective-fp32 heads)*/,
     /*numThreads (NN server)*/1, /*gpuIdxByServerThread*/std::vector<int>{-1},
     /*randSeed*/"kge-nneval", /*doRandomize*/false, /*defaultSymmetry*/0,
     /*disableWarmup*/true, cfg);
@@ -685,6 +686,32 @@ KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
     if(reusedOut) *reusedOut = gPollReused;
     return 1;
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
+}
+
+// Top-N root candidate moves, best-first: each with its own visits, side-to-move
+// win-rate, score lead, and policy prior. Safe to call live during search. Writes up
+// to maxN into the parallel arrays; returns the count (or -1 on error).
+KATAEVAL_EXPORT int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
+                                  float* winrateOut, float* scoreOut, float* priorOut) {
+  if(gBot == nullptr) { gErr = "no engine"; return -1; }
+  try {
+    const Search* s = gBot->getSearch();
+    std::vector<AnalysisData> buf;
+    s->getAnalysisData(buf, /*minMovesToTryToGet*/maxN, /*includeWeightFactors*/false,
+                       /*maxPVDepth*/1, /*duplicateForSymmetries*/false);
+    int count = 0;
+    for(size_t i = 0; i < buf.size() && count < maxN; i++) {
+      const AnalysisData& a = buf[i];
+      double whiteWr = (a.winLossValue + 1.0) * 0.5;  // winLossValue is white-perspective
+      locsOut[count]    = locToIdx(a.move);
+      visitsOut[count]  = (int)a.numVisits;
+      winrateOut[count] = (float)((gPollPla == P_WHITE) ? whiteWr : 1.0 - whiteWr);
+      scoreOut[count]   = (float)((gPollPla == P_WHITE) ? a.lead : -a.lead);
+      priorOut[count]   = (float)a.policyPrior;
+      count++;
+    }
+    return count;
+  } catch(const std::exception& e) { gErr = e.what(); return -1; }
 }
 
 KATAEVAL_EXPORT int kgePonderBegin() {  // real background ponder; poll to watch it climb

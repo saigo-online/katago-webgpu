@@ -30,7 +30,7 @@ if [ "${MT:-0}" = 1 ]; then
   CFLAGS+=( -pthread -DKGE_THREADS )
   MANIFESTS+=( kataeval/sources-search.txt )
   OUTNAME=kataeval-mt
-  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePoll,_kgePonderBegin,_kgeStopSearch"
+  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePoll,_kgePonderBegin,_kgeStopSearch,_kgeCandidates"
   LINKEXTRA=( -pthread -sPTHREAD_POOL_SIZE=8 -sINITIAL_MEMORY=256MB )
 fi
 
