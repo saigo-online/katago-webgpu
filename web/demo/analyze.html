@@ -52,6 +52,13 @@
       <button id="clear">Clear</button>
       <label style="margin-left:6px;"><input type="checkbox" id="owner"> ownership</label>
     </div>
+    <div class="row">
+      <button id="think">Think ▶</button>
+      visits <input id="visits" type="number" value="400" min="1" max="20000" style="width:64px">
+      ms <input id="ms" type="number" value="3000" min="100" max="120000" style="width:70px">
+      <label style="margin-left:6px;"><input type="checkbox" id="searchplay"> engine searches</label>
+    </div>
+    <div class="row mono" id="searchout" style="min-height:1.4em"></div>
     <div class="row muted" id="adapter">adapter: –</div>
     <div class="row muted">Powered by <span class="mono">kataeval</span> (cpp/kataeval) — the clean
       KataGo-eval dependency compiled to WASM. Same forward pass that's validated byte-identical
@@ -98,7 +105,9 @@
   sel.onchange = () => { const u = new URLSearchParams(location.search); u.set('net', sel.value); location.search = u.toString(); }; // reload with new net
 
   // --- load engine + model ---
-  let M = null, ready = false, pPtr, vPtr, oPtr, mlPtr, mcPtr, bPtr;
+  let M = null, ready = false, pPtr, vPtr, oPtr, mlPtr, mcPtr, bPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;
+  let searchBest = -2;            // highlighted searched move (-2 = none, -1 = pass)
+  const PVCAP = 24;
   try {
     M = await createKata();
     if (qs.has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
@@ -111,6 +120,7 @@
     if (!ok) { $('status').innerHTML = 'engine: <span class="bad">load failed</span> — ' + M.ccall('kgeError','string',[],[]); return; }
     pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
     mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4); bPtr = M._malloc(HW * 4);
+    bmPtr = M._malloc(4); wrPtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4); pvlPtr = M._malloc(4); visPtr = M._malloc(4);
     ready = true;
     const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen fallback)';
     $('status').innerHTML = 'engine: <span class="ok">ready</span> · KataGo ' + netKey + ' on ' + backend;
@@ -183,6 +193,34 @@
       octx.fillStyle = (idx(x, y) === lastBest) ? 'rgba(40,140,250,0.85)' : 'rgba(40,140,250,0.40)';
       octx.fill();
     }
+    // searched best move — red ring
+    if (searchBest >= 0) {
+      octx.beginPath(); octx.arc(board.getX(searchBest % N), board.getY(Math.floor(searchBest / N)), sr * 0.7, 0, 7);
+      octx.lineWidth = 3; octx.strokeStyle = 'rgba(220,40,40,0.9)'; octx.stroke();
+    }
+  }
+  // Run MCTS search on the current position; show the move/win-rate/PV; return the move.
+  async function think() {
+    if (!ready) return null;
+    const n = Math.min(moves.length, MAXMV);
+    const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
+    for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
+    M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
+    const visits = Math.max(1, parseInt($('visits').value) || 400);
+    const ms = Math.max(100, parseInt($('ms').value) || 3000);
+    $('searchout').textContent = 'thinking…';
+    const t0 = performance.now();
+    const ok = await M.ccall('kgeSearch', 'number',
+      ['number','number','number','number','number','number','number','number','number','number','number','number','number'],
+      [mlPtr, mcPtr, n, toPlay, 7.5, visits, ms, bmPtr, wrPtr, pvPtr, PVCAP, pvlPtr, visPtr], { async: true });
+    if (!ok) { $('searchout').textContent = 'search failed: ' + M.ccall('kgeError','string',[],[]); return null; }
+    const dt = (performance.now() - t0).toFixed(0);
+    const best = M.HEAP32[bmPtr >> 2], wr = M.HEAPF32[wrPtr >> 2], nv = M.HEAP32[visPtr >> 2], plen = M.HEAP32[pvlPtr >> 2];
+    const mv = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
+    const pv = [...Array(plen)].map((_, i) => mv(M.HEAP32[(pvPtr >> 2) + i]));
+    $('searchout').innerHTML = `search: <b>${mv(best)}</b> · ${(wr * 100).toFixed(1)}% · ${nv} visits / ${dt} ms · PV ${pv.slice(0, 8).join(' ')}`;
+    searchBest = best; drawOverlay();
+    return best;
   }
 
   // Redraw all stones from the displayed grid (captures appear/disappear).
@@ -196,6 +234,8 @@
     if (!ready || moves.length >= MAXMV) return;
     moves.push({ loc, col: toPlay });
     toPlay = toPlay === 1 ? 2 : 1;
+    searchBest = -2;                 // new position — clear the searched marker
+    $('searchout').textContent = '';
     analyze();
   }
 
@@ -203,7 +243,12 @@
     if (x < 0 || y < 0 || x >= N || y >= N || grid[x][y] !== 0) return;
     playMove(idx(x, y));
   });
-  $('play').onclick = () => { if (ready && lastBest >= 0) playMove(lastBest === HW ? -1 : lastBest); };
+  $('think').onclick = think;
+  $('play').onclick = async () => {
+    if (!ready) return;
+    if ($('searchplay').checked) { const mv = await think(); if (mv !== null) playMove(mv); }   // searched move (loc or -1)
+    else if (lastBest >= 0) playMove(lastBest === HW ? -1 : lastBest);                            // raw policy move
+  };
   $('pass').onclick = () => playMove(-1);
   $('undo').onclick = () => { if (ready && moves.length) { moves.pop(); toPlay = toPlay === 1 ? 2 : 1; analyze(); } };
   $('clear').onclick = () => { if (ready) { moves.length = 0; toPlay = 1; analyze(); } };
