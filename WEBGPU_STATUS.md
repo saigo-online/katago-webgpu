@@ -220,12 +220,19 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
 2. **SGF-metadata encoder** + grouped RMSNorm — the last architecture gaps.
 3. **Selective-fp32 heads** + validate the fp16 GPU path on a `shader-f16` adapter
    (then re-introduce the scale8 rescale per-handle for fp16 stability).
-4. **Search** — KataGo in the browser: a batched MCTS/PUCT using the net as the
-   leaf evaluator (ponder + max-time / max-visits). **Foundation done:** batched
-   evaluation (`kgeEvalBatch`, `maxBatch=16`) — B leaves per forward pass, matches
-   single-eval within rounding; this is the dominant perf lever (the GPU evaluates a
-   batch in ≈ one eval's wall-time). Next: a single-thread async batched MCTS with
-   KataGo's PUCT + virtual loss, NN cache, and tree reuse.
+4. **Search — KataGo in the browser (done, core):** `kgeSearch` is a batched MCTS.
+   - **Batched eval** (`kgeEvalBatch`, `maxBatch=16`) — B leaves per forward pass
+     (matches single within rounding); the dominant perf lever (GPU does a batch in
+     ≈ one eval's wall-time).
+   - **PUCT** with KataGo's formula (c_PUCT=1.1, `Q + c_PUCT·P·√ΣN/(1+N)`, FPU 0) and
+     **virtual-loss** batched leaf collection; white-perspective utility; top-32
+     legal policy children per node. Refs: AlphaZero (Silver 2017), KataGo
+     (arXiv:1902.10565).
+   - Validated: from the empty board, 400 visits → best **D4**, ~50% win-rate, PV
+     `D4 Q16 Q4 D16` (real read-ahead). Returns best move + searched win-rate + PV.
+   - *Next:* **Gumbel AlphaZero** root/selection (Danihelka 2022, arXiv:2202.…) — the
+     SOTA at low visit budgets, exactly the browser regime; selection is isolated in
+     `selectChildPUCT` for the swap. Plus NN cache + tree reuse (ponder).
    *(Done: conv + nested-bottleneck + the full transformer stack through v17 —
    RMSNorm, RoPE, grouped-query attention, SwiGLU, optimism/q-value policy.)*
 

@@ -42,7 +42,7 @@ emcc "${OBJS[@]}" --use-port=emdawnwebgpu -sUSE_ZLIB=1 \
   -sASYNCIFY -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 \
   -sSTACK_SIZE=16MB -sINITIAL_MEMORY=64MB \
   -sMODULARIZE=1 -sEXPORT_NAME=createKata \
-  -sEXPORTED_FUNCTIONS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_malloc,_free \
+  -sEXPORTED_FUNCTIONS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeSearch,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_malloc,_free \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS,HEAPF32,HEAP32,UTF8ToString \
   -O2 -o "$ROOT/web/demo/kataeval.js"
 

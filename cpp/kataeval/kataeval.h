@@ -51,6 +51,18 @@ int kgeEvalSeq(const int* moveLocs, const int* moveCols, int numMoves,
 int kgeEvalBatch(const int* stonesBatch, const int* plas, int numPos,
                  double komi, float* policyOut, float* valueOut);
 
+// Batched MCTS search from the position after replaying the move sequence (as
+// kgeEvalSeq). Runs to maxVisits or maxTimeMs, whichever first.
+//   bestMoveOut[1]: chosen move (y*size+x, or -1 pass).
+//   winrateOut[1]:  searched win probability for toPla (0..1).
+//   pvOut[<=pvCap]: principal variation moves; pvLenOut[1] its length.
+//   visitsOut[1]:   total visits performed.
+// Returns 1 on success, 0 on failure (see kgeError).
+int kgeSearch(const int* moveLocs, const int* moveCols, int numMoves,
+              int toPla, double komi, int maxVisits, double maxTimeMs,
+              int* bestMoveOut, float* winrateOut,
+              int* pvOut, int pvCap, int* pvLenOut, int* visitsOut);
+
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size
 int kgeModelVersion(void);        // loaded model's version
