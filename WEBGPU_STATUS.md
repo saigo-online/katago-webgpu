@@ -220,8 +220,12 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
 2. **SGF-metadata encoder** + grouped RMSNorm — the last architecture gaps.
 3. **Selective-fp32 heads** + validate the fp16 GPU path on a `shader-f16` adapter
    (then re-introduce the scale8 rescale per-handle for fp16 stability).
-4. **Search** — MCTS/PUCT in the browser using the net as the leaf evaluator
-   (ponder + max-time / max-visits), now that move history + `kgeEvalSeq` exist.
+4. **Search** — KataGo in the browser: a batched MCTS/PUCT using the net as the
+   leaf evaluator (ponder + max-time / max-visits). **Foundation done:** batched
+   evaluation (`kgeEvalBatch`, `maxBatch=16`) — B leaves per forward pass, matches
+   single-eval within rounding; this is the dominant perf lever (the GPU evaluates a
+   batch in ≈ one eval's wall-time). Next: a single-thread async batched MCTS with
+   KataGo's PUCT + virtual loss, NN cache, and tree reuse.
    *(Done: conv + nested-bottleneck + the full transformer stack through v17 —
    RMSNorm, RoPE, grouped-query attention, SwiGLU, optimism/q-value policy.)*
 

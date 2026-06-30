@@ -45,6 +45,12 @@ int kgeEvalSeq(const int* moveLocs, const int* moveCols, int numMoves,
                int toPla, double komi, int* boardOut,
                float* policyOut, float* valueOut, float* ownerOut);
 
+// Batched stones-only eval — numPos positions (each a boardSize*boardSize stone-grid
+// in stonesBatch, plas[i] the side to move) evaluated in ONE forward pass. Outputs:
+// policyOut numPos*(size*size+1) logits, valueOut numPos*5. numPos in [1,16].
+int kgeEvalBatch(const int* stonesBatch, const int* plas, int numPos,
+                 double komi, float* policyOut, float* valueOut);
+
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size
 int kgeModelVersion(void);        // loaded model's version

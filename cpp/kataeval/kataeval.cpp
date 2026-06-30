@@ -37,6 +37,7 @@ InputBuffers* gInputs = nullptr;
 int gXLen = 19, gYLen = 19, gModelVersion = 0;
 bool gUseNHWC = false;  // WebGPU wants NCHW (false); the Eigen CPU backend wants NHWC (true)
 std::string gErr = "";
+const int KGE_MAX_BATCH = 16;  // batched eval: many MCTS leaves per forward pass
 }  // namespace
 
 extern "C" {
@@ -64,9 +65,9 @@ KATAEVAL_EXPORT int kgeLoad(const char* modelPath, int boardSize) {
     // input layout to it (Eigen only supports NHWC).
     gUseNHWC = !kgeBackendIsGpu();
     gHandle = NeuralNet::createComputeHandle(
-      gCtx, gModel, /*logger*/nullptr, /*maxBatch*/1,
+      gCtx, gModel, /*logger*/nullptr, /*maxBatch*/KGE_MAX_BATCH,
       /*requireExactNNLen*/true, /*inputsUseNHWC*/gUseNHWC, /*gpuIdx*/-1, /*serverThread*/0);
-    gInputs = NeuralNet::createInputBuffers(gModel, 1, gXLen, gYLen);
+    gInputs = NeuralNet::createInputBuffers(gModel, KGE_MAX_BATCH, gXLen, gYLen);
     return 1;
   } catch(const std::exception& e) {
     gErr = e.what();
@@ -104,6 +105,45 @@ static int evalBoardHist(const Board& board, const BoardHistory& hist, Player ne
   valueOut[2] = output.whiteNoResultProb;
   valueOut[3] = output.whiteScoreMean;
   valueOut[4] = output.whiteLead;
+  return 1;
+}
+
+// Batched eval: B positions in ONE forward pass (the GPU evaluates them in
+// parallel, ~the cost of one). policyOut is B*(hw+1) raw logits; valueOut is B*5
+// (win/loss/noResult logits, scoreMean, lead). No ownership (search doesn't need it).
+static int evalBatch(const std::vector<const Board*>& boards,
+                     const std::vector<const BoardHistory*>& hists,
+                     const std::vector<Player>& plas,
+                     float* policyOut, float* valueOut) {
+  const int B = (int)boards.size();
+  const int spatialLen = NNModelVersion::getNumSpatialFeatures(gModelVersion) * gXLen * gYLen;
+  const int globalLen = NNModelVersion::getNumGlobalFeatures(gModelVersion);
+  std::vector<NNResultBuf> bufs(B);
+  std::vector<NNResultBuf*> bufPtrs(B);
+  std::vector<NNOutput> outs(B);
+  std::vector<NNOutput*> outPtrs(B);
+  MiscNNInputParams nnInputParams;
+  for(int i = 0; i < B; i++) {
+    bufs[i].rowSpatialBuf.resize(spatialLen);
+    bufs[i].rowGlobalBuf.resize(globalLen);
+    bufs[i].hasRowMeta = false;
+    bufs[i].symmetry = 0;
+    NNInputs::fillRowV7(*boards[i], *hists[i], plas[i], nnInputParams, gXLen, gYLen,
+                        gUseNHWC, bufs[i].rowSpatialBuf.data(), bufs[i].rowGlobalBuf.data());
+    bufPtrs[i] = &bufs[i];
+    outs[i].nnXLen = gXLen; outs[i].nnYLen = gYLen; outs[i].whiteOwnerMap = nullptr;
+    outPtrs[i] = &outs[i];
+  }
+  NeuralNet::getOutput(gHandle, gInputs, B, bufPtrs.data(), outPtrs);
+  const int hw = gXLen * gYLen;
+  for(int i = 0; i < B; i++) {
+    std::memcpy(policyOut + (size_t)i * (hw + 1), outs[i].policyProbs, (hw + 1) * sizeof(float));
+    valueOut[i*5+0] = outs[i].whiteWinProb;
+    valueOut[i*5+1] = outs[i].whiteLossProb;
+    valueOut[i*5+2] = outs[i].whiteNoResultProb;
+    valueOut[i*5+3] = outs[i].whiteScoreMean;
+    valueOut[i*5+4] = outs[i].whiteLead;
+  }
   return 1;
 }
 
@@ -155,6 +195,43 @@ KATAEVAL_EXPORT int kgeEvalSeq(const int* moveLocs, const int* moveCols, int num
         for(int x = 0; x < gXLen; x++)
           boardOut[y * gXLen + x] = (int)board.colors[Location::getLoc(x, y, gXLen)];
     return evalBoardHist(board, hist, (Player)toPla, policyOut, valueOut, ownerOut);
+  } catch(const std::exception& e) {
+    gErr = e.what();
+    return 0;
+  }
+}
+
+// Batched stones-only eval — for validating batched vs single. numPos positions,
+// each a hw stone-grid (stonesBatch[i*hw..]); plas[i] = side to move.
+//   policyOut: numPos*(hw+1) logits; valueOut: numPos*5.
+KATAEVAL_EXPORT int kgeEvalBatch(const int* stonesBatch, const int* plas, int numPos,
+                                 double komi, float* policyOut, float* valueOut) {
+  if(gHandle == nullptr) { gErr = "not loaded"; return 0; }
+  if(numPos < 1 || numPos > KGE_MAX_BATCH) { gErr = "batch size out of range"; return 0; }
+  try {
+    const int hw = gXLen * gYLen;
+    Rules rules = Rules::getTrompTaylorish();
+    rules.komi = (float)komi;
+    std::vector<Board> boards;
+    boards.reserve(numPos);                 // reserve so element addresses stay stable
+    for(int i = 0; i < numPos; i++) {
+      Board board(gXLen, gYLen);
+      const int* s = stonesBatch + (size_t)i * hw;
+      for(int y = 0; y < gYLen; y++)
+        for(int x = 0; x < gXLen; x++) {
+          int c = s[y * gXLen + x];
+          if(c == 1 || c == 2) board.setStone(Location::getLoc(x, y, gXLen), (Color)c);
+        }
+      boards.push_back(board);
+    }
+    std::vector<BoardHistory> hists;
+    hists.reserve(numPos);
+    std::vector<const Board*> bp;
+    std::vector<const BoardHistory*> hp;
+    std::vector<Player> plav;
+    for(int i = 0; i < numPos; i++) hists.emplace_back(boards[i], (Player)plas[i], rules, 0);
+    for(int i = 0; i < numPos; i++) { bp.push_back(&boards[i]); hp.push_back(&hists[i]); plav.push_back((Player)plas[i]); }
+    return evalBatch(bp, hp, plav, policyOut, valueOut);
   } catch(const std::exception& e) {
     gErr = e.what();
     return 0;
