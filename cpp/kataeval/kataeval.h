@@ -33,6 +33,18 @@ int kgeLoad(const char* modelPath, int boardSize);
 int kgeEval(const int* stones, int pla, double komi,
             float* policyOut, float* valueOut, float* ownerOut);
 
+// Evaluate after replaying a move sequence — models captures, ko/superko, and the
+// net's recent-move input features (unlike kgeEval, which sees only the final stones).
+//   moveLocs:  numMoves ints, each y*size + x, or < 0 for a pass.
+//   moveCols:  numMoves ints, the mover's color (1 black / 2 white).
+//   toPla:     side to move for the eval (1 black / 2 white).
+//   boardOut:  boardSize*boardSize ints written with the post-replay board
+//              (0 empty, 1 black, 2 white), or NULL to skip. Lets the UI show captures.
+//   policyOut/valueOut/ownerOut: as kgeEval. Returns 1 on success, 0 on failure.
+int kgeEvalSeq(const int* moveLocs, const int* moveCols, int numMoves,
+               int toPla, double komi, int* boardOut,
+               float* policyOut, float* valueOut, float* ownerOut);
+
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size
 int kgeModelVersion(void);        // loaded model's version

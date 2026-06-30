@@ -27,8 +27,9 @@
   <div>
     <h1>saiGo · offline KataGo — analyze &amp; play</h1>
     <div class="muted">A real KataGo net, evaluated entirely in your browser on WebGPU (no server).
-      Click to place stones; the overlay shows the policy (move probabilities) and the
-      win-rate bar updates. "Engine plays" makes KataGo take its top move.</div>
+      Play a real game — moves are replayed through KataGo's rules (captures, ko/superko)
+      and fed to the net as history. The overlay shows the policy and the win-rate updates;
+      "Engine plays" takes the top move.</div>
     <div id="boardWrap" style="margin-top:10px;">
       <div id="board"></div>
       <canvas id="overlay"></canvas>
@@ -47,6 +48,7 @@
     <div class="row">
       <button id="play">Engine plays ▶</button>
       <button id="pass">Pass</button>
+      <button id="undo">Undo</button>
       <button id="clear">Clear</button>
       <label style="margin-left:6px;"><input type="checkbox" id="owner"> ownership</label>
     </div>
@@ -63,7 +65,9 @@
   const N = 19, HW = N * N, BOARD_PX = 600;
   const $ = id => document.getElementById(id);
   const board = new WGo.Board($('board'), { size: N, width: BOARD_PX });
-  const grid = Array.from({ length: N }, () => new Array(N).fill(0)); // 1 black, 2 white
+  const grid = Array.from({ length: N }, () => new Array(N).fill(0)); // displayed board (from boardOut)
+  const moves = [];            // played sequence: {loc: y*N+x or -1 pass, col: 1|2}
+  const MAXMV = 2048;
   let toPlay = 1;  // 1 black, 2 white
   const overlay = $('overlay'), octx = overlay.getContext('2d');
   function syncOverlay() {
@@ -94,7 +98,7 @@
   sel.onchange = () => { const u = new URLSearchParams(location.search); u.set('net', sel.value); location.search = u.toString(); }; // reload with new net
 
   // --- load engine + model ---
-  let M = null, ready = false, sPtr, pPtr, vPtr, oPtr;
+  let M = null, ready = false, pPtr, vPtr, oPtr, mlPtr, mcPtr, bPtr;
   try {
     M = await createKata();
     if (qs.has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
@@ -105,7 +109,8 @@
     $('status').textContent = 'initializing engine (WebGPU, else CPU)…';
     const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
     if (!ok) { $('status').innerHTML = 'engine: <span class="bad">load failed</span> — ' + M.ccall('kgeError','string',[],[]); return; }
-    sPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
+    pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
+    mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4); bPtr = M._malloc(HW * 4);
     ready = true;
     const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen fallback)';
     $('status').innerHTML = 'engine: <span class="ok">ready</span> · KataGo ' + netKey + ' on ' + backend;
@@ -115,15 +120,21 @@
 
   async function analyze() {
     if (!ready) return;
-    const stones = new Int32Array(HW);
-    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) stones[idx(x, y)] = grid[x][y];
-    M.HEAP32.set(stones, sPtr >> 2);
+    const n = Math.min(moves.length, MAXMV);
+    const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
+    for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
+    M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
     const t0 = performance.now();
-    const ok = await M.ccall('kgeEval', 'number',
-      ['number','number','number','number','number','number'],
-      [sPtr, toPlay, 7.5, pPtr, vPtr, $('owner').checked ? oPtr : 0], { async: true });
+    // Replay the move sequence: captures + ko/superko + recent-move features.
+    const ok = await M.ccall('kgeEvalSeq', 'number',
+      ['number','number','number','number','number','number','number','number','number'],
+      [mlPtr, mcPtr, n, toPlay, 7.5, bPtr, pPtr, vPtr, $('owner').checked ? oPtr : 0], { async: true });
     if (!ok) { $('status').innerHTML = 'eval failed: ' + M.ccall('kgeError','string',[],[]); return; }
     const dt = (performance.now() - t0).toFixed(0);
+    // Sync the displayed board to the replayed position (shows captures), then redraw.
+    const bo = M.HEAP32.subarray(bPtr >> 2, (bPtr >> 2) + HW);
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) grid[x][y] = bo[idx(x, y)];
+    renderBoard();
     const pol = M.HEAPF32.subarray(pPtr >> 2, (pPtr >> 2) + HW + 1);
     const val = M.HEAPF32.subarray(vPtr >> 2, (vPtr >> 2) + 5);
 
@@ -174,22 +185,28 @@
     }
   }
 
-  function placeStone(x, y) {
-    board.addObject({ x, y, c: toPlay === 1 ? WGo.B : WGo.W });
-    grid[x][y] = toPlay; toPlay = toPlay === 1 ? 2 : 1;
+  // Redraw all stones from the displayed grid (captures appear/disappear).
+  function renderBoard() {
+    board.removeAllObjects();
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++)
+      if (grid[x][y]) board.addObject({ x, y, c: grid[x][y] === 1 ? WGo.B : WGo.W });
+  }
+  // Append a move to the game sequence (loc = y*N+x, or -1 for pass) and re-eval.
+  function playMove(loc) {
+    if (!ready || moves.length >= MAXMV) return;
+    moves.push({ loc, col: toPlay });
+    toPlay = toPlay === 1 ? 2 : 1;
+    analyze();
   }
 
   board.addEventListener('click', (x, y) => {
     if (x < 0 || y < 0 || x >= N || y >= N || grid[x][y] !== 0) return;
-    placeStone(x, y); analyze();
+    playMove(idx(x, y));
   });
-  $('play').onclick = async () => {
-    if (!ready || lastBest < 0) return;
-    if (lastBest === HW) { toPlay = toPlay === 1 ? 2 : 1; await analyze(); return; }
-    placeStone(lastBest % N, Math.floor(lastBest / N)); await analyze();
-  };
-  $('pass').onclick = async () => { toPlay = toPlay === 1 ? 2 : 1; await analyze(); };
-  $('clear').onclick = async () => { board.removeAllObjects(); for (let x = 0; x < N; x++) grid[x].fill(0); toPlay = 1; await analyze(); };
+  $('play').onclick = () => { if (ready && lastBest >= 0) playMove(lastBest === HW ? -1 : lastBest); };
+  $('pass').onclick = () => playMove(-1);
+  $('undo').onclick = () => { if (ready && moves.length) { moves.pop(); toPlay = toPlay === 1 ? 2 : 1; analyze(); } };
+  $('clear').onclick = () => { if (ready) { moves.length = 0; toPlay = 1; analyze(); } };
   $('owner').onchange = analyze;
   window.addEventListener('resize', () => { syncOverlay(); if (lastPolicy) drawOverlay(); });
 })();

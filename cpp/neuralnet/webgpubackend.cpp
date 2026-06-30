@@ -196,16 +196,20 @@ struct ComputeContext {
 // wgpu::StringView) and the WGSL shader-source descriptor
 // (ShaderModuleWGSLDescriptor vs newer ShaderSourceWGSL).
 static wgpu::Adapter requestAdapterSync(Logger* logger) {
-  // Dawn disables shader-f16 on ALL NVIDIA Vulkan GPUs by default (a guard for f16
-  // CTS failures, crbug.com/42251215) unless this adapter-stage toggle is set.
-  // Harmless on non-NVIDIA / non-Vulkan (unknown toggles are ignored).
+  wgpu::RequestAdapterOptions options{};
+  options.powerPreference = wgpu::PowerPreference::HighPerformance;
+#ifndef __EMSCRIPTEN__
+  // Native Dawn disables shader-f16 on ALL NVIDIA Vulkan GPUs by default (a guard
+  // for f16 CTS failures, crbug.com/42251215) unless this adapter-stage toggle is
+  // set. Harmless on non-NVIDIA (unknown toggles are ignored). DawnTogglesDescriptor
+  // is a Dawn-native extension — not present in emdawnwebgpu (the browser sets its
+  // own toggles), so it's compiled in only for the native build.
   static const char* const kEnabledToggles[] = { "vulkan_enable_f16_on_nvidia" };
   wgpu::DawnTogglesDescriptor toggles{};
   toggles.enabledToggleCount = 1;
   toggles.enabledToggles = kEnabledToggles;
-  wgpu::RequestAdapterOptions options{};
   options.nextInChain = &toggles;
-  options.powerPreference = wgpu::PowerPreference::HighPerformance;
+#endif
   wgpu::Adapter result = nullptr;
   volatile bool done = false;
   gInstance.RequestAdapter(

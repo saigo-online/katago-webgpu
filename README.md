@@ -128,8 +128,8 @@ README-KATAGO-UPSTREAM.md   the original KataGo README
   policy. Still **rejected with a clear error** (not silently mis-evaluated): the
   **SGF-metadata encoder** (`metaEncoderVersion ≠ 0` — train without it) and
   **grouped** RMSNorm (`cgroupSize ≠ 0`).
-- **Demo**: single-position analysis (no move history fed yet, so ko/superko and
-  "the actual game" aren't modeled); score is approximate; 19×19, Tromp-Taylor.
+- **Demo**: plays a real game — moves are replayed through KataGo's rules (captures,
+  ko/superko) and fed to the net as history; score is approximate; 19×19, Tromp-Taylor.
 - **Perf**: direct convs (no Winograd yet). b6c96 is fast but weak; b20c256
   (23.5M params, ~9 dan) is strong but an 87 MB download and slower per eval —
   pick per your hardware.

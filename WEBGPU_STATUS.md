@@ -205,8 +205,9 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
   fp16-only trick and the desc is shared with the Eigen CPU fallback (which asserts
   on scaled mish). When the fp16 GPU path is validated, apply scale8 to a per-handle
   copy instead.
-- **Demo**: single-position analysis — no move history is fed yet, so ko/superko
-  and "the actual game" aren't modeled; score is approximate; 19×19, Tromp-Taylor.
+- **Demo**: plays a real game — `kgeEvalSeq` replays the move sequence through
+  KataGo's `BoardHistory` (captures + ko/superko + the recent-move input features)
+  and returns the post-capture board; score is approximate; 19×19, Tromp-Taylor.
 - **Perf**: 3×3 convs use **Winograd F(2,3)** (~+72% nnEvals/s); other filter
   sizes are direct. Attention is the simple O(seq²) form (one thread per (head,
   query, key)) — fine at 19×19, not yet tiled. The net selector spans b6c96 →
@@ -219,7 +220,8 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
 2. **SGF-metadata encoder** + grouped RMSNorm — the last architecture gaps.
 3. **Selective-fp32 heads** + validate the fp16 GPU path on a `shader-f16` adapter
    (then re-introduce the scale8 rescale per-handle for fp16 stability).
-4. **Demo**: feed move history (ko/superko, real games) and ownership/score polish.
+4. **Search** — MCTS/PUCT in the browser using the net as the leaf evaluator
+   (ponder + max-time / max-visits), now that move history + `kgeEvalSeq` exist.
    *(Done: conv + nested-bottleneck + the full transformer stack through v17 —
    RMSNorm, RoPE, grouped-query attention, SwiGLU, optimism/q-value policy.)*
 
