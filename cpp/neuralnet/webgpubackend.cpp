@@ -52,6 +52,9 @@
 #include <utility>
 #include <cmath>
 #include <cstring>
+#include <chrono>
+#include <atomic>
+#include <cstdlib>
 
 #include "../external/half-2.2.0/include/half.hpp"
 using half_t = half_float::half;
@@ -622,11 +625,24 @@ void wgReadFloats(ComputeContext* ctx, const wgpu::Buffer& src, size_t count, st
 // gives the WebGPU-guaranteed ordering + memory barrier between data-dependent
 // ops. Bind groups are kept alive until submit (they hold refs to their buffers,
 // including the per-dispatch uniform buffers, so nothing is freed early).
+// One compute pass for the whole forward pass collapses ~50–60 per-op pass boundaries
+// (each a GPU pipeline-barrier/flush — the dominant cost for small nets) into one.
+// Dawn inserts the storage-buffer hazard barriers between dispatches within a pass, so
+// dependent layers stay correct (validated byte-exact). Same Dawn runs in the browser.
+// Gated on KGE_MULTIPASS for an A/B fallback.
+static const bool kgeMultipass = std::getenv("KGE_MULTIPASS") != nullptr;
+static const bool kgeTimingHist = std::getenv("KATAGO_WEBGPU_TIMING") != nullptr;
+static std::unordered_map<std::string,int> gDispatchHist;
+static int gHistFrames = 0;
 struct WgRecorder {
   ComputeContext* ctx;
   wgpu::CommandEncoder encoder;
+  wgpu::ComputePassEncoder pass;
+  bool passOpen = false;
   std::vector<wgpu::BindGroup> keepAlive;
   explicit WgRecorder(ComputeContext* c) : ctx(c), encoder(c->device.CreateCommandEncoder()) {}
+
+  void endPass() { if(passOpen) { pass.End(); passOpen = false; } }
 
   void dispatch(const char* entryPoint, const std::vector<wgpu::Buffer>& binds,
                 uint32_t wgX, uint32_t wgY = 1, uint32_t wgZ = 1) {
@@ -640,9 +656,16 @@ struct WgRecorder {
     bgDesc.layout = pipeline.GetBindGroupLayout(0);
     bgDesc.entryCount = entries.size(); bgDesc.entries = entries.data();
     wgpu::BindGroup bindGroup = ctx->device.CreateBindGroup(&bgDesc);
-    wgpu::ComputePassEncoder pass = encoder.BeginComputePass();
-    pass.SetPipeline(pipeline); pass.SetBindGroup(0, bindGroup);
-    pass.DispatchWorkgroups(wgX, wgY, wgZ); pass.End();
+    if(kgeTimingHist) gDispatchHist[entryPoint]++;  // tallied; printed once in submitAndReadback
+    if(kgeMultipass) {
+      wgpu::ComputePassEncoder p = encoder.BeginComputePass();
+      p.SetPipeline(pipeline); p.SetBindGroup(0, bindGroup);
+      p.DispatchWorkgroups(wgX, wgY, wgZ); p.End();
+    } else {
+      if(!passOpen) { pass = encoder.BeginComputePass(); passOpen = true; }
+      pass.SetPipeline(pipeline); pass.SetBindGroup(0, bindGroup);
+      pass.DispatchWorkgroups(wgX, wgY, wgZ);
+    }
     keepAlive.push_back(bindGroup);
   }
 
@@ -651,6 +674,15 @@ struct WgRecorder {
   // the per-output readbacks into a single GPU round-trip.
   void submitAndReadback(const std::vector<std::pair<wgpu::Buffer,size_t>>& srcs,
                          std::vector<std::vector<float>*>& outs, bool forceF32 = false) {
+    endPass();  // close the single forward-pass compute pass before buffer copies
+    if(kgeTimingHist && ++gHistFrames == 3) {
+      std::vector<std::pair<std::string,int>> v(gDispatchHist.begin(), gDispatchHist.end());
+      std::sort(v.begin(), v.end(), [](auto&a, auto&b){ return a.second > b.second; });
+      int tot = 0; for(auto& p : v) tot += p.second;
+      fprintf(stderr, "[wgpu-dispatches] ~%d/frame:", tot / gHistFrames);
+      for(auto& p : v) fprintf(stderr, " %s=%.1f", p.first.c_str(), (double)p.second / gHistFrames);
+      fprintf(stderr, "\n");
+    }
     // Each region's byte size is padded to a multiple of 4 (also keeps the next
     // copy offset 4-aligned, which CopyBufferToBuffer requires). forceF32: the head
     // outputs are f32 buffers under selective-fp32 even when the trunk is fp16.
@@ -665,6 +697,20 @@ struct WgRecorder {
     for(size_t i = 0; i < srcs.size(); i++) { encoder.CopyBufferToBuffer(srcs[i].first, 0, staging, off, rbytes[i]); off += rbytes[i]; }
     wgpu::CommandBuffer commands = encoder.Finish();
     ctx->queue.Submit(1, &commands);
+
+    // Split GPU-execute vs map round-trip when timing: wait for the GPU to finish the
+    // submitted work first, then for the map. (env-gated; adds a callback otherwise.)
+    static const bool _tm = std::getenv("KATAGO_WEBGPU_TIMING") != nullptr;
+    if(_tm) {
+      auto _ts = std::chrono::steady_clock::now();
+      volatile bool _g = false;
+      ctx->queue.OnSubmittedWorkDone(KGE_CB_MODE, [&_g](wgpu::QueueWorkDoneStatus, wgpu::StringView){ _g = true; });
+      wgPump(_g);
+      static std::atomic<int64_t> sG{0}, sN{0};
+      sG += std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-_ts).count(); sN += 1;
+      int64_t n = sN.load();
+      if(n % 100 == 0) fprintf(stderr, "[wgpu-gpu] avg GPU-execute us = %lld (n=%lld)\n", (long long)(sG/n), (long long)n);
+    }
 
     volatile bool done = false; bool ok = false;
     staging.MapAsync(wgpu::MapMode::Read, 0, (size_t)totalBytes, KGE_CB_MODE,
@@ -868,6 +914,8 @@ void NeuralNet::getOutput(
   assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
   assert(numBatchEltsFilled > 0);
   const int batchSize = numBatchEltsFilled;
+  static const bool kgeTiming = std::getenv("KATAGO_WEBGPU_TIMING") != nullptr;
+  auto _tMarshal = std::chrono::steady_clock::now();
   const int nnXLen = gpuHandle->nnXLen;
   const int nnYLen = gpuHandle->nnYLen;
   const int modelVersion = gpuHandle->modelDesc->modelVersion;
@@ -907,6 +955,7 @@ void NeuralNet::getOutput(
     ~PoolGuard() { tlPool = nullptr; tlForceF32 = false; }
   } poolGuard(&gpuHandle->pool);
   const int trunkC = trunk.trunkNumChannels;
+  auto _tEncode = std::chrono::steady_clock::now();  // marshal done; encoding begins
 
   // ---- Upload inputs; derive mask from spatial feature 0 (NCHW) ----
   wgpu::Buffer inBuf = wgMakeStorage(ctx, inputBuffers->userInputBuffer.data(),
@@ -1295,7 +1344,18 @@ void NeuralNet::getOutput(
     {ownBuf, (size_t)batchSize*numOwn*hw},
   };
   std::vector<std::vector<float>*> outs = {&policyHost, &policyPassHost, &valueHost, &svHost, &ownHost};
+  auto _tSubmit = std::chrono::steady_clock::now();  // encoding done; submit+readback begins
   rec.submitAndReadback(srcs, outs, /*forceF32=*/selectiveF32);  // head outputs are f32 when selective
+  if(kgeTiming) {
+    auto _tEnd = std::chrono::steady_clock::now();
+    auto us = [](auto a, auto b){ return std::chrono::duration_cast<std::chrono::microseconds>(b-a).count(); };
+    static std::atomic<int64_t> sM{0}, sE{0}, sR{0}, sN{0};
+    sM += us(_tMarshal,_tEncode); sE += us(_tEncode,_tSubmit); sR += us(_tSubmit,_tEnd); sN += 1;
+    int64_t n = sN.load();
+    if(n % 100 == 0)
+      fprintf(stderr, "[wgpu-timing] B=%d n=%lld avg us: marshal=%lld encode=%lld submit+readback=%lld total=%lld\n",
+              batchSize, (long long)n, (long long)(sM/n), (long long)(sE/n), (long long)(sR/n), (long long)((sM+sE+sR)/n));
+  }
   tlForceF32 = false;  // restore for the next eval (PoolGuard handles the pool)
 
   // ---- Write NNOutputs (logits; NNEvaluator applies softmax/tanh) ----
