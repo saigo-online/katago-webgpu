@@ -89,11 +89,45 @@ back to Eigen. JS does the final softmax (so it can mask illegal moves).
 The big win was **latency**, not FLOPs: one `Submit` per eval (a single
 `WgRecorder` command encoder) and **one** coalesced `MapAsync` readback instead
 of ~50 submits and 5 blocking round-trips. Weights upload once
-(`weightCache`/`bnCache`); intermediates/uniforms are reused from a per-handle
-`BufferPool`; `conv1x1NCHW` skips the spatial loop for 1×1 layers (the heads).
+(`weightCache`/`bnCache`/`winogradCache`); intermediates/uniforms are reused from
+a per-handle `BufferPool`; `conv1x1NCHW` skips the spatial loop for 1×1 layers.
 
-Still open: **Winograd 3×3** (the direct conv is the remaining compute hot spot),
-larger fixed batch.
+**Winograd F(2,3) for 3×3 convs** (`winogradInput`/`winogradMatmul`/
+`winogradOutput`, filters transformed once on host into `winogradCache`):
+4 multiplies/output vs 9. A/B from one binary (`KATAGO_WEBGPU_NO_WINOGRAD=1`
+forces direct conv), b6c96 19×19 8 threads on a GB10:
+
+| 3×3 path | nnEvals/s | visits/s |
+|----------|-----------|----------|
+| direct `conv2dNCHW` | 296.9 | ~472 |
+| **Winograd F(2,3)** | **511.4** (**+72%**) | ~937 |
+
+Validated: `runnnlayertests` routes its 3×3 case through Winograd (matches the
+CPU reference), and a full b6c96 tiny-board eval is **byte-identical** to direct
+conv.
+
+**Further SOTA passes** (each with an `A/B` env flag, each validated byte-identical
+to Eigen on conv / nbt / transformer / GQA nets + per-op):
+
+| # | optimization | what | flag |
+|---|--------------|------|------|
+| 1 | **Flash Attention** | fused single-kernel attention with online softmax — no materialized `[heads×seq×seq]` score matrix (3 dispatches → 1) | `KATAGO_WEBGPU_NO_FLASHATTN` |
+| 2 | **Tiled GEMM** | shared-memory tiling for 1×1 conv / transformer projections | `KATAGO_WEBGPU_NO_TILEDGEMM` |
+| 3 | **Kernel fusion** | fold pre-activation BN+act+mask into the 1×1 GEMM's input load (no intermediate) | `KATAGO_WEBGPU_NO_FUSION` |
+| 6 | **Register tiling** | 2×2 output micro-tile per thread on top of shared-memory tiling | `KATAGO_WEBGPU_NO_REGTILE` |
+
+Pending (need GPU features this dev adapter — NVIDIA GB10, software Vulkan — does
+**not** expose, so they can't be validated here; to do on a `shader-f16`/subgroup
+browser/GPU):
+- **#4 fp16 compute + selective-fp32 heads** — the fp16 *storage* path exists; true
+  fp16 compute + keeping policy/value/RMSNorm reductions in fp32 needs a `shader-f16`
+  adapter to validate (this one reports "using fp32").
+- **#5 subgroup reductions** — `subgroupAdd`/`subgroupShuffle` for pooling / softmax /
+  GEMM dot-products; needs the WebGPU subgroups feature (absent here, and a missing
+  feature would fail shader compilation, so it must be feature-gated on the device).
+
+Still open (validatable here): tiled attention for big nets; larger fixed batch;
+sharing the Winograd input transform across output channels.
 
 ## fp16
 
@@ -159,13 +193,15 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
   copy instead.
 - **Demo**: single-position analysis — no move history is fed yet, so ko/superko
   and "the actual game" aren't modeled; score is approximate; 19×19, Tromp-Taylor.
-- **Perf**: direct convs (no Winograd yet); attention is the simple O(seq²) form
-  (one thread per (head, query, key)) — fine at 19×19, not yet tiled. The net
-  selector spans b6c96 → b10c128 → b20c256 → b18c384nbt → a v17 transformer test net.
+- **Perf**: 3×3 convs use **Winograd F(2,3)** (~+72% nnEvals/s); other filter
+  sizes are direct. Attention is the simple O(seq²) form (one thread per (head,
+  query, key)) — fine at 19×19, not yet tiled. The net selector spans b6c96 →
+  b10c128 → b20c256 → b18c384nbt → a v17 transformer test net.
 
 ## Roadmap
 
-1. **Winograd 3×3** — the main remaining conv speedup; tiled attention for big nets.
+1. ✅ **Winograd 3×3** — done + validated (F(2,3), ~+72% nnEvals/s vs direct,
+   full-net byte-identical). Remaining: tiled attention for big nets.
 2. **SGF-metadata encoder** + grouped RMSNorm — the last architecture gaps.
 3. **Selective-fp32 heads** + validate the fp16 GPU path on a `shader-f16` adapter
    (then re-introduce the scale8 rescale per-handle for fp16 stability).
