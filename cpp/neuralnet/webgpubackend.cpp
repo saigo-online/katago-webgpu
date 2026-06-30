@@ -154,7 +154,8 @@ struct ComputeContext {
   int nnXLen;
   int nnYLen;
   enabled_t useFP16Mode;
-  bool useFP16 = false;  // resolved: fp16 requested AND adapter supports shader-f16
+  bool useFP16 = false;       // resolved: fp16 requested AND adapter supports shader-f16
+  bool useSubgroups = false;  // adapter supports the WebGPU subgroups feature
 
 #ifdef KATAGO_HAVE_WEBGPU
   wgpu::Device device;
@@ -222,12 +223,16 @@ static wgpu::Adapter requestAdapterSync(Logger* logger) {
   return result;
 }
 
-// Request a device, enabling the shader-f16 feature when wanted and supported.
-static wgpu::Device requestDeviceSync(const wgpu::Adapter& adapter, Logger* logger, bool wantFP16, bool& gotFP16) {
+// Request a device, enabling shader-f16 + subgroups when wanted and supported.
+static wgpu::Device requestDeviceSync(const wgpu::Adapter& adapter, Logger* logger, bool wantFP16, bool& gotFP16, bool& gotSubgroups) {
   gotFP16 = wantFP16 && adapter.HasFeature(wgpu::FeatureName::ShaderF16);
-  wgpu::FeatureName features[1] = { wgpu::FeatureName::ShaderF16 };
+  gotSubgroups = adapter.HasFeature(wgpu::FeatureName::Subgroups);
+  std::vector<wgpu::FeatureName> feats;
+  if(gotFP16) feats.push_back(wgpu::FeatureName::ShaderF16);
+  if(gotSubgroups) feats.push_back(wgpu::FeatureName::Subgroups);
   wgpu::DeviceDescriptor devDesc{};
-  if(gotFP16) { devDesc.requiredFeatureCount = 1; devDesc.requiredFeatures = features; }
+  devDesc.requiredFeatureCount = feats.size();
+  devDesc.requiredFeatures = feats.data();
   wgpu::Device result = nullptr;
   volatile bool done = false;
   adapter.RequestDevice(
@@ -245,7 +250,7 @@ static wgpu::Device requestDeviceSync(const wgpu::Adapter& adapter, Logger* logg
   return result;
 }
 
-static wgpu::Device acquireDevice(Logger* logger, bool wantFP16, bool& gotFP16) {
+static wgpu::Device acquireDevice(Logger* logger, bool wantFP16, bool& gotFP16, bool& gotSubgroups) {
   wgpu::Adapter adapter = requestAdapterSync(logger);
   if(logger != NULL) {
     wgpu::AdapterInfo info{};
@@ -253,7 +258,7 @@ static wgpu::Device acquireDevice(Logger* logger, bool wantFP16, bool& gotFP16) 
     logger->write(string("WebGPU backend: using adapter ") +
                   string(info.device.data, info.device.length));
   }
-  return requestDeviceSync(adapter, logger, wantFP16, gotFP16);
+  return requestDeviceSync(adapter, logger, wantFP16, gotFP16, gotSubgroups);
 }
 
 // Acquire device + queue and compile the WGSL module into a context. Selects the
@@ -266,9 +271,11 @@ static void initContextGpu(ComputeContext* context, Logger* logger) {
   // it for A/B testing. Needs an adapter exposing shader-f16 (see the NVIDIA toggle
   // in requestAdapterSync); falls back to fp32 otherwise.
   bool wantFP16 = (context->useFP16Mode != enabled_t::False) || (std::getenv("KATAGO_WEBGPU_FP16") != nullptr);
-  bool gotFP16 = false;
-  context->device = acquireDevice(logger, wantFP16, gotFP16);
+  bool gotFP16 = false, gotSubgroups = false;
+  context->device = acquireDevice(logger, wantFP16, gotFP16, gotSubgroups);
   context->useFP16 = gotFP16;
+  // Subgroup-accelerated reductions (pooling); KATAGO_WEBGPU_NO_SUBGROUPS=1 disables (A/B).
+  context->useSubgroups = gotSubgroups && (std::getenv("KATAGO_WEBGPU_NO_SUBGROUPS") == nullptr);
   context->queue = context->device.GetQueue();
 
   auto compile = [&](const std::string& code) {
@@ -287,12 +294,42 @@ static void initContextGpu(ComputeContext* context, Logger* logger) {
     "@group(0) @binding(2) var<storage, read_write> cvtOut : array<f32>;\n"
     "@compute @workgroup_size(64) fn convF16ToF32(@builtin(global_invocation_id) gid : vec3<u32>) {\n"
     "  let i = gid.x; if (i >= cvtN.x) { return; } cvtOut[i] = f32(cvtIn[i]); }\n";
+  // Subgroup pooling: replaces globalPoolMeanMax's shared-memory tree reduction with
+  // subgroupAdd/subgroupMax + a small cross-subgroup combine. Reuses GPParams (from
+  // WGSL_KERNELS), so it must be appended after `base`. Needs `enable subgroups;`.
+  static const char* const WGSL_SUBGROUP =
+    "var<workgroup> sgRSum : array<f32,16>;\n"
+    "var<workgroup> sgRCnt : array<f32,16>;\n"
+    "var<workgroup> sgRMax : array<f32,16>;\n"
+    "@group(0) @binding(0) var<uniform> gsg : GPParams;\n"
+    "@group(0) @binding(1) var<storage, read> gsgIn : array<STO>;\n"
+    "@group(0) @binding(2) var<storage, read> gsgMask : array<STO>;\n"
+    "@group(0) @binding(3) var<storage, read_write> gsgOut : array<STO>;\n"
+    "@compute @workgroup_size(64) fn globalPoolMeanMaxSG(\n"
+    "    @builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) lid : vec3<u32>,\n"
+    "    @builtin(subgroup_invocation_id) sgId : u32, @builtin(subgroup_size) sgSz : u32) {\n"
+    "  let nc = wid.x; let c = nc % gsg.c; let n = nc / gsg.c;\n"
+    "  let base = (n*gsg.c + c)*gsg.hw; let maskBase = n*gsg.hw;\n"
+    "  var ls=0.0; var lm=-3.4e38; var lc=0.0; var i = lid.x;\n"
+    "  loop { if(i>=gsg.hw){break;} let m=f32(gsgMask[maskBase+i]); let v=f32(gsgIn[base+i]); ls=ls+v*m; lc=lc+m; if(m>0.5){lm=max(lm,v);} i=i+64u; }\n"
+    "  let ssum=subgroupAdd(ls); let scnt=subgroupAdd(lc); let smax=subgroupMax(lm);\n"
+    "  let sg = lid.x / sgSz;\n"
+    "  if(sgId==0u){ sgRSum[sg]=ssum; sgRCnt[sg]=scnt; sgRMax[sg]=smax; }\n"
+    "  workgroupBarrier();\n"
+    "  if(lid.x==0u){\n"
+    "    let numSg=(64u+sgSz-1u)/sgSz; var ts=0.0; var tc=0.0; var tm=-3.4e38;\n"
+    "    for(var k=0u;k<numSg;k=k+1u){ ts=ts+sgRSum[k]; tc=tc+sgRCnt[k]; tm=max(tm,sgRMax[k]); }\n"
+    "    let area=max(tc,1.0); let mean=ts/area; let scaled=mean*(sqrt(area)-14.0)*0.1; let ob=n*3u*gsg.c;\n"
+    "    gsgOut[ob+c]=STO(mean); gsgOut[ob+gsg.c+c]=STO(scaled); gsgOut[ob+2u*gsg.c+c]=STO(tm);\n"
+    "  }\n}\n";
   std::string base = KataGoWebGPU::WGSL_KERNELS;
+  std::string sgEnable = context->useSubgroups ? "enable subgroups;\n" : "";
+  std::string sgBody = context->useSubgroups ? WGSL_SUBGROUP : "";
   if(gotFP16) {
-    context->kernels = compile("enable f16;\nalias STO = f16;\n" + base + WGSL_CONVERT);
-    context->kernelsF32 = compile("alias STO = f32;\n" + base);  // for the heads
+    context->kernels = compile("enable f16;\n" + sgEnable + "alias STO = f16;\n" + base + sgBody + WGSL_CONVERT);
+    context->kernelsF32 = compile(sgEnable + "alias STO = f32;\n" + base + sgBody);  // for the heads
   } else {
-    context->kernels = compile("alias STO = f32;\n" + base);
+    context->kernels = compile(sgEnable + "alias STO = f32;\n" + base + sgBody);
   }
   if(logger != NULL) {
     if(gotFP16)
@@ -976,7 +1013,9 @@ void NeuralNet::getOutput(
   auto gpool = [&](const char* entry, wgpu::Buffer in, int C) {
     GPParamsHost p{(uint32_t)batchSize,(uint32_t)C,(uint32_t)hw,0u};
     wgpu::Buffer out = wgMakeStorage(ctx, nullptr, (size_t)batchSize*3*C, false);
-    rec.dispatch(entry, {wgMakeUniform(ctx,p), in, maskBuf, out}, (uint32_t)(batchSize*C));
+    // Subgroup pooling for mean/max (the common gpool); value-head pool unchanged.
+    const char* k = (ctx->useSubgroups && std::strcmp(entry, "globalPoolMeanMax") == 0) ? "globalPoolMeanMaxSG" : entry;
+    rec.dispatch(k, {wgMakeUniform(ctx,p), in, maskBuf, out}, (uint32_t)(batchSize*C));
     return out;
   };
   auto addChanBias = [&](wgpu::Buffer data, wgpu::Buffer bias, int C) {

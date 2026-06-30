@@ -132,9 +132,13 @@ browser/GPU):
   gap: b6c96 → 92.05c (vs 92.06), GQA transformer → 64.31c (vs 64.32), b10c128
   74.02 vs full-fp16 74.09 (b10 is trunk-dominated, so a smaller win there).
   `KATAGO_WEBGPU_NO_FP32HEADS=1` keeps everything fp16 (A/B).
-- **#5 subgroup reductions** — `subgroupAdd`/`subgroupShuffle` for pooling / softmax /
-  GEMM dot-products; needs the WebGPU subgroups feature (absent here, and a missing
-  feature would fail shader compilation, so it must be feature-gated on the device).
+- **#5 subgroup reductions** — **done.** Global pooling (mean/max) uses
+  `subgroupAdd`/`subgroupMax` + a small cross-subgroup combine instead of the
+  shared-memory tree reduction. Feature-gated: the subgroup kernel is only appended
+  (with `enable subgroups;`) when the adapter exposes the WebGPU subgroups feature
+  (the GB10 does, size 32) — otherwise the unmodified tree-reduction kernel runs, so
+  no shader fails to compile. Validated byte-exact vs Eigen; composes with fp16 +
+  selective-fp32 heads. `KATAGO_WEBGPU_NO_SUBGROUPS=1` for A/B.
 
 Still open (validatable here): tiled attention for big nets; larger fixed batch;
 sharing the Winograd input transform across output channels.
