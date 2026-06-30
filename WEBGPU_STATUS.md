@@ -174,6 +174,24 @@ matrix), which would accelerate the Winograd/projection GEMMs — but it's
 flag-gated/experimental in stable browsers, so **not portable yet**. It's the biggest
 future compute win once WebGPU ships cooperative matrix in stable Chrome.
 
+**Next perf wins, ranked** (all native-validatable here):
+1. **fp16 trunk rescale** → unlocks the opt-in fp16 path for *all* nets (~2×). The
+   trunk overflows ±65504 on g170 (ReLU); needs a per-handle activation/residual
+   rescale (cf. KataGo's scale8). Biggest single lever; fp16 toggle already wired.
+2. **Fuse winogradMatmul + winogradOutput** → removes the ~14 *expensive* output-
+   transform dispatches (the BN+act fusion only cut cheap ones, hence +1.6%). Compute
+   a tile's 16 matmul components in-kernel, then transform — one kernel per output tile.
+3. **Pipeline 2 batches** (double-buffer I/O + 2 in-flight submits) to hide even the
+   small map latency — diminishing here (latency is GPU-execute, not map), but helps.
+4. **Cooperative matrix** once stable browsers ship it (tensor cores for the GEMMs).
+
+**Search (Gumbel):** the demo's **Measure** button (visit-sweep convergence) is the
+evaluation harness. A Gumbel-AlphaZero root (Gumbel-top-k + sequential halving over a
+custom playout loop, PUCT below the root; Danihelka 2022) is the SOTA low-visit
+upgrade — but it's a new search loop, not a knob on KataGo's PUCT `Search`, so it
+wants its own native test harness before shipping (not done here — risk of shipping
+unvalidated search). Measure-tool A/B (PUCT vs Gumbel: visits-to-settle) is the metric.
+
 ## fp16
 
 The kernels use a `STO` storage-scalar alias the backend prepends as
