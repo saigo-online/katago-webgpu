@@ -5,7 +5,7 @@
 #include <emscripten.h>
 #include <pthread.h>
 #include <utility>
-static void report(int status, double val) { EM_ASM({ if (window.__tt) window.__tt($0, $1); }, status, val); }
+static void report(int status, double val) { MAIN_THREAD_ASYNC_EM_ASM({ if (window.__tt) window.__tt($0, $1); }, status, val); }
 static void pump(volatile bool& done) { while(!done) emscripten_sleep(0); }
 static void runWebGPU() {
   wgpu::Instance instance = wgpu::CreateInstance(nullptr);
