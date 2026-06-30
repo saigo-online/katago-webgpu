@@ -248,7 +248,8 @@
       const own = lastOwner;
       for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
         const v = own[idx(x, y)]; if (Math.abs(v) < 0.05) continue;
-        octx.fillStyle = v > 0 ? `rgba(20,20,20,${Math.min(.45, v*.45)})` : `rgba(240,240,240,${Math.min(.5, -v*.5)})`;
+        // whiteOwnerMap is white-positive: v>0 = white controls (light), v<0 = black (dark).
+        octx.fillStyle = v > 0 ? `rgba(235,235,235,${Math.min(.5, v*.5)})` : `rgba(20,20,20,${Math.min(.45, -v*.45)})`;
         octx.fillRect(board.getX(x) - sr, board.getY(y) - sr, sr*2, sr*2);
       }
     }
