@@ -49,7 +49,7 @@
 
   <div class="panel">
     <div class="row status" id="status">loading engine…</div>
-    <div class="row">Net: <select id="net"></select> <span class="muted" id="netnote"></span></div>
+    <div class="row">Net: <select id="net"></select> Size: <select id="size"></select> <span class="muted" id="netnote"></span></div>
     <div class="row">
       <div class="wr"><span>Black <span id="bwr">–</span></span><span><span id="wwr">–</span> White</span></div>
       <div class="bar"><div class="b" id="barB" style="width:50%">.</div><div class="w" id="barW" style="width:50%">.</div></div>
@@ -114,7 +114,10 @@
 <script src="vendor/wgo.min.js"></script>
 <script>
 (async function () {
-  const N = 19, HW = N * N, BOARD_PX = 600;
+  // Board size from ?size= (9/13/19; default 19). KataGo nets are fully convolutional,
+  // so any size works — the engine just gets boardSize at load.
+  const N = (() => { const s = parseInt(new URLSearchParams(location.search).get('size')); return (s === 9 || s === 13) ? s : 19; })();
+  const HW = N * N, BOARD_PX = 600;
   const $ = id => document.getElementById(id);
   // WGo treats a '#'-prefixed background as a CSS color (no image) — avoids the missing
   // wood1.jpg texture (which 404s -> black board). A warm goban tone instead.
@@ -179,6 +182,9 @@
   const sel = $('net');
   for (const k in NETS) { const o = document.createElement('option'); o.value = k; o.textContent = NETS[k].label; if (k === netKey) o.selected = true; sel.appendChild(o); }
   sel.onchange = () => { const u = new URLSearchParams(location.search); u.set('net', sel.value); location.search = u.toString(); }; // reload with new net
+  const szSel = $('size');
+  for (const s of [19, 13, 9]) { const o = document.createElement('option'); o.value = s; o.textContent = s + '×' + s; if (s === N) o.selected = true; szSel.appendChild(o); }
+  szSel.onchange = () => { const u = new URLSearchParams(location.search); u.set('size', szSel.value); location.search = u.toString(); }; // reload with new size
 
   // Fetch a net with persistent caching (Cache API) — shared with the search worker
   // (same origin), so each net downloads once and survives refreshes. The big nets
