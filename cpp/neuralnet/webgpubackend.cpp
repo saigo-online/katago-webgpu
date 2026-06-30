@@ -321,6 +321,7 @@ struct ConvParamsHost {
   uint32_t n, inC, outC, h, w, fy, fx, dilY, dilX, pad0, pad1, pad2;
 };
 struct Conv1x1ParamsHost { uint32_t n, inC, outC, hw; };
+struct TGParamsHost { uint32_t n, inC, outC, hw, wInMajor, pad0, pad1, pad2; };
 struct SBMAParamsHost { uint32_t n, c, hw, act; };
 struct AddParamsHost { uint32_t total, pad0, pad1, pad2; };
 struct WgParamsHost { uint32_t n, inC, outC, h, w, nTilesX, nTilesY, xi; };
@@ -844,6 +845,14 @@ void NeuralNet::getOutput(
     cache.emplace(w.data(), b);
     return b;
   };
+  // Shared-memory tiled GEMM for 1x1 conv / projections (into a caller buffer).
+  // KATAGO_WEBGPU_NO_TILEDGEMM=1 forces the naive per-output kernels (A/B).
+  const bool useTiledGemm = (std::getenv("KATAGO_WEBGPU_NO_TILEDGEMM") == nullptr);
+  auto tgemmInto = [&](wgpu::Buffer in, wgpu::Buffer out, int inC, int outC, wgpu::Buffer W, bool wInMajor) {
+    TGParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw, wInMajor?1u:0u, 0u,0u,0u};
+    rec.dispatch("tiledGemm", {wgMakeUniform(ctx,p), in, W, out},
+                 (uint32_t)((outC+15)/16), (uint32_t)((hw+15)/16), (uint32_t)batchSize);
+  };
   auto bnbuf = [&](const BatchNormLayerDesc& bn) {
     auto& cache = gpuHandle->bnCache;
     auto it = cache.find(&bn);
@@ -873,9 +882,12 @@ void NeuralNet::getOutput(
     size_t outElts = (size_t)batchSize * outC * hw;
     wgpu::Buffer out = wgMakeStorage(ctx, nullptr, outElts, true);
     if(cd.convXSize == 1 && cd.convYSize == 1) {
-      // 1x1 fast path (per-pixel channel GEMM): no spatial window/padding.
-      Conv1x1ParamsHost p{(uint32_t)batchSize, (uint32_t)inC, (uint32_t)outC, (uint32_t)hw};
-      rec.dispatch("conv1x1NCHW", {wgMakeUniform(ctx,p), in, wbuf(cd.weights), out}, (uint32_t)((outElts+63)/64));
+      // 1x1 = per-pixel channel GEMM. Tiled (shared-memory) or naive.
+      if(useTiledGemm) tgemmInto(in, out, inC, outC, wbuf(cd.weights), /*wInMajor=*/false);
+      else {
+        Conv1x1ParamsHost p{(uint32_t)batchSize, (uint32_t)inC, (uint32_t)outC, (uint32_t)hw};
+        rec.dispatch("conv1x1NCHW", {wgMakeUniform(ctx,p), in, wbuf(cd.weights), out}, (uint32_t)((outElts+63)/64));
+      }
     } else if(!std::getenv("KATAGO_WEBGPU_NO_WINOGRAD")
               && cd.convXSize == 3 && cd.convYSize == 3 && cd.dilationX == 1 && cd.dilationY == 1) {
       // Winograd F(2,3): 4 mults/output vs 9 (validated by testEvaluateConv).
@@ -939,10 +951,13 @@ void NeuralNet::getOutput(
   };
   // Per-position projection with MatMulLayerDesc [inC][outC] weights (bias-free).
   auto proj = [&](wgpu::Buffer in, int inC, int outC, const std::vector<float>& W) {
-    ProjParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw};
     size_t outElts = (size_t)batchSize*outC*hw;
     wgpu::Buffer out = wgMakeStorage(ctx, nullptr, outElts, true);
-    rec.dispatch("proj1x1", {wgMakeUniform(ctx,p), in, wbuf(W), out}, (uint32_t)((outElts+63)/64));
+    if(useTiledGemm) tgemmInto(in, out, inC, outC, wbuf(W), /*wInMajor=*/true);
+    else {
+      ProjParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw};
+      rec.dispatch("proj1x1", {wgMakeUniform(ctx,p), in, wbuf(W), out}, (uint32_t)((outElts+63)/64));
+    }
     return out;
   };
   auto rope = [&](wgpu::Buffer data, int numHeads, int headDim, int numPairs, int numKVHeads, bool learnable, wgpu::Buffer cosB, wgpu::Buffer sinB) {

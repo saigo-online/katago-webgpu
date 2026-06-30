@@ -378,6 +378,52 @@ fn conv1x1NCHW(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 
 // ===========================================================================
+// tiledGemm: shared-memory tiled version of the per-position channel GEMM
+//   out[n,o,xy] = sum_k W * in[n,k,xy]   (1x1 conv / transformer projection)
+// Computes one TILE×TILE block of out[outC, hw] per workgroup (batch n = wid.z),
+// staging A (weights) and B (input) tiles into workgroup memory. wInMajor picks
+// the weight layout: 1 = MatMulLayerDesc W[k*outC+o]; 0 = ConvLayerDesc W[o*inC+k].
+// ===========================================================================
+
+struct TGParams { n : u32, inC : u32, outC : u32, hw : u32, wInMajor : u32, pad0 : u32, pad1 : u32, pad2 : u32, };
+
+@group(0) @binding(0) var<uniform> tg : TGParams;
+@group(0) @binding(1) var<storage, read>       tgIn  : array<STO>;
+@group(0) @binding(2) var<storage, read>       tgW   : array<STO>;
+@group(0) @binding(3) var<storage, read_write> tgOut : array<STO>;
+
+const TG_TILE : u32 = 16u;
+var<workgroup> tgAs : array<f32, 256>;   // [TG_TILE][TG_TILE]  (o, k)
+var<workgroup> tgBs : array<f32, 256>;   // [TG_TILE][TG_TILE]  (k, xy)
+
+@compute @workgroup_size(16, 16)
+fn tiledGemm(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) lid : vec3<u32>) {
+  let n  = wid.z;
+  let o  = wid.x * TG_TILE + lid.x;      // output channel (row)
+  let xy = wid.y * TG_TILE + lid.y;      // spatial position (col)
+  var acc : f32 = 0.0;
+  let nTiles = (tg.inC + TG_TILE - 1u) / TG_TILE;
+  for (var t : u32 = 0u; t < nTiles; t = t + 1u) {
+    let kA = t * TG_TILE + lid.y;        // A's reduction index varies with lid.y
+    var av : f32 = 0.0;
+    if (o < tg.outC && kA < tg.inC) {
+      if (tg.wInMajor != 0u) { av = f32(tgW[kA * tg.outC + o]); } else { av = f32(tgW[o * tg.inC + kA]); }
+    }
+    tgAs[lid.x * TG_TILE + lid.y] = av;
+    let kB = t * TG_TILE + lid.x;        // B's reduction index varies with lid.x
+    var bv : f32 = 0.0;
+    if (kB < tg.inC && xy < tg.hw) { bv = f32(tgIn[(n * tg.inC + kB) * tg.hw + xy]); }
+    tgBs[lid.x * TG_TILE + lid.y] = bv;
+    workgroupBarrier();
+    for (var kk : u32 = 0u; kk < TG_TILE; kk = kk + 1u) {
+      acc = acc + tgAs[lid.x * TG_TILE + kk] * tgBs[kk * TG_TILE + lid.y];
+    }
+    workgroupBarrier();
+  }
+  if (o < tg.outC && xy < tg.hw) { tgOut[(n * tg.outC + o) * tg.hw + xy] = STO(acc); }
+}
+
+// ===========================================================================
 // Winograd F(2x2, 3x3) convolution — 3 stages (SAME padding, stride 1, dil 1).
 // Reduces the 3x3 conv's per-output multiplies from 9 to 4 by transforming
 // 4x4 input tiles and 3x3 filters into a 4x4 elementwise (Hadamard) domain.
