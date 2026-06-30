@@ -95,12 +95,39 @@
     <div class="row mono" id="m_pv" style="min-height:3.4em;">–</div>
   </div>
 
+  <div class="panel" style="width:auto;">
+    <h2 style="font-size:16px; margin:0 0 6px;">Engine's line
+      <span class="muted" style="font-weight:400;">— train of thought (PV)</span></h2>
+    <div id="pvboard"></div>
+    <div class="row muted mono" id="pvtext" style="max-width:360px; min-height:1.4em;">
+      Search to watch the engine read ahead — its expected best line, numbered, updating live.</div>
+  </div>
+
 <script src="vendor/wgo.min.js"></script>
 <script>
 (async function () {
   const N = 19, HW = N * N, BOARD_PX = 600;
   const $ = id => document.getElementById(id);
   const board = new WGo.Board($('board'), { size: N, width: BOARD_PX });
+  const pvBoard = new WGo.Board($('pvboard'), { size: N, width: 360 });
+  // Render the engine's principal variation on the 2nd board: current stones, then the
+  // PV played out as numbered, alternating moves from the side to move (its read-ahead).
+  function renderPV(pv) {
+    pvBoard.removeAllObjects();
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++)
+      if (grid[x][y]) pvBoard.addObject({ x, y, c: grid[x][y] === 1 ? WGo.B : WGo.W });
+    let col = toPlay, num = 0;
+    for (const loc of (pv || [])) {
+      if (loc >= 0) {
+        const x = loc % N, y = Math.floor(loc / N);
+        num++;
+        pvBoard.addObject({ x, y, c: col === 1 ? WGo.B : WGo.W });
+        pvBoard.addObject({ x, y, type: 'LB', text: String(num) });
+      }
+      col = col === 1 ? 2 : 1;
+    }
+    $('pvtext').textContent = (pv && pv.length) ? pv.map(ptName).join(' ') : '(current position)';
+  }
   const grid = Array.from({ length: N }, () => new Array(N).fill(0)); // displayed board (from boardOut)
   const moves = [];            // played sequence: {loc: y*N+x or -1 pass, col: 1|2}
   const MAXMV = 2048;
@@ -118,6 +145,7 @@
   const idx = (x, y) => y * N + x;
   function softmax(arr) { let m = -1e30; for (const v of arr) m = Math.max(m, v); let s = 0; const o = arr.map(v => { const e = Math.exp(v - m); s += e; return e; }); return o.map(v => v / s); }
   let lastPolicy = null, lastBest = -1, lastOwner = null;
+  const ptName = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
   // The single engine lives in a worker (threaded kataeval-mt): analysis + search both
   // go through it — one net load, shared NN cache, main thread free. Declared up here
   // so the load block below (which calls ensureKataWorker) is past their TDZ.
@@ -202,6 +230,7 @@
 
       lastOwner = r.owner;
       drawOverlay();
+      renderPV([]);   // position changed — reset the 2nd board to the current stones
     } catch (e) {
       $('status').innerHTML = 'eval failed: <span class="bad">' + (e.message || e) + '</span>';
     }
@@ -251,6 +280,7 @@
         if (e.data.diag) { console.log('[kata]', e.data.diag); $('searchout').textContent = 'KataGo · ' + e.data.diag; return; }
         if (e.data.progress) {   // live search/ponder stats — stream them into the panel
           renderMetrics(e.data, e.data.threads);
+          renderPV(e.data.pv);   // play the engine's current line on the 2nd board
           setBotState(e.data.state + '…', e.data.state === 'pondering' ? 'live' : 'run');
           searchBest = e.data.best; drawOverlay();
           return;
@@ -283,7 +313,6 @@
     }
     return kataInfo;
   }
-  const ptName = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
   function setBotState(text, cls) { const e = $('m_state'); e.textContent = text; e.className = 'pill' + (cls ? ' ' + cls : ''); }
   function renderMetrics(r, threads) {
     const wr = r.wr * 100;
