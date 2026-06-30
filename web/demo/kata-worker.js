@@ -9,14 +9,33 @@ importScripts('kataeval-mt.js');
 
 const MAXMV = 1024, PVCAP = 32;
 let M = null, N = 19, ready = false;
+
+// Net caching (Cache API), shared with the page — a net downloads once across both
+// contexts and survives refreshes. The page may have already cached it on load.
+async function cachedNet(url) {
+  let cache = null;
+  try { cache = await caches.open('saigo-nets-v1'); } catch (_) { cache = null; }
+  if (cache) { const hit = await cache.match(url); if (hit) return await hit.arrayBuffer(); }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('fetch ' + url + ' -> ' + res.status);
+  if (cache) { try { await cache.put(url, res.clone()); } catch (_) {} }
+  return await res.arrayBuffer();
+}
 let mlPtr, mcPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;
 
 async function init(netFile, boardSize) {
-  M = await createKata();
+  // The module is loaded via importScripts INTO this worker, so emscripten's
+  // _scriptName would point at kata-worker.js — it would then spawn pthread workers
+  // as new Worker('kata-worker.js') (re-running THIS file) instead of the pthread
+  // bootstrap. mainScriptUrlOrBlob tells it the real module URL so pthread + wasm
+  // loading resolve correctly.
+  const moduleUrl = new URL('kataeval-mt.js', self.location.href).href;
+  M = await createKata({
+    mainScriptUrlOrBlob: moduleUrl,
+    locateFile: (p) => new URL(p, self.location.href).href,
+  });
   N = boardSize;
-  const resp = await fetch(netFile);
-  if (!resp.ok) throw new Error('fetch ' + netFile + ' -> ' + resp.status);
-  M.FS.writeFile('/model.bin.gz', new Uint8Array(await resp.arrayBuffer()));
+  M.FS.writeFile('/model.bin.gz', new Uint8Array(await cachedNet(netFile)));
   const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
   if (!ok) throw new Error('kgeLoad: ' + M.ccall('kgeError', 'string', [], []));
   mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4);

@@ -106,6 +106,24 @@
   for (const k in NETS) { const o = document.createElement('option'); o.value = k; o.textContent = NETS[k].label; if (k === netKey) o.selected = true; sel.appendChild(o); }
   sel.onchange = () => { const u = new URLSearchParams(location.search); u.set('net', sel.value); location.search = u.toString(); }; // reload with new net
 
+  // Fetch a net with persistent caching (Cache API) — shared with the search worker
+  // (same origin), so each net downloads once and survives refreshes. The big nets
+  // (b20c256 = 87 MB) then load instantly on reload. Falls back to a plain fetch if
+  // the Cache API is unavailable.
+  async function cachedNet(url, onProgress) {
+    let cache = null;
+    try { cache = await caches.open('saigo-nets-v1'); } catch (_) { cache = null; }
+    if (cache) {
+      const hit = await cache.match(url);
+      if (hit) { onProgress && onProgress('loading ' + url + ' (cached)'); return await hit.arrayBuffer(); }
+    }
+    onProgress && onProgress('downloading ' + url + ' (first time — caching for next refresh)…');
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('fetch ' + url + ' -> ' + res.status);
+    if (cache) { try { await cache.put(url, res.clone()); } catch (_) {} }
+    return await res.arrayBuffer();
+  }
+
   // --- load engine + model ---
   let M = null, ready = false, pPtr, vPtr, oPtr, mlPtr, mcPtr, bPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;
   let searchBest = -2;            // highlighted searched move (-2 = none, -1 = pass)
@@ -113,10 +131,10 @@
   try {
     M = await createKata();
     if (qs.has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
-    $('status').textContent = 'fetching ' + netKey + ' net…';
-    const resp = await fetch(NETS[netKey].file);
-    if (!resp.ok) { $('status').innerHTML = 'net <b>' + netKey + '</b> not bundled — re-run <span class="mono">build-eval.sh</span>' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with the big net available ($B20_NET / $B18_NET)'); return; }
-    M.FS.writeFile('/model.bin.gz', new Uint8Array(await resp.arrayBuffer()));
+    let netBuf;
+    try { netBuf = await cachedNet(NETS[netKey].file, m => $('status').textContent = m); }
+    catch (e) { $('status').innerHTML = 'net <b>' + netKey + '</b> not bundled — re-run <span class="mono">build-eval.sh</span>' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with the big net available ($B20_NET / $B18_NET)'); return; }
+    M.FS.writeFile('/model.bin.gz', new Uint8Array(netBuf));
     $('status').textContent = 'initializing engine (WebGPU, else CPU)…';
     const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
     if (!ok) { $('status').innerHTML = 'engine: <span class="bad">load failed</span> — ' + M.ccall('kgeError','string',[],[]); return; }
