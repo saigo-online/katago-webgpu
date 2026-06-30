@@ -80,7 +80,7 @@ function pollStats() {
     done: !!M.HEAP32[donePtr >> 2],
     reused: !!M.HEAP32[reusedPtr >> 2],
     pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
-    mem: M.HEAP8.length,
+    mem: M.HEAP32.buffer.byteLength,   // total wasm memory (HEAP8 isn't exported)
   };
 }
 
