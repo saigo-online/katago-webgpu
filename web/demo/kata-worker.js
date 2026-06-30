@@ -26,9 +26,10 @@ async function cachedNet(url) {
   if (cache) { try { await cache.put(url, res.clone()); } catch (_) {} }
   return await res.arrayBuffer();
 }
-let mlPtr, mcPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;
+let mlPtr, mcPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;  // search buffers
+let bPtr, pPtr, vPtr, oPtr;                             // analysis (kgeEvalSeq) buffers
 
-async function init(netFile, boardSize, wasmBinary, jsText) {
+async function init(netFile, boardSize, wasmBinary, jsText, forceCpu) {
   // The module is loaded via importScripts INTO this worker, so emscripten's
   // _scriptName would point at kata-worker.js — it would then spawn pthread workers
   // as new Worker('kata-worker.js') (re-running THIS file) instead of the pthread
@@ -48,12 +49,15 @@ async function init(netFile, boardSize, wasmBinary, jsText) {
   });
   diag('createKata: runtime + thread pool ready');
   N = boardSize;
+  if (forceCpu) M.ccall('kgeSetForceCpu', null, ['number'], [1]);  // ?cpu — Eigen fallback
   M.FS.writeFile('/model.bin.gz', new Uint8Array(await cachedNet(netFile)));
   const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
   if (!ok) throw new Error('kgeLoad: ' + M.ccall('kgeError', 'string', [], []));
   mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4);
   bmPtr = M._malloc(4); wrPtr = M._malloc(4); visPtr = M._malloc(4); pvlPtr = M._malloc(4);
   pvPtr = M._malloc(PVCAP * 4);
+  const HW = N * N;
+  bPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
   ready = true;
   const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen)';
   return { backend, version: M.ccall('kgeModelVersion', 'number', [], []) };
@@ -82,10 +86,38 @@ async function search(req) {
   };
 }
 
+// Instant per-move analysis (raw NN policy/value/ownership) — same NNEvaluator-backed
+// net as search, so it's one net load and the analysis warms the cache search reuses.
+async function evalPos(req) {
+  if (!ready) throw new Error('engine not initialized');
+  const moves = req.moves || [];
+  const n = Math.min(moves.length, MAXMV);
+  const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
+  for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
+  M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
+  const HW = N * N;
+  const ok = await M.ccall('kgeEvalSeq', 'number',
+    ['number','number','number','number','number','number','number','number','number'],
+    [mlPtr, mcPtr, n, req.toPlay, req.komi ?? 7.5, bPtr, pPtr, vPtr, req.owner ? oPtr : 0], { async: true });
+  if (!ok) throw new Error('kgeEvalSeq: ' + M.ccall('kgeError', 'string', [], []));
+  // Copy HEAP slices into standalone buffers we can transfer back to the page.
+  return {
+    board: M.HEAP32.slice(bPtr >> 2, (bPtr >> 2) + HW),
+    policy: M.HEAPF32.slice(pPtr >> 2, (pPtr >> 2) + HW + 1),
+    value: M.HEAPF32.slice(vPtr >> 2, (vPtr >> 2) + 5),
+    owner: req.owner ? M.HEAPF32.slice(oPtr >> 2, (oPtr >> 2) + HW) : null,
+  };
+}
+
 onmessage = async (e) => {
   const { id, type } = e.data;
   try {
-    if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText)) });
+    if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText, e.data.forceCpu)) });
+    else if (type === 'eval') {
+      const r = await evalPos(e.data);
+      const xfer = [r.board.buffer, r.policy.buffer, r.value.buffer]; if (r.owner) xfer.push(r.owner.buffer);
+      postMessage({ id, ok: true, ...r }, xfer);
+    }
     else if (type === 'search') postMessage({ id, ok: true, ...(await search(e.data)) });
     else throw new Error('unknown message type: ' + type);
   } catch (err) {

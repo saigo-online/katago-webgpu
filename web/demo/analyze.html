@@ -53,8 +53,7 @@
       <label style="margin-left:6px;"><input type="checkbox" id="owner"> ownership</label>
     </div>
     <div class="row">
-      <button id="think">Think ▶</button>
-      <button id="thinkkata" title="KataGo's real Search (tree reuse + heuristics) on a worker thread">KataGo search ▶</button>
+      <button id="thinkkata" title="KataGo's real Search (PUCT heuristics + PV) on a worker thread">Search ▶</button>
       visits <input id="visits" type="number" value="400" min="1" max="20000" style="width:64px">
       ms <input id="ms" type="number" value="3000" min="100" max="120000" style="width:70px">
       threads <input id="threads" type="number" value="4" min="1" max="8" style="width:46px">
@@ -68,7 +67,6 @@
   </div>
 
 <script src="vendor/wgo.min.js"></script>
-<script src="kataeval.js"></script>
 <script>
 (async function () {
   const N = 19, HW = N * N, BOARD_PX = 600;
@@ -90,7 +88,12 @@
   // helpers / state declared before the load block (which calls analyze()).
   const idx = (x, y) => y * N + x;
   function softmax(arr) { let m = -1e30; for (const v of arr) m = Math.max(m, v); let s = 0; const o = arr.map(v => { const e = Math.exp(v - m); s += e; return e; }); return o.map(v => v / s); }
-  let lastPolicy = null, lastBest = -1;
+  let lastPolicy = null, lastBest = -1, lastOwner = null;
+  // The single engine lives in a worker (threaded kataeval-mt): analysis + search both
+  // go through it — one net load, shared NN cache, main thread free. Declared up here
+  // so the load block below (which calls ensureKataWorker) is past their TDZ.
+  let kataWorker = null, kataReqId = 0, kataInited = false, kataInfo = null;
+  const kataPending = new Map();
 
   // --- net selection (all g170, modelVersion 8 = supported), increasing strength ---
   const NETS = {
@@ -124,80 +127,67 @@
     return await res.arrayBuffer();
   }
 
-  // --- load engine + model ---
-  let M = null, ready = false, pPtr, vPtr, oPtr, mlPtr, mcPtr, bPtr, bmPtr, wrPtr, pvPtr, pvlPtr, visPtr;
+  // --- load engine (the threaded worker is the ONE engine: analysis + search) ---
+  let ready = false;
   let searchBest = -2;            // highlighted searched move (-2 = none, -1 = pass)
-  const PVCAP = 24;
   try {
-    M = await createKata();
-    if (qs.has('cpu')) M.ccall('kgeSetForceCpu', null, ['number'], [1]); // ?cpu forces CPU
-    let netBuf;
-    try { netBuf = await cachedNet(NETS[netKey].file, m => $('status').textContent = m); }
-    catch (e) { $('status').innerHTML = 'net <b>' + netKey + '</b> not bundled — re-run <span class="mono">build-eval.sh</span>' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with the big net available ($B20_NET / $B18_NET)'); return; }
-    M.FS.writeFile('/model.bin.gz', new Uint8Array(netBuf));
-    $('status').textContent = 'initializing engine (WebGPU, else CPU)…';
-    const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
-    if (!ok) { $('status').innerHTML = 'engine: <span class="bad">load failed</span> — ' + M.ccall('kgeError','string',[],[]); return; }
-    pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
-    mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4); bPtr = M._malloc(HW * 4);
-    bmPtr = M._malloc(4); wrPtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4); pvlPtr = M._malloc(4); visPtr = M._malloc(4);
+    if (!self.crossOriginIsolated)
+      throw new Error('page is not cross-origin isolated (COOP/COEP) — the threaded engine needs SharedArrayBuffer; serve via scripts/serve-demo-tls.sh');
+    $('status').textContent = 'starting engine (WebGPU, threaded)…';
+    const info = await ensureKataWorker();   // creates the worker + loads the net once
     ready = true;
-    const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen fallback)';
-    $('status').innerHTML = 'engine: <span class="ok">ready</span> · KataGo ' + netKey + ' on ' + backend;
-    $('adapter').textContent = 'backend: ' + backend + ' · add ?cpu to URL to force CPU';
+    $('status').innerHTML = 'engine: <span class="ok">ready</span> · KataGo ' + netKey + ' on ' + info.backend;
+    $('adapter').textContent = 'backend: ' + info.backend + ' · threaded worker engine · add ?cpu to force CPU';
     await analyze();
-  } catch (e) { $('status').innerHTML = 'engine: <span class="bad">error</span> — ' + e; return; }
+  } catch (e) { $('status').innerHTML = 'engine: <span class="bad">error</span> — ' + (e.message || e); return; }
 
   async function analyze() {
     if (!ready) return;
-    const n = Math.min(moves.length, MAXMV);
-    const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
-    for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
-    M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
-    const t0 = performance.now();
-    // Replay the move sequence: captures + ko/superko + recent-move features.
-    const ok = await M.ccall('kgeEvalSeq', 'number',
-      ['number','number','number','number','number','number','number','number','number'],
-      [mlPtr, mcPtr, n, toPlay, 7.5, bPtr, pPtr, vPtr, $('owner').checked ? oPtr : 0], { async: true });
-    if (!ok) { $('status').innerHTML = 'eval failed: ' + M.ccall('kgeError','string',[],[]); return; }
-    const dt = (performance.now() - t0).toFixed(0);
-    // Sync the displayed board to the replayed position (shows captures), then redraw.
-    const bo = M.HEAP32.subarray(bPtr >> 2, (bPtr >> 2) + HW);
-    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) grid[x][y] = bo[idx(x, y)];
-    renderBoard();
-    const pol = M.HEAPF32.subarray(pPtr >> 2, (pPtr >> 2) + HW + 1);
-    const val = M.HEAPF32.subarray(vPtr >> 2, (vPtr >> 2) + 5);
+    try {
+      const t0 = performance.now();
+      // Worker replays the sequence (captures + ko/superko + recent-move features) and
+      // returns the board + raw policy/value/ownership.
+      const r = await kataCall({ type: 'eval', moves: moves.slice(0, MAXMV), toPlay, komi: 7.5, owner: $('owner').checked });
+      const dt = (performance.now() - t0).toFixed(0);
+      const pol = r.policy, val = r.value;
+      // Sync the displayed board to the replayed position (shows captures), then redraw.
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) grid[x][y] = r.board[idx(x, y)];
+      renderBoard();
 
-    // value: white-perspective softmax(win,loss,noResult)
-    const [pWin, pLoss] = softmax([val[0], val[1], val[2]]);
-    const wWhite = pWin * 100, wBlack = pLoss * 100;
-    $('wwr').textContent = wWhite.toFixed(1) + '%'; $('bwr').textContent = wBlack.toFixed(1) + '%';
-    $('barW').style.width = wWhite + '%'; $('barB').style.width = wBlack + '%';
-    $('score').textContent = (val[3] * 20).toFixed(1) + ' (W)';  // raw*~20 -> points (approx)
-    $('evtime').textContent = dt + ' ms';
-    $('tomove').textContent = toPlay === 1 ? 'Black' : 'White';
+      // value: white-perspective softmax(win,loss,noResult)
+      const [pWin, pLoss] = softmax([val[0], val[1], val[2]]);
+      const wWhite = pWin * 100, wBlack = pLoss * 100;
+      $('wwr').textContent = wWhite.toFixed(1) + '%'; $('bwr').textContent = wBlack.toFixed(1) + '%';
+      $('barW').style.width = wWhite + '%'; $('barB').style.width = wBlack + '%';
+      $('score').textContent = (val[3] * 20).toFixed(1) + ' (W)';  // raw*~20 -> points (approx)
+      $('evtime').textContent = dt + ' ms';
+      $('tomove').textContent = toPlay === 1 ? 'Black' : 'White';
 
-    // policy: softmax over legal (empty) points + pass
-    const legalLogits = [], legalPos = [];
-    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (grid[x][y] === 0) { legalLogits.push(pol[idx(x, y)]); legalPos.push(idx(x, y)); }
-    legalLogits.push(pol[HW]); legalPos.push(HW); // pass
-    const probs = softmax(legalLogits);
-    lastPolicy = new Float32Array(HW + 1);
-    let best = -1, bestP = -1;
-    for (let i = 0; i < legalPos.length; i++) { lastPolicy[legalPos[i]] = probs[i]; if (probs[i] > bestP) { bestP = probs[i]; best = legalPos[i]; } }
-    lastBest = best;
-    $('best').textContent = best === HW ? `pass (${(bestP*100).toFixed(1)}%)`
-      : `${'ABCDEFGHJKLMNOPQRST'[best % N]}${N - Math.floor(best / N)} (${(bestP*100).toFixed(1)}%)`;
+      // policy: softmax over legal (empty) points + pass
+      const legalLogits = [], legalPos = [];
+      for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) if (grid[x][y] === 0) { legalLogits.push(pol[idx(x, y)]); legalPos.push(idx(x, y)); }
+      legalLogits.push(pol[HW]); legalPos.push(HW); // pass
+      const probs = softmax(legalLogits);
+      lastPolicy = new Float32Array(HW + 1);
+      let best = -1, bestP = -1;
+      for (let i = 0; i < legalPos.length; i++) { lastPolicy[legalPos[i]] = probs[i]; if (probs[i] > bestP) { bestP = probs[i]; best = legalPos[i]; } }
+      lastBest = best;
+      $('best').textContent = best === HW ? `pass (${(bestP*100).toFixed(1)}%)`
+        : `${'ABCDEFGHJKLMNOPQRST'[best % N]}${N - Math.floor(best / N)} (${(bestP*100).toFixed(1)}%)`;
 
-    drawOverlay(pol, val);
+      lastOwner = r.owner;
+      drawOverlay();
+    } catch (e) {
+      $('status').innerHTML = 'eval failed: <span class="bad">' + (e.message || e) + '</span>';
+    }
   }
 
-  function drawOverlay(pol, val) {
+  function drawOverlay() {
     syncOverlay(); octx.clearRect(0, 0, overlay.width, overlay.height);
     const sr = board.stoneRadius;
     // ownership tint
-    if ($('owner').checked) {
-      const own = M.HEAPF32.subarray(oPtr >> 2, (oPtr >> 2) + HW);
+    if ($('owner').checked && lastOwner) {
+      const own = lastOwner;
       for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
         const v = own[idx(x, y)]; if (Math.abs(v) < 0.05) continue;
         octx.fillStyle = v > 0 ? `rgba(20,20,20,${Math.min(.45, v*.45)})` : `rgba(240,240,240,${Math.min(.5, -v*.5)})`;
@@ -219,34 +209,8 @@
       octx.lineWidth = 3; octx.strokeStyle = 'rgba(220,40,40,0.9)'; octx.stroke();
     }
   }
-  // Run MCTS search on the current position; show the move/win-rate/PV; return the move.
-  async function think() {
-    if (!ready) return null;
-    const n = Math.min(moves.length, MAXMV);
-    const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
-    for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
-    M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
-    const visits = Math.max(1, parseInt($('visits').value) || 400);
-    const ms = Math.max(100, parseInt($('ms').value) || 3000);
-    $('searchout').textContent = 'thinking…';
-    const t0 = performance.now();
-    const ok = await M.ccall('kgeSearch', 'number',
-      ['number','number','number','number','number','number','number','number','number','number','number','number','number'],
-      [mlPtr, mcPtr, n, toPlay, 7.5, visits, ms, bmPtr, wrPtr, pvPtr, PVCAP, pvlPtr, visPtr], { async: true });
-    if (!ok) { $('searchout').textContent = 'search failed: ' + M.ccall('kgeError','string',[],[]); return null; }
-    const dt = (performance.now() - t0).toFixed(0);
-    const best = M.HEAP32[bmPtr >> 2], wr = M.HEAPF32[wrPtr >> 2], nv = M.HEAP32[visPtr >> 2], plen = M.HEAP32[pvlPtr >> 2];
-    const mv = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
-    const pv = [...Array(plen)].map((_, i) => mv(M.HEAP32[(pvPtr >> 2) + i]));
-    $('searchout').innerHTML = `search: <b>${mv(best)}</b> · ${(wr * 100).toFixed(1)}% · ${nv} visits / ${dt} ms · PV ${pv.slice(0, 8).join(' ')}`;
-    searchBest = best; drawOverlay();
-    return best;
-  }
 
-  // --- KataGo real-search worker (threaded kataeval-mt) ----------------------
-  // Runs KataGo's actual Search off the main thread; needs cross-origin isolation.
-  let kataWorker = null, kataReqId = 0, kataInited = false;
-  const kataPending = new Map();
+  // --- the worker engine: analysis + search off the main thread (needs isolation) ---
   function kataCall(msg, transfer) {
     return new Promise((resolve, reject) => {
       const id = ++kataReqId; kataPending.set(id, { resolve, reject });
@@ -270,19 +234,23 @@
       };
     }
     if (!kataInited) {
-      // Fetch BOTH the wasm and the module JS HERE (main thread) — over a self-signed/
-      // overridden cert, a worker's fetch() AND its nested new Worker(https-url) both
-      // fail. We hand the worker the wasm bytes (-> wasmBinary) and the JS text (-> a
-      // Blob it gives emscripten as mainScriptUrlOrBlob, so pthread workers spawn from
-      // a blob: URL with no cert involved).
-      $('searchout').textContent = 'KataGo: loading engine…';
+      // Fetch the wasm, the module JS, AND the net HERE on the main thread — over a
+      // self-signed/overridden cert, a worker's fetch() and its nested new Worker(https)
+      // both fail. We hand the worker the wasm bytes (-> wasmBinary) and the JS text
+      // (-> a Blob it gives emscripten as mainScriptUrlOrBlob, so pthread workers spawn
+      // from a blob: URL); the net we just cache here so the worker reads it from the
+      // shared Cache (no worker fetch).
+      $('status').textContent = 'loading engine…';
       const [wasmBuf, jsText] = await Promise.all([
         fetch('kataeval-mt.wasm').then(r => r.arrayBuffer()),
         fetch('kataeval-mt.js').then(r => r.text()),
       ]);
-      await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText }, [wasmBuf]);
+      try { await cachedNet(NETS[netKey].file, m => $('status').textContent = m); }
+      catch (e) { throw new Error('net "' + netKey + '" not bundled — re-run build-eval.sh' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with $B20_NET / $B18_NET')); }
+      kataInfo = await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText, forceCpu: qs.has('cpu') }, [wasmBuf]);
       kataInited = true;
     }
+    return kataInfo;
   }
   async function kataThink() {
     if (!ready) return null;
@@ -325,11 +293,10 @@
     if (x < 0 || y < 0 || x >= N || y >= N || grid[x][y] !== 0) return;
     playMove(idx(x, y));
   });
-  $('think').onclick = think;
   $('thinkkata').onclick = kataThink;
   $('play').onclick = async () => {
     if (!ready) return;
-    if ($('searchplay').checked) { const mv = await think(); if (mv !== null) playMove(mv); }   // searched move (loc or -1)
+    if ($('searchplay').checked) { const mv = await kataThink(); if (mv !== null) playMove(mv); }   // searched move (loc or -1)
     else if (lastBest >= 0) playMove(lastBest === HW ? -1 : lastBest);                            // raw policy move
   };
   $('pass').onclick = () => playMove(-1);
