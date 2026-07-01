@@ -24,6 +24,7 @@
 #ifdef KGE_THREADS
 #include <utility>
 #include <atomic>
+#include <mutex>
 #include "../core/logger.h"
 #include "../search/search.h"
 #include "../search/asyncbot.h"
@@ -504,13 +505,8 @@ static std::atomic<bool> gSearchDone{true};
 static Loc gSearchBestLoc = Board::NULL_LOC;
 static Player gPollPla = P_BLACK;
 static int gPollReused = 0;
-// true only when the engine is STOPPED (no genMoveAsync / ponder actively mutating the
-// tree). Deep tree reads (appendPV / getAnalysisData) are only safe then — walking the
-// tree while search threads expand nodes can trap. Root values (getRootValues) stay
-// safe to poll live during search.
-static std::atomic<bool> gDeepReadOk{true};
 static void stopPonder() {
-  if(gBot != nullptr) { gBot->stopAndWait(); gPondering = false; gSearchDone = true; gDeepReadOk = true; }
+  if(gBot != nullptr) { gBot->stopAndWait(); gPondering = false; gSearchDone = true; }
 }
 
 static int locToIdx(Loc loc) {
@@ -520,6 +516,47 @@ static int locToIdx(Loc loc) {
 static Loc decodeLoc(int mv) {
   return (mv < 0) ? Board::PASS_LOC : Location::getLoc(mv % gXLen, mv / gXLen, gXLen);
 }
+
+// ---- Analysis snapshot: the ENGINE pushes its current thinking here from inside the
+// search's periodic analyze callback (a safe point where reading the tree is legal —
+// this is how KataGo's kata-analyze streams). kgePoll/kgeCandidates just read this
+// buffer under a mutex, never touching the live tree — so no reader-vs-search race.
+static const int SNAP_PV = 32, SNAP_CAND = 8;
+struct Snap {
+  int best = -1; float wr = 0.5f, score = 0.0f; int visits = 0;
+  int pv[SNAP_PV]; int pvLen = 0;
+  struct Cand { int loc, visits; float wr, score, prior; } cand[SNAP_CAND]; int nCand = 0;
+};
+static Snap gSnap;
+static std::mutex gSnapMutex;
+
+// Called by AsyncBot's analyze machinery (genMoveAsyncAnalyze / analyzeAsync) at a safe
+// point during the search — so getAnalysisData / appendPV are safe here.
+static void writeSnapshot(const Search* s) {
+  Snap snap;
+  ReportedSearchValues vals;
+  if(s->getRootValues(vals)) {
+    snap.wr    = (float)((gPollPla == P_WHITE) ? vals.winValue : vals.lossValue);
+    snap.score = (float)((gPollPla == P_WHITE) ? vals.lead : -vals.lead);
+    snap.visits = (int)vals.visits;
+  }
+  std::vector<AnalysisData> buf;
+  s->getAnalysisData(buf, SNAP_CAND, false, 1, false);
+  for(size_t i = 0; i < buf.size() && snap.nCand < SNAP_CAND; i++) {
+    const AnalysisData& a = buf[i];
+    double whiteWr = (a.winLossValue + 1.0) * 0.5;
+    snap.cand[snap.nCand] = { locToIdx(a.move), (int)a.numVisits,
+      (float)((gPollPla == P_WHITE) ? whiteWr : 1.0 - whiteWr),
+      (float)((gPollPla == P_WHITE) ? a.lead : -a.lead), (float)a.policyPrior };
+    snap.nCand++;
+  }
+  snap.best = buf.empty() ? -1 : locToIdx(buf[0].move);
+  std::vector<Loc> pvBuf; std::vector<int64_t> vb, eb; std::vector<Loc> sl; std::vector<double> sv;
+  if(s->getRootNode() != NULL) s->appendPV(pvBuf, vb, eb, sl, sv, s->getRootNode(), SNAP_PV);
+  for(size_t i = 0; i < pvBuf.size() && snap.pvLen < SNAP_PV; i++) snap.pv[snap.pvLen++] = locToIdx(pvBuf[i]);
+  { std::lock_guard<std::mutex> lk(gSnapMutex); gSnap = snap; }
+}
+static void analyzeCb(const Search* s) { writeSnapshot(s); }
 
 // Replay a move sequence into a fresh Board + BoardHistory (captures + ko/superko).
 static void replayLine(const int* moveLocs, const int* moveCols, int numMoves, double komi,
@@ -676,11 +713,13 @@ KATAEVAL_EXPORT int kgeSearchBegin(const int* moveLocs, const int* moveCols, int
     gBot->setParamsNoClearing(params);
 
     gSearchDone = false;
-    gDeepReadOk = false;  // search threads about to mutate the tree — no deep reads
     gSearchBestLoc = Board::NULL_LOC;
-    gBot->genMoveAsync(gPollPla, 0, TimeControls(), 1.0, [](Loc loc, int, Search*) {
-      gSearchBestLoc = loc; gSearchDone = true; gDeepReadOk = true;  // search stopped: safe to read
-    });
+    { std::lock_guard<std::mutex> lk(gSnapMutex); gSnap = Snap(); }  // clear any stale snapshot
+    // genMoveAsyncAnalyze: search to the target AND fire analyzeCb periodically from a
+    // safe point (writes the snapshot buffer that kgePoll/kgeCandidates read).
+    gBot->genMoveAsyncAnalyze(gPollPla, 0, TimeControls(), 1.0,
+      [](Loc loc, int, Search*) { gSearchBestLoc = loc; gSearchDone = true; },
+      /*callbackPeriod*/0.08, /*firstCallbackAfter*/0.05, analyzeCb);
     return 1;
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
@@ -691,71 +730,49 @@ KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
                             int* pvOut, int pvCap, int* pvLenOut, int* visitsOut,
                             int* doneOut, int* reusedOut) {
   if(gBot == nullptr) { gErr = "no engine"; return 0; }
-  try {
-    const Search* s = gBot->getSearch();
-    ReportedSearchValues vals;
-    if(s->getRootValues(vals)) {
-      if(winrateOut) *winrateOut = (float)((gPollPla == P_WHITE) ? vals.winValue : vals.lossValue);
-      if(scoreOut)   *scoreOut   = (float)((gPollPla == P_WHITE) ? vals.lead : -vals.lead);
-      if(visitsOut)  *visitsOut  = (int)vals.visits;
-    } else {
-      if(winrateOut) *winrateOut = 0.5f; if(scoreOut) *scoreOut = 0.0f; if(visitsOut) *visitsOut = 0;
-    }
-    int pvLen = 0;
-    // appendPV walks the tree — only safe when the engine is stopped (see gDeepReadOk).
-    // During an active search we return no PV (root values above stay live + safe).
-    if(pvOut && pvCap > 0 && gDeepReadOk.load()) {
-      std::vector<Loc> pvBuf; std::vector<int64_t> vb, eb; std::vector<Loc> sl; std::vector<double> sv;
-      if(s->getRootNode() != NULL) s->appendPV(pvBuf, vb, eb, sl, sv, s->getRootNode(), pvCap);
-      for(size_t i = 0; i < pvBuf.size() && pvLen < pvCap; i++) pvOut[pvLen++] = locToIdx(pvBuf[i]);
-    }
-    bool done = gSearchDone.load();
-    if(bestOut) *bestOut = done ? locToIdx(gSearchBestLoc) : (pvLen > 0 ? pvOut[0] : -1);
-    if(pvLenOut) *pvLenOut = pvLen;
-    if(doneOut) *doneOut = done ? 1 : 0;
-    if(reusedOut) *reusedOut = gPollReused;
-    return 1;
-  } catch(const std::exception& e) { gErr = e.what(); return 0; }
+  // Read the engine's snapshot buffer — NO tree access here, so no race with the search.
+  Snap snap;
+  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
+  bool done = gSearchDone.load();
+  if(winrateOut) *winrateOut = snap.wr;
+  if(scoreOut)   *scoreOut   = snap.score;
+  if(visitsOut)  *visitsOut  = snap.visits;
+  int pvLen = 0;
+  if(pvOut) for(; pvLen < snap.pvLen && pvLen < pvCap; pvLen++) pvOut[pvLen] = snap.pv[pvLen];
+  if(pvLenOut) *pvLenOut = pvLen;
+  if(bestOut)  *bestOut  = done ? locToIdx(gSearchBestLoc) : snap.best;
+  if(doneOut)  *doneOut  = done ? 1 : 0;
+  if(reusedOut) *reusedOut = gPollReused;
+  return 1;
 }
 
-// Top-N root candidate moves, best-first: each with its own visits, side-to-move
-// win-rate, score lead, and policy prior. Safe to call live during search. Writes up
-// to maxN into the parallel arrays; returns the count (or -1 on error).
+// Top-N root candidate moves from the snapshot buffer (best-first) — no tree access.
 KATAEVAL_EXPORT int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
                                   float* winrateOut, float* scoreOut, float* priorOut) {
   if(gBot == nullptr) { gErr = "no engine"; return -1; }
-  // getAnalysisData walks the tree deeply — only safe when the engine is stopped.
-  // During an active search/ponder, report no candidates (return 0) rather than race.
-  if(!gDeepReadOk.load()) return 0;
-  try {
-    const Search* s = gBot->getSearch();
-    std::vector<AnalysisData> buf;
-    s->getAnalysisData(buf, /*minMovesToTryToGet*/maxN, /*includeWeightFactors*/false,
-                       /*maxPVDepth*/1, /*duplicateForSymmetries*/false);
-    int count = 0;
-    for(size_t i = 0; i < buf.size() && count < maxN; i++) {
-      const AnalysisData& a = buf[i];
-      double whiteWr = (a.winLossValue + 1.0) * 0.5;  // winLossValue is white-perspective
-      locsOut[count]    = locToIdx(a.move);
-      visitsOut[count]  = (int)a.numVisits;
-      winrateOut[count] = (float)((gPollPla == P_WHITE) ? whiteWr : 1.0 - whiteWr);
-      scoreOut[count]   = (float)((gPollPla == P_WHITE) ? a.lead : -a.lead);
-      priorOut[count]   = (float)a.policyPrior;
-      count++;
-    }
-    return count;
-  } catch(const std::exception& e) { gErr = e.what(); return -1; }
+  Snap snap;
+  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
+  int count = 0;
+  for(; count < snap.nCand && count < maxN; count++) {
+    locsOut[count]    = snap.cand[count].loc;
+    visitsOut[count]  = snap.cand[count].visits;
+    winrateOut[count] = snap.cand[count].wr;
+    scoreOut[count]   = snap.cand[count].score;
+    priorOut[count]   = snap.cand[count].prior;
+  }
+  return count;
 }
 
-KATAEVAL_EXPORT int kgePonderBegin() {  // real background ponder; poll to watch it climb
+KATAEVAL_EXPORT int kgePonderBegin() {  // background ponder that ALSO streams the snapshot
   if(gBot == nullptr) { gErr = "no engine"; return 0; }
-  try { gDeepReadOk = false; gBot->ponder(); gPondering = true; return 1; }  // ponder mutates the tree
+  try { gBot->analyzeAsync(gPollPla, 1.0, /*callbackPeriod*/0.15, /*firstAfter*/0.05, analyzeCb);
+        gPondering = true; return 1; }
   catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 
 KATAEVAL_EXPORT int kgeStopSearch() {  // stop search/ponder before a new request
   if(gBot == nullptr) return 1;
-  try { gBot->stopAndWait(); gPondering = false; gSearchDone = true; gDeepReadOk = true; return 1; }
+  try { gBot->stopAndWait(); gPondering = false; gSearchDone = true; return 1; }
   catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 #endif  // KGE_THREADS
