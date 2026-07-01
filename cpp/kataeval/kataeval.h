@@ -88,28 +88,26 @@ int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
 // halts before a new request.
 int kgeSearchBegin(const int* moveLocs, const int* moveCols, int numMoves,
                    int toPla, double komi, int maxVisits, double maxTimeMs, int numSearchThreads);
-// pvVisitsOut (optional, parallel to pvOut) receives per-move visit counts down the PV.
-int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
-            int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* doneOut, int* reusedOut,
-            int* pvVisitsOut);
+// ONE combined poll — the JS worker calls this every ~90ms; takes the snapshot lock and
+// copies the buffer ONCE (vs the old kgePoll/kgeCandidates/kgeInsights/kgeOwnership which
+// each locked + full-copied separately). Fills caller-owned buffers:
+//   scalarsOut[7] = {best, done, reused, visits, pvLen, nCand, ownLen}
+//   valuesOut[8]  = {wr, score, scoreStdev, rawWr, rawScore, surprise, searchEntropy, policyEntropy}
+//   pv/pvVisits up to pvCap; cand* (loc/vis ints, wr/score/prior/lcb/radius/stdev floats) up to
+//   candCap; own (white-perspective tree ownership, y*xLen+x) up to ownCap. lcb/radius are in
+//   utility units (KataGo ranks by LCB, not raw win-rate). Returns 1 ok / 0 error.
+int kgePollAll(int* scalarsOut, float* valuesOut,
+               int* pvOut, int* pvVisitsOut, int pvCap,
+               int* candLocOut, int* candVisOut, float* candWrOut, float* candScOut,
+               float* candPrOut, float* candLcbOut, float* candRadOut, float* candStdOut, int candCap,
+               float* ownOut, int ownCap);
 int kgePonderBegin(void);
 int kgeStopSearch(void);
-// Top-N root candidate moves (best-first), each with visits / side-to-move win-rate /
-// score lead / policy prior, plus LCB + radius (utility units — how KataGo actually
-// ranks) and score stdev (points). Pass NULL for unwanted outputs. Returns count (-1 err).
-int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
-                  float* winrateOut, float* scoreOut, float* priorOut,
-                  float* lcbOut, float* radiusOut, float* stdevOut);
-// Root insight metrics into 6 floats: [rawWinrate, rawScore, scoreStdev, policySurprise,
-// searchEntropy, policyEntropy]. raw* are the instant NN read pre-search (side-to-move).
-int kgeInsights(float* out6);
-// Tree-averaged ownership heatmap (white-perspective, +1 = white), y*xLen+x indexed.
-// Copies up to cap points; returns the count written.
-int kgeOwnership(float* out, int cap);
 // Limit playing strength for the NEXT search. maxVisits<=0 keeps the per-request budget,
-// >0 caps it (fewer = weaker). chosenMoveTemp>0 samples a non-best move ~ visits^(1/T)
-// (higher = weaker, more human/varied). Both 0/off = full strength.
-void kgeSetStrength(int maxVisits, float chosenMoveTemp);
+// >0 caps it (fewer = weaker). chosenMoveTemp>0 samples a non-best final move (at 1 visit
+// this samples the raw policy, not visits — see the .cpp). policyTemp>1 flattens the root
+// policy for more natural variety; 1.0 = unchanged. All neutral = full strength.
+void kgeSetStrength(int maxVisits, float chosenMoveTemp, float policyTemp);
 
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size

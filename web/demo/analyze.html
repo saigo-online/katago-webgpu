@@ -72,12 +72,12 @@
       visits <input id="visits" type="number" value="400" min="1" max="20000" style="width:64px">
       ms <input id="ms" type="number" value="3000" min="100" max="120000" style="width:70px">
       threads <input id="threads" type="number" value="4" min="1" max="32" style="width:46px">
-      strength <select id="strength" title="Weaken the engine: cap visits + sample a non-best move by temperature (visits^1/T)">
-        <option value="0,0">Full</option>
-        <option value="600,0.15">Strong</option>
-        <option value="80,0.35">Intermediate</option>
-        <option value="12,0.55">Casual</option>
-        <option value="1,0.8">Beginner</option>
+      strength <select id="strength" title="Weaken the engine: cap visits + move-temperature + root-policy flattening (visits,moveTemp,policyTemp)">
+        <option value="0,0,1">Full</option>
+        <option value="600,0.15,1">Strong</option>
+        <option value="80,0.35,1.1">Intermediate</option>
+        <option value="12,0.55,1.3">Casual</option>
+        <option value="1,0.8,1.6">Beginner</option>
       </select>
       <label style="margin-left:6px;"><input type="checkbox" id="searchplay"> engine searches</label>
     </div>
@@ -157,8 +157,7 @@
   // PV played out as numbered, alternating moves from the side to move (its read-ahead).
   function renderPV(pv, pvVisits) {
     pvBoard.removeAllObjects();
-    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++)
-      if (grid[x][y]) pvBoard.addObject({ x, y, c: grid[x][y] === 1 ? WGo.B : WGo.W });
+    placeStones(pvBoard);
     let col = toPlay, num = 0;
     for (const loc of (pv || [])) {
       if (loc >= 0) {
@@ -189,7 +188,16 @@
 
   // helpers / state declared before the load block (which calls analyze()).
   const idx = (x, y) => y * N + x;
-  function softmax(arr) { let m = -1e30; for (const v of arr) m = Math.max(m, v); let s = 0; const o = arr.map(v => { const e = Math.exp(v - m); s += e; return e; }); return o.map(v => v / s); }
+  const clamp01 = (v) => v < 0 ? 0 : v > 1 ? 1 : v;
+  // Side to move after k moves — O(1) parity. White(2) moves first under handicap, else Black(1).
+  const tpAfter = (k) => (((hc > 0 ? 1 : 0) + k) & 1) ? 2 : 1;
+  // Win-rate -> hue: red (0%) through yellow to green (100%), side-to-move perspective.
+  const hueForWr = (wr) => Math.round(clamp01(wr) * 120);
+  // Draw the current position's stones onto a WGo board (shared by the main + PV boards).
+  function placeStones(b) {
+    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++)
+      if (grid[x][y]) b.addObject({ x, y, c: grid[x][y] === 1 ? WGo.B : WGo.W });
+  }
   let lastPolicy = null, lastBest = -1, lastOwner = null, lastCand = null, lastSearch = null;
   let trainRecord = [];  // per-move {policy target = visit dist, value = searched win-rate} for training export
   const ptName = l => l < 0 ? 'pass' : `${'ABCDEFGHJKLMNOPQRST'[l % N]}${N - Math.floor(l / N)}`;
@@ -334,7 +342,7 @@
         if (c.loc < 0) continue;
         const x = c.loc % N, y = Math.floor(c.loc / N);
         const r = Math.max(sr * 0.42, sr * (0.5 + 0.5 * Math.sqrt(c.visits / maxV)));
-        const hue = Math.round(Math.max(0, Math.min(1, c.wr)) * 120);
+        const hue = hueForWr(c.wr);
         octx.beginPath(); octx.arc(board.getX(x), board.getY(y), r, 0, 7);
         octx.fillStyle = `hsla(${hue},62%,44%,0.82)`; octx.fill();
         octx.fillStyle = 'rgba(255,255,255,0.96)';
@@ -371,8 +379,8 @@
   // the worker is up; re-sent after init so a page-load default takes effect.
   async function applyStrength() {
     if (!kataInited) return;
-    const [visits, temp] = ($('strength').value || '0,0').split(',').map(Number);
-    try { await kataCall({ type: 'strength', visits, temp }); } catch (_) {}
+    const [visits, temp, policyTemp] = ($('strength').value || '0,0,1').split(',').map(Number);
+    try { await kataCall({ type: 'strength', visits, temp, policyTemp }); } catch (_) {}
   }
   $('strength').onchange = applyStrength;
   async function ensureKataWorker() {
@@ -383,14 +391,8 @@
       kataWorker.onmessage = (e) => {
         if (e.data.diag) { console.log('[kata]', e.data.diag); $('searchout').textContent = 'KataGo · ' + e.data.diag; return; }
         if (e.data.progress) {   // live search/ponder stats — stream them into the panel
-          renderMetrics(e.data, e.data.threads);
-          renderPV(e.data.pv, e.data.pvVisits);   // play the engine's current line on the 2nd board
-          lastCand = e.data.cand; renderCandidates(e.data.cand);  // live candidate moves
-          // Tree-averaged ownership is search-corrected — prefer it over the raw NN head
-          // for the live territory tint while a search is running.
-          if (e.data.ownership) lastOwner = e.data.ownership;
+          applySearchResult(e.data, e.data.threads);
           setBotState(e.data.state + '…', e.data.state === 'pondering' ? 'live' : 'run');
-          searchBest = e.data.best; drawOverlay();
           return;
         }
         const p = kataPending.get(e.data.id); if (!p) return;
@@ -429,6 +431,16 @@
     return kataInfo;
   }
   function setBotState(text, cls) { const e = $('m_state'); e.textContent = text; e.className = 'pill' + (cls ? ' ' + cls : ''); }
+  // Apply a search result (live-stream frame or final) to the whole UI: metrics panel, PV
+  // board, candidate list, search-corrected ownership tint, best-move ring. One place so the
+  // progress stream, kataThink, and measureSweep can't drift.
+  function applySearchResult(r, threads) {
+    renderMetrics(r, threads ?? r.threads);
+    renderPV(r.pv, r.pvVisits);
+    lastCand = r.cand; renderCandidates(r.cand);
+    if (r.ownership) lastOwner = r.ownership;   // tree-averaged (search-corrected) territory
+    searchBest = r.best; drawOverlay();
+  }
   function renderMetrics(r, threads) {
     const wr = r.wr * 100;
     $('m_best').textContent = ptName(r.best);
@@ -472,7 +484,7 @@
     // Rank by LCB (how KataGo actually picks) but display best-first as given. The σ is
     // the score stdev in points — the per-move uncertainty; smaller = surer.
     el.innerHTML = cand.slice(0, 6).map((c, i) => {
-      const hue = Math.round(Math.max(0, Math.min(1, c.wr)) * 120);
+      const hue = hueForWr(c.wr);
       const sig = (c.stdev != null && c.stdev > 0) ? ` · <span class="muted">±${c.stdev.toFixed(1)}</span>` : '';
       return `<div style="display:flex; justify-content:space-between; gap:8px; padding:1px 0;">
         <span><span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:hsl(${hue},62%,44%); margin-right:5px;"></span>${i + 1}. <b>${ptName(c.loc)}</b></span>
@@ -493,10 +505,9 @@
       const r = await kataCall({ type: 'search', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), visits, ms, threads, noPonder });
       if (r.superseded) return null;   // a newer request took over and owns the panel now
       lastSearch = r;                  // remember for training-data capture (self-play)
-      renderMetrics(r, threads);
+      applySearchResult(r, threads);
       setBotState(noPonder ? 'idle' : 'pondering…', noPonder ? '' : 'live');  // self-play: no between-move ponder
       $('searchout').innerHTML = `KataGo: <b>${ptName(r.best)}</b> · ${(r.wr * 100).toFixed(1)}% · ${r.nv} visits · ${r.nps.toLocaleString()}/s · ${threads}t${r.reused ? ' · reused' : ''}`;
-      searchBest = r.best; drawOverlay();
       return r.best;
     } catch (e) {
       setBotState('error', 'run');
@@ -521,11 +532,10 @@
         const r = await kataCall({ type: 'search', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), visits: V, ms: 120000, threads });
         if (r.superseded) return;
         rows.push({ v: r.nv, best: r.best, wr: r.wr, score: r.score });
-        const fb = rows[rows.length - 1].best;
+        const fb = r.best;
         $('searchout').innerHTML = '<b>visit sweep</b> — move · win% · score:<br>' + rows.map(x =>
           `${String(x.v).padStart(5)} → <b>${ptName(x.best)}</b> · ${(x.wr * 100).toFixed(1)}% · ${(x.score >= 0 ? '+' : '') + x.score.toFixed(1)}${x.best !== fb ? ' ·changed' : ''}`).join('<br>');
-        renderMetrics(r, threads); renderPV(r.pv, r.pvVisits); lastCand = r.cand; renderCandidates(r.cand);
-        if (r.ownership) lastOwner = r.ownership; searchBest = r.best; drawOverlay();
+        applySearchResult(r, threads);
       }
       const fb = rows[rows.length - 1].best;
       let s = rows.length - 1; while (s > 0 && rows[s - 1].best === fb) s--;
@@ -585,28 +595,38 @@
   }
 
   // --- SGF review: load a game and step through it with full per-move analysis ---
-  let reviewLine = null;
+  let reviewLine = null, reviewSetup = 0;   // reviewSetup = # leading setup (handicap) stones
+  const sgfToLoc = (co) => (co.length === 2 && co !== 'tt') ? (co.charCodeAt(1) - 97) * N + (co.charCodeAt(0) - 97) : -1;
+  // Side to move after k stones of an explicit {loc,col} line — derived from the colors,
+  // so it's correct for handicap/setup (a leading same-color run) too, not just parity.
+  const sideToMoveAt = (line, k) => k < line.length ? line[k].col : (line.length ? (line[line.length - 1].col === 1 ? 2 : 1) : (hc > 0 ? 2 : 1));
   function parseSGF(text) {
-    const g = { size: 19, mv: [] };
+    const g = { size: 19, setup: [], mv: [] };
     const sz = text.match(/\bSZ\[(\d+)\]/); if (sz) g.size = +sz[1];
+    // Setup stones (handicap / problem placements): AB[..][..] = black, AW[..][..] = white.
+    // Without these, loading a real handicap SGF would desync from the engine's position.
+    for (const m of text.matchAll(/\b(AB|AW)((?:\s*\[[a-z]{2}\])+)/g)) {
+      const col = m[1] === 'AB' ? 1 : 2;
+      for (const c of m[2].matchAll(/\[([a-z]{2})\]/g)) g.setup.push({ col, co: c[1] });
+    }
+    g.setup.sort((a, b) => a.col - b.col);   // blacks first so the handicap run leads (engine detects it)
     for (const m of text.matchAll(/;\s*([BW])\[([a-z]{0,2})\]/g)) g.mv.push({ col: m[1] === 'B' ? 1 : 2, co: m[2] });
     return g;
   }
   function setReviewCursor(k) {
     if (!reviewLine) return;
-    k = Math.max(0, Math.min(reviewLine.length, k));
+    k = Math.max(reviewSetup, Math.min(reviewLine.length, k));   // never step "into" the setup stones
     moves.length = 0; for (let i = 0; i < k; i++) moves.push(reviewLine[i]);
-    toPlay = hc > 0 ? 2 : 1; for (let i = 0; i < k; i++) toPlay = toPlay === 1 ? 2 : 1;
-    $('reviewinfo').textContent = `move ${k}/${reviewLine.length}`;
+    toPlay = sideToMoveAt(reviewLine, k);
+    $('reviewinfo').textContent = `move ${k - reviewSetup}/${reviewLine.length - reviewSetup}` + (reviewSetup ? ` (+${reviewSetup} handicap)` : '');
     analyze();
   }
   function loadSGFText(text) {
     const g = parseSGF(text);
     if (g.size !== N) { $('reviewinfo').innerHTML = `<span class="bad">SGF is ${g.size}×${g.size} — reload at <a href="?net=${netKey}&size=${g.size}">size ${g.size}</a></span>`; return; }
-    reviewLine = g.mv.map(m => ({
-      loc: (m.co.length === 2 && m.co !== 'tt') ? (m.co.charCodeAt(1) - 97) * N + (m.co.charCodeAt(0) - 97) : -1,
-      col: m.col,
-    }));
+    const setup = g.setup.map(m => ({ loc: sgfToLoc(m.co), col: m.col })).filter(m => m.loc >= 0);
+    reviewSetup = setup.length;
+    reviewLine = setup.concat(g.mv.map(m => ({ loc: sgfToLoc(m.co), col: m.col })));   // setup stones lead
     scanFlags = null; renderScanFlags();  // flags from a prior game no longer apply
     setReviewCursor(reviewLine.length);   // jump to the final position; use ◀ ▶ to step
   }
@@ -619,41 +639,60 @@
   $('rnext').onclick = () => setReviewCursor(moves.length + 1);
   $('rlast').onclick = () => reviewLine && setReviewCursor(reviewLine.length);
 
-  // --- auto-flag teaching moments: scan the whole game with a bounded search per
-  // position, then flag (a) mistakes = win-rate swings against the mover, and (b) tricky
-  // spots = high policy surprise (search disagreeing with the raw net). Click to jump. ---
-  const SCAN_VISITS = 120;          // per-position budget — coarse but enough to rank moves
-  const MISTAKE_WR = 0.10, BLUNDER_WR = 0.20, TRICKY_SURPRISE = 1.0;  // thresholds
+  // --- auto-flag teaching moments: scan the whole game and flag mistakes + tricky spots,
+  // click to jump. The mistake signal is "points lost" (best move vs. the move played, at the
+  // SAME searched position — low variance, unlike differencing two noisy roots), measured in
+  // BOTH win-rate and score; when the played move isn't in the top candidates we fall back to
+  // the consecutive-position win-rate delta. Tricky = high policy surprise. Categories match
+  // the main app's OGS buckets (moveQuality.ts): inaccuracy / mistake / blunder. ---
+  const SCAN_VISITS = 200;   // per-position budget (tree-reused across positions, so cheap after the first)
+  // Win-rate-lost and score-lost (points) thresholds, worst wins. Win-rate buckets mirror
+  // web/frontend .../moveQuality.ts (blunder .10 / mistake .05 / inaccuracy .02).
+  const WR_BK = [[0.10, 'blunder'], [0.05, 'mistake'], [0.02, 'inaccuracy']];
+  const PT_BK = [[10, 'blunder'], [6, 'mistake'], [3, 'inaccuracy']];
+  const TRICKY_SURPRISE = 1.0;   // nats — search strongly disagreed with the raw policy
   let scanFlags = null, scanning = false;
-  const tpAfter = k => { let t = hc > 0 ? 2 : 1; for (let i = 0; i < k; i++) t = t === 1 ? 2 : 1; return t; };
   async function scanGame() {
-    const line = reviewLine || moves.slice();
     if (scanning) { scanning = false; return; }                 // toggle-cancel
-    if (!line.length) { $('reviewinfo').textContent = 'load an SGF (or play a game) first'; return; }
+    const isReview = !!reviewLine;
+    const full = isReview ? reviewLine.slice() : hcMoves.concat(moves);   // complete stone sequence
+    const lead = isReview ? reviewSetup : hcMoves.length;                 // skip leading handicap stones
+    if (full.length - lead < 1) { $('reviewinfo').textContent = 'load an SGF (or play a game) first'; return; }
     scanning = true; $('rscan').textContent = 'Stop ⏹';
     try {
       await ensureKataWorker();
       const threads = Math.max(1, parseInt($('threads').value) || 4);
       setBotState('scanning…', 'run');
-      const L = line.length, wrB = new Array(L + 1), sur = new Array(L + 1);
-      for (let k = 0; k <= L && scanning; k++) {
-        const seq = hcMoves.concat(line.slice(0, k)).slice(0, MAXMV);
-        const tp = tpAfter(k);
+      const L = full.length, wrAt = new Array(L + 1), info = new Array(L + 1);
+      // Positions are searched in forward order, each extending the last by one move, so the
+      // engine REUSES the tree across positions (confirmed: kgeSearchBegin makeMove-reuses a
+      // forward-extending line) — the scan is far cheaper than L independent searches.
+      for (let k = lead; k <= L && scanning; k++) {
+        const seq = full.slice(0, k).slice(0, MAXMV);
+        const tp = sideToMoveAt(full, k);
         const r = await kataCall({ type: 'search', moves: seq, toPlay: tp, komi: komiVal(), visits: SCAN_VISITS, ms: 20000, threads, noPonder: true });
         if (!r || r.superseded || !scanning) { setBotState('idle'); break; }
-        wrB[k] = tp === 1 ? r.wr : 1 - r.wr;   // Black's win prob at position k (absolute)
-        sur[k] = r.surprise || 0;              // surprise AT this decision point
-        $('reviewinfo').textContent = `scanning ${k}/${L}…`;
+        wrAt[k] = r.wr;                                   // side-to-move win-rate at this position
+        if (k < L) {                                      // decision point: the mover plays full[k]
+          const best = (r.cand && r.cand[0]) || null;
+          const played = r.cand ? r.cand.find(c => c.loc === full[k].loc) : null;
+          info[k] = { best, played, surprise: r.surprise || 0, mover: tp };
+        }
+        $('reviewinfo').textContent = `scanning ${k - lead}/${L - lead}…`;
       }
       if (!scanning) return;
-      // Attribute each move: mover = who played move k = side to move at position k-1.
       scanFlags = [];
-      for (let k = 1; k <= L; k++) {
-        if (wrB[k] == null || wrB[k - 1] == null) continue;
-        const mover = tpAfter(k - 1);
-        const before = mover === 1 ? wrB[k - 1] : 1 - wrB[k - 1];  // mover's winprob before their move
-        const after  = mover === 1 ? wrB[k]     : 1 - wrB[k];      // …and after
-        scanFlags.push({ k, mover, swing: before - after, surprise: sur[k - 1] || 0 });
+      for (let k = lead; k < L; k++) {
+        const it = info[k]; if (!it || !it.best) continue;
+        let wrLost, ptsLost;
+        if (it.played) {                                 // same-node best-vs-played (low variance)
+          wrLost = it.best.wr - it.played.wr;
+          ptsLost = it.best.score - it.played.score;
+        } else if (wrAt[k] != null && wrAt[k + 1] != null) {   // played move off-candidates: consecutive fallback
+          wrLost = wrAt[k] - (1 - wrAt[k + 1]);          // mover's win-rate before minus after
+          ptsLost = 0;                                   // no reliable same-node score off-candidate
+        } else continue;
+        scanFlags.push({ k, mover: it.mover, lead, wrLost: Math.max(0, wrLost), ptsLost: Math.max(0, ptsLost), surprise: it.surprise });
       }
       renderScanFlags();
       setBotState('idle');
@@ -661,22 +700,29 @@
       setBotState('error', 'run'); $('reviewinfo').innerHTML = 'scan failed: <span class="bad">' + (e.message || e) + '</span>';
     } finally { scanning = false; $('rscan').textContent = 'Scan 🔎'; }
   }
+  const bucketFor = (wrLost, ptsLost) => {
+    for (const [t, name] of WR_BK) if (wrLost >= t) return name;
+    for (const [t, name] of PT_BK) if (ptsLost >= t) return name;
+    return null;
+  };
+  const KIND_RANK = { blunder: 3, mistake: 2, inaccuracy: 1, tricky: 0 };
+  const KIND_COLOR = { blunder: '#e05555', mistake: '#e0a020', inaccuracy: '#d8c24a', tricky: '#4aa3e0' };
   function renderScanFlags() {
     const el = $('scanflags'); if (!scanFlags) { el.innerHTML = ''; return; }
     const nm = m => m === 1 ? 'B' : 'W';
     const items = scanFlags.map(f => {
-      let kind = null, weight = 0;
-      if (f.swing >= MISTAKE_WR) { kind = f.swing >= BLUNDER_WR ? 'blunder' : 'mistake'; weight = 100 + f.swing; }
-      else if (f.surprise >= TRICKY_SURPRISE) { kind = 'tricky'; weight = f.surprise; }
-      return kind ? { ...f, kind, weight } : null;
-    }).filter(Boolean).sort((a, b) => b.weight - a.weight).slice(0, 12);
+      const kind = bucketFor(f.wrLost, f.ptsLost) || (f.surprise >= TRICKY_SURPRISE ? 'tricky' : null);
+      if (!kind) return null;
+      const weight = KIND_RANK[kind] * 100 + (kind === 'tricky' ? f.surprise : f.wrLost * 100 + f.ptsLost);
+      return { ...f, kind, weight };
+    }).filter(Boolean).sort((a, b) => b.weight - a.weight).slice(0, 14);
     if (!items.length) { el.innerHTML = '<span class="muted">no notable mistakes or tricky spots — clean game</span>'; return; }
-    const color = k => k === 'blunder' ? '#e05555' : k === 'mistake' ? '#e0a020' : '#4aa3e0';
     el.innerHTML = '<span class="muted">teaching moments (click to jump):</span><br>' + items.map(f => {
+      const mv = f.k - f.lead + 1;   // move number within the game (excluding handicap setup)
       const label = f.kind === 'tricky'
-        ? `#${f.k} ${nm(tpAfter(f.k - 1))} tricky · surprise ${f.surprise.toFixed(1)}`
-        : `#${f.k} ${nm(f.mover)} ${f.kind} · −${(f.swing * 100).toFixed(0)}%`;
-      return `<a href="#" data-k="${f.k}" style="color:${color(f.kind)}; text-decoration:none; display:inline-block; margin:1px 8px 1px 0;">◆ ${label}</a>`;
+        ? `#${mv} ${nm(f.mover)} tricky · surprise ${f.surprise.toFixed(1)}`
+        : `#${mv} ${nm(f.mover)} ${f.kind} · −${(f.wrLost * 100).toFixed(0)}%${f.ptsLost >= 0.5 ? ` · −${f.ptsLost.toFixed(1)}pt` : ''}`;
+      return `<a href="#" data-k="${f.k}" style="color:${KIND_COLOR[f.kind]}; text-decoration:none; display:inline-block; margin:1px 8px 1px 0;">◆ ${label}</a>`;
     }).join('');
     el.querySelectorAll('a[data-k]').forEach(a => a.onclick = (ev) => { ev.preventDefault(); setReviewCursor(+a.dataset.k); });
   }
@@ -704,8 +750,7 @@
   // Redraw all stones from the displayed grid (captures appear/disappear).
   function renderBoard() {
     board.removeAllObjects();
-    for (let y = 0; y < N; y++) for (let x = 0; x < N; x++)
-      if (grid[x][y]) board.addObject({ x, y, c: grid[x][y] === 1 ? WGo.B : WGo.W });
+    placeStones(board);
     // circle-mark the last move played (WGo 'CR' markup, auto-contrasting on the stone)
     const last = moves.length ? moves[moves.length - 1] : null;
     if (last && last.loc >= 0) board.addObject({ x: last.loc % N, y: Math.floor(last.loc / N), type: 'CR' });

@@ -30,7 +30,7 @@ if [ "${MT:-0}" = 1 ]; then
   CFLAGS+=( -pthread -DKGE_THREADS )
   MANIFESTS+=( kataeval/sources-search.txt )
   OUTNAME=kataeval-mt
-  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePoll,_kgePonderBegin,_kgeStopSearch,_kgeCandidates,_kgeInsights,_kgeOwnership,_kgeSetStrength"
+  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePollAll,_kgePonderBegin,_kgeStopSearch,_kgeSetStrength"
   # 512MB initial so big nets (b18/b20, loaded ~2x in CPU) fit WITHOUT triggering
   # threaded-WASM memory growth (a fragile path that traps with "unaligned accesses").
   LINKEXTRA=( -pthread -sPTHREAD_POOL_SIZE=33 -sINITIAL_MEMORY=512MB )  # 1 NN server + up to 32 search threads

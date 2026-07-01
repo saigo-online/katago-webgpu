@@ -12,7 +12,7 @@ const diag = (m) => { try { postMessage({ diag: m }); } catch (_) {} };
 self.onerror = (e) => diag('worker.onerror: ' + ((e && e.message) || e));
 self.addEventListener('unhandledrejection', (e) => diag('unhandledrejection: ' + ((e.reason && (e.reason.stack || e.reason.message)) || e.reason)));
 
-const MAXMV = 1024, PVCAP = 32, MAXCAND = 8;
+const MAXMV = 2048, PVCAP = 32, MAXCAND = 8;   // MAXMV matches the page (analyze.html) so long games aren't truncated
 let M = null, N = 19, ready = false;
 
 // Net caching (Cache API), shared with the page — a net downloads once across both
@@ -26,10 +26,11 @@ async function cachedNet(url) {
   if (cache) { try { await cache.put(url, res.clone()); } catch (_) {} }
   return await res.arrayBuffer();
 }
-let mlPtr, mcPtr, bmPtr, wrPtr, scPtr, pvPtr, pvlPtr, visPtr, reusedPtr, donePtr, pvVisPtr;  // search buffers
-let bPtr, pPtr, vPtr, oPtr;                             // analysis (kgeEvalSeqKata) buffers
+let mlPtr, mcPtr;                                      // move-list buffers (persistent heap, written in place)
+let scalPtr, valPtr, pvPtr, pvVisPtr;                 // kgePollAll: 7 ints, 8 floats, pv, pvVisits
 let candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr, candLcbPtr, candRadPtr, candStdPtr;  // candidate-move buffers
-let insPtr, ownPtr;                                    // insight-metrics + tree-ownership buffers
+let ownPtr;                                           // tree-ownership buffer
+let bPtr, pPtr, vPtr, oPtr;                           // analysis (kgeEvalSeqKata) buffers
 
 async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16) {
   // The module is loaded via importScripts INTO this worker, so emscripten's
@@ -57,15 +58,14 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16) {
   const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
   if (!ok) throw new Error('kgeLoad: ' + M.ccall('kgeError', 'string', [], []));
   mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4);
-  bmPtr = M._malloc(4); wrPtr = M._malloc(4); scPtr = M._malloc(4); visPtr = M._malloc(4);
-  pvlPtr = M._malloc(4); reusedPtr = M._malloc(4); donePtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4);
-  pvVisPtr = M._malloc(PVCAP * 4);
+  scalPtr = M._malloc(7 * 4); valPtr = M._malloc(8 * 4);
+  pvPtr = M._malloc(PVCAP * 4); pvVisPtr = M._malloc(PVCAP * 4);
   const HW = N * N;
   bPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
   candLocPtr = M._malloc(MAXCAND * 4); candVisPtr = M._malloc(MAXCAND * 4);
   candWrPtr = M._malloc(MAXCAND * 4); candScPtr = M._malloc(MAXCAND * 4); candPrPtr = M._malloc(MAXCAND * 4);
   candLcbPtr = M._malloc(MAXCAND * 4); candRadPtr = M._malloc(MAXCAND * 4); candStdPtr = M._malloc(MAXCAND * 4);
-  insPtr = M._malloc(6 * 4); ownPtr = M._malloc(HW * 4);
+  ownPtr = M._malloc(HW * 4);
   ready = true;
   const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen)';
   return { backend, version: M.ccall('kgeModelVersion', 'number', [], []) };
@@ -74,42 +74,43 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16) {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 let pollToken = 0;  // bumped on every new request; a running stream exits when it changes
 
+// Write a move list straight into the persistent heap buffers (no staging TypedArrays).
+// Returns the number written (capped at MAXMV). loc = y*N+x or -1 pass; col = 1|2.
+function writeMoves(moves) {
+  const n = Math.min(moves.length, MAXMV);
+  const mi = mlPtr >> 2, ci = mcPtr >> 2;
+  for (let i = 0; i < n; i++) { M.HEAP32[mi + i] = moves[i].loc; M.HEAP32[ci + i] = moves[i].col; }
+  return n;
+}
+
+// ONE ccall per poll (kgePollAll) instead of four separate ones. 16 pointer/int args.
+const POLLALL_SIG = ['number','number','number','number','number','number','number','number',
+                     'number','number','number','number','number','number','number','number'];
 function pollStats() {
-  const ok = M.ccall('kgePoll', 'number',
-    ['number','number','number','number','number','number','number','number','number','number'],
-    [bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, donePtr, reusedPtr, pvVisPtr]);
-  if (!ok) throw new Error('kgePoll: ' + M.ccall('kgeError', 'string', [], []));
-  const plen = M.HEAP32[pvlPtr >> 2];
-  // top-N candidate moves (best-first): visits/win-rate/score/prior + LCB/radius/stdev
-  const ncand = M.ccall('kgeCandidates', 'number',
-    ['number','number','number','number','number','number','number','number','number'],
-    [MAXCAND, candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr, candLcbPtr, candRadPtr, candStdPtr]);
-  const cand = [];
-  for (let i = 0; i < ncand; i++) cand.push({
+  const ok = M.ccall('kgePollAll', 'number', POLLALL_SIG,
+    [scalPtr, valPtr, pvPtr, pvVisPtr, PVCAP,
+     candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr, candLcbPtr, candRadPtr, candStdPtr, MAXCAND,
+     ownPtr, N * N]);
+  if (!ok) throw new Error('kgePollAll: ' + M.ccall('kgeError', 'string', [], []));
+  const S = scalPtr >> 2, V = valPtr >> 2;
+  const plen = M.HEAP32[S + 4], ncand = M.HEAP32[S + 5], nOwn = M.HEAP32[S + 6];
+  const cand = new Array(ncand);
+  for (let i = 0; i < ncand; i++) cand[i] = {
     loc: M.HEAP32[(candLocPtr >> 2) + i], visits: M.HEAP32[(candVisPtr >> 2) + i],
     wr: M.HEAPF32[(candWrPtr >> 2) + i], score: M.HEAPF32[(candScPtr >> 2) + i],
     prior: M.HEAPF32[(candPrPtr >> 2) + i],
     lcb: M.HEAPF32[(candLcbPtr >> 2) + i], radius: M.HEAPF32[(candRadPtr >> 2) + i],
     stdev: M.HEAPF32[(candStdPtr >> 2) + i],
-  });
-  // root insight metrics: [rawWr, rawScore, scoreStdev, surprise, searchEntropy, policyEntropy]
-  M.ccall('kgeInsights', 'number', ['number'], [insPtr]);
-  const ins = M.HEAPF32.slice(insPtr >> 2, (insPtr >> 2) + 6);
-  // tree-averaged ownership heatmap (white-perspective); nOwn==0 until the root is read
-  const nOwn = M.ccall('kgeOwnership', 'number', ['number','number'], [ownPtr, N * N]);
+  };
+  const pv = new Array(plen), pvVisits = new Array(plen);
+  for (let i = 0; i < plen; i++) { pv[i] = M.HEAP32[(pvPtr >> 2) + i]; pvVisits[i] = M.HEAP32[(pvVisPtr >> 2) + i]; }
   return {
-    best: M.HEAP32[bmPtr >> 2],
-    wr: M.HEAPF32[wrPtr >> 2],
-    score: M.HEAPF32[scPtr >> 2],
-    nv: M.HEAP32[visPtr >> 2],
-    done: !!M.HEAP32[donePtr >> 2],
-    reused: !!M.HEAP32[reusedPtr >> 2],
-    pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
-    pvVisits: [...Array(plen)].map((_, i) => M.HEAP32[(pvVisPtr >> 2) + i]),
-    cand,
-    rawWr: ins[0], rawScore: ins[1], scoreStdev: ins[2],
-    surprise: ins[3], searchEntropy: ins[4], policyEntropy: ins[5],
-    ownership: nOwn > 0 ? Array.from(M.HEAPF32.slice(ownPtr >> 2, (ownPtr >> 2) + nOwn)) : null,
+    best: M.HEAP32[S + 0], done: !!M.HEAP32[S + 1], reused: !!M.HEAP32[S + 2], nv: M.HEAP32[S + 3],
+    wr: M.HEAPF32[V + 0], score: M.HEAPF32[V + 1], scoreStdev: M.HEAPF32[V + 2],
+    rawWr: M.HEAPF32[V + 3], rawScore: M.HEAPF32[V + 4],
+    surprise: M.HEAPF32[V + 5], searchEntropy: M.HEAPF32[V + 6], policyEntropy: M.HEAPF32[V + 7],
+    pv, pvVisits, cand,
+    ownership: nOwn > 0 ? M.HEAPF32.slice(ownPtr >> 2, (ownPtr >> 2) + nOwn) : null,  // Float32Array
     mem: M.HEAP32.buffer.byteLength,   // total wasm memory (HEAP8 isn't exported)
   };
 }
@@ -120,10 +121,7 @@ function pollStats() {
 async function search(req, token) {
   if (!ready) throw new Error('engine not initialized');
   const moves = req.moves || [];
-  const n = Math.min(moves.length, MAXMV);
-  const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
-  for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
-  M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
+  const n = writeMoves(moves);   // straight into the persistent heap — no staging Int32Arrays
   const threads = (req.threads | 0) || 1;
   M.ccall('kgeStopSearch', 'number', [], []);  // halt any prior search/ponder
   const ok = await M.ccall('kgeSearchBegin', 'number',
@@ -132,8 +130,11 @@ async function search(req, token) {
   if (!ok) throw new Error('kgeSearchBegin: ' + M.ccall('kgeError', 'string', [], []));
 
   const t0 = performance.now();
-  const post = (s, state, t) => postMessage({ progress: true, state, threads,
-    ms: Math.round(performance.now() - t), nps: (performance.now() - t) > 0 ? Math.round(s.nv / ((performance.now() - t) / 1000)) : 0, ...s });
+  const post = (s, state, t) => {
+    const el = performance.now() - t;   // one clock read per post
+    postMessage({ progress: true, state, threads, ms: Math.round(el),
+      nps: el > 0 ? Math.round(s.nv / (el / 1000)) : 0, ...s });
+  };
 
   // search phase: poll the running search until it finishes
   let s = pollStats();
@@ -145,8 +146,9 @@ async function search(req, token) {
   }
   if (token !== pollToken) return null;
   post(s, 'searching', t0);
-  const final = { ...s, threads, ms: Math.round(performance.now() - t0),
-    nps: (performance.now() - t0) > 0 ? Math.round(s.nv / ((performance.now() - t0) / 1000)) : 0 };
+  const elapsed = performance.now() - t0;
+  const final = { ...s, threads, ms: Math.round(elapsed),
+    nps: elapsed > 0 ? Math.round(s.nv / (elapsed / 1000)) : 0 };
 
   // ponder phase: real background ponder, polled live (detached so search() resolves now).
   // Skipped for scans (req.noPonder) — a whole-game sweep wants each position's final
@@ -170,11 +172,7 @@ async function search(req, token) {
 // net as search, so it's one net load and the analysis warms the cache search reuses.
 async function evalPos(req) {
   if (!ready) throw new Error('engine not initialized');
-  const moves = req.moves || [];
-  const n = Math.min(moves.length, MAXMV);
-  const ml = new Int32Array(MAXMV), mc = new Int32Array(MAXMV);
-  for (let i = 0; i < n; i++) { ml[i] = moves[i].loc; mc[i] = moves[i].col; }
-  M.HEAP32.set(ml, mlPtr >> 2); M.HEAP32.set(mc, mcPtr >> 2);
+  const n = writeMoves(req.moves || []);
   const HW = N * N;
   const ok = await M.ccall('kgeEvalSeqKata', 'number',
     ['number','number','number','number','number','number','number','number','number'],
@@ -193,19 +191,19 @@ async function handleMessage(e) {
   const { id, type } = e.data;
   try {
     if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText, e.data.forceCpu, e.data.fp16)) });
-    else if (type === 'eval') {
-      pollToken++;                       // stop any running ponder stream (position changing)
+    else if (type === 'eval') {          // pollToken already bumped in onmessage (supersede)
       const r = await evalPos(e.data);
       const xfer = [r.board.buffer, r.policy.buffer, r.value.buffer]; if (r.owner) xfer.push(r.owner.buffer);
       postMessage({ id, ok: true, ...r }, xfer);
     }
     else if (type === 'search') {
-      const token = ++pollToken;         // supersede any prior search/ponder stream
+      const token = pollToken;           // onmessage already bumped it; capture the current value
       const r = await search(e.data, token);
       postMessage({ id, ok: true, superseded: r === null, ...(r || {}) });
     }
     else if (type === 'strength') {      // limit playing strength for the next search
-      M.ccall('kgeSetStrength', null, ['number','number'], [e.data.visits | 0, e.data.temp || 0]);
+      M.ccall('kgeSetStrength', null, ['number','number','number'],
+        [e.data.visits | 0, e.data.temp || 0, e.data.policyTemp || 1]);
       postMessage({ id, ok: true });
     }
     else throw new Error('unknown message type: ' + type);

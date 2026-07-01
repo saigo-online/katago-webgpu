@@ -294,12 +294,15 @@ static void buildBoardHist(const int* moveLocs, const int* moveCols, int numMove
   auto toLoc = [](int mv) {
     return (mv < 0) ? Board::PASS_LOC : Location::getLoc(mv % gXLen, mv / gXLen, gXLen);
   };
+  // Real Go handicap is ALWAYS a run of BLACK setup stones; only treat a leading run of
+  // >= 2 BLACK stones as handicap. (Restricting to black avoids misreading a malformed
+  // leading white run as "white handicap" and applying the wrong komi.)
   int setup = 0;
-  while(setup < numMoves && moveLocs[setup] >= 0 && moveCols[setup] == moveCols[0]) setup++;
+  if(numMoves >= 2 && moveCols[0] == P_BLACK)
+    while(setup < numMoves && moveLocs[setup] >= 0 && moveCols[setup] == P_BLACK) setup++;
   if(setup >= 2) {
-    Player hcPla = (Player)moveCols[0];
-    for(int i = 0; i < setup; i++) board.setStone(toLoc(moveLocs[i]), (Color)hcPla);
-    Player nextPla = (numMoves > setup) ? (Player)moveCols[setup] : getOpp(hcPla);
+    for(int i = 0; i < setup; i++) board.setStone(toLoc(moveLocs[i]), C_BLACK);
+    Player nextPla = (numMoves > setup) ? (Player)moveCols[setup] : P_WHITE;
     hist = BoardHistory(board, nextPla, rules, 0);
     hist.setAssumeMultipleStartingBlackMovesAreHandicap(true);  // correct komi/score for handicap
   } else {
@@ -517,22 +520,34 @@ static bool ensureKataEngine() {
   return true;
 }
 
-// Stop any running search/ponder so the engine is idle for a fresh request.
+// Cross-thread state. gSearchBestLoc is written by the async move-callback on the bot
+// thread and read in kgePoll on the main thread; gPollPla is written on the main thread
+// (kgeSearchBegin) and read in writeSnapshot on the callback thread; gPollReused likewise
+// crosses threads. All atomic to avoid torn reads / visibility hazards.
 static std::atomic<bool> gSearchDone{true};
-static Loc gSearchBestLoc = Board::NULL_LOC;
-static Player gPollPla = P_BLACK;
-static int gPollReused = 0;
-// Strength limiting (kgeSetStrength): a visits cap and a move-selection temperature.
-// gStrMaxVisits > 0 caps the search depth; gStrChosenTemp > 0 makes the FINAL move be
-// sampled ~ visits^(1/T) instead of the max — non-best, more human/varied = weaker.
-static int gStrMaxVisits = 0;
-static float gStrChosenTemp = 0.0f;
-// Adjust playing strength. maxVisits <= 0 leaves the per-request budget alone; > 0 caps
-// it (fewer visits = weaker). chosenMoveTemp > 0 samples a non-best move ~ visits^(1/T)
-// (higher = weaker + more varied/human). Applied to the NEXT search.
-KATAEVAL_EXPORT void kgeSetStrength(int maxVisits, float chosenMoveTemp) {
-  gStrMaxVisits = maxVisits;
-  gStrChosenTemp = chosenMoveTemp > 0.0f ? chosenMoveTemp : 0.0f;
+static std::atomic<Loc> gSearchBestLoc{Board::NULL_LOC};
+static std::atomic<Player> gPollPla{P_BLACK};
+static std::atomic<int> gPollReused{0};
+// Strength limiting (kgeSetStrength). Written on the main thread (from JS) and read on the
+// main thread (prepareSearch) — same-thread, but atomic for cheap peace-of-mind. gStrMaxVisits
+// > 0 caps the search depth (fewer visits = weaker); gStrPolicyTemp / gStrChosenTemp flatten
+// the root policy and sample a non-best move (more human/varied = weaker). See kgeSetStrength.
+static std::atomic<int> gStrMaxVisits{0};
+static std::atomic<float> gStrChosenTemp{0.0f};
+static std::atomic<float> gStrPolicyTemp{1.0f};
+// Adjust playing strength, applied to the NEXT search. Three orthogonal knobs:
+//   maxVisits<=0 leaves the per-request budget alone; >0 caps it (fewer = weaker).
+//   chosenMoveTemp>0 sets chosenMoveTemperature: the FINAL move is sampled instead of taken
+//     as the max. At many visits this samples ~ visits^(1/T); at maxVisits=1 there is no
+//     visit distribution, so KataGo falls back to sampling the RAW POLICY ^ (1/T) — i.e. a
+//     policy-sampling weak mode, NOT visit-sampling (be honest about which regime you're in).
+//   policyTemp>1 sets rootPolicyTemperature: flattens the root policy so weak play spreads
+//     over more moves (and the low-visit policy-sampling above draws from a wider set),
+//     giving more natural variety than temperature alone. 1.0 = unchanged.
+KATAEVAL_EXPORT void kgeSetStrength(int maxVisits, float chosenMoveTemp, float policyTemp) {
+  gStrMaxVisits.store(maxVisits);
+  gStrChosenTemp.store(chosenMoveTemp > 0.0f ? chosenMoveTemp : 0.0f);
+  gStrPolicyTemp.store(policyTemp > 0.0f ? policyTemp : 1.0f);
 }
 static void stopPonder() {
   if(gBot != nullptr) { gBot->stopAndWait(); gPondering = false; gSearchDone = true; }
@@ -562,9 +577,15 @@ struct Snap {
 };
 static Snap gSnap;
 static std::mutex gSnapMutex;
+// Bumped by kgeSearchBegin at the start of each search so writeSnapshot recomputes the
+// once-per-search fields (raw NN read). gSnapWantOwn gates the expensive ownership map.
+static std::atomic<uint32_t> gSnapSearchId{0};
+static std::atomic<bool> gSnapWantOwn{true};
 
 // Called by AsyncBot's analyze machinery (genMoveAsyncAnalyze / analyzeAsync) at a safe
-// point during the search — so getAnalysisData / appendPV are safe here.
+// point during the search — so getAnalysisData / appendPV are safe here. Runs on the single
+// callbackLoopThread, so the function-local statics below (per-search / throttle caches) are
+// only ever touched by one thread and need no locking.
 static void writeSnapshot(const Search* s) {
   Snap snap;
   // EXCEPTION FIREWALL: this runs on KataGo's callbackLoopThread (asyncbot.cpp), which
@@ -581,13 +602,22 @@ static void writeSnapshot(const Search* s) {
     snap.scoreStdev = (float)vals.expectedScoreStdev;
     snap.visits = (int)vals.visits;
   }
-  // Instant NN read (pre-search) — the delta vs the searched values above shows what
-  // reading is buying. Same side-to-move perspective as wr/score.
-  ReportedSearchValues raw;
-  if(s->getRootRawNNValues(raw)) {
-    snap.rawWr    = (float)(stmWhite ? raw.winValue : raw.lossValue);
-    snap.rawScore = (float)(stmWhite ? raw.lead : -raw.lead);
-  } else { snap.rawWr = snap.wr; snap.rawScore = snap.score; }
+  // Instant NN read (pre-search) — the delta vs the searched values shows what reading is
+  // buying. This is a pure function of the fixed root NN eval, so it's constant for the whole
+  // search: compute it ONCE per search (keyed on gSnapSearchId) and reuse. Perspective is
+  // fixed per search too, so caching the side-to-move value is fine.
+  static uint32_t rawComputedFor = 0xFFFFFFFFu;
+  static float sRawWr = 0.5f, sRawScore = 0.0f;
+  uint32_t sid = gSnapSearchId.load();
+  if(sid != rawComputedFor) {
+    ReportedSearchValues raw;
+    if(s->getRootRawNNValues(raw)) {  // only mark done on success (root may not be evaluated on the first frame)
+      sRawWr    = (float)(stmWhite ? raw.winValue : raw.lossValue);
+      sRawScore = (float)(stmWhite ? raw.lead : -raw.lead);
+      rawComputedFor = sid;
+    }
+  }
+  snap.rawWr = sRawWr; snap.rawScore = sRawScore;
   // Position descriptors: surprise = how far search moved from the raw policy (tactical),
   // entropy = how spread the move choice is (sharp vs calm).
   double sp = 0.0, se = 0.0, pe = 0.0;
@@ -613,24 +643,33 @@ static void writeSnapshot(const Search* s) {
     snap.pvVisits[snap.pvLen] = (i < vb.size()) ? (int)vb[i] : 0;
     snap.pvLen++;
   }
-  // Tree-averaged territory heatmap (white-perspective). Throws if the root isn't
-  // evaluated yet or the owner map is off — guard so an early callback can't crash.
-  try {
-    std::vector<double> own = s->getAverageTreeOwnership(P_WHITE, s->getRootNode(), 0);
-    for(size_t i = 0; i < own.size() && snap.ownLen < SNAP_MAXPTS; i++)
-      snap.own[snap.ownLen++] = (float)own[i];
-  } catch(...) { snap.ownLen = 0; }
+  // Tree-averaged territory heatmap (white-perspective). This is the ONE expensive read —
+  // getAverageTreeOwnership traverses the tree (O(visits^0.75)) + allocates each call. So:
+  // (a) only when the UI wants it (gSnapWantOwn), and (b) throttled — recompute only when
+  // visits grew >= ~25% since the last map (it barely changes between 80ms frames) or on a
+  // new search; otherwise carry the cached map forward. Guarded: throws if the root isn't
+  // evaluated yet or the owner map is off.
+  static uint32_t ownComputedFor = 0xFFFFFFFFu;
+  static int ownAtVisits = 0, ownLen = 0;
+  static float ownCache[SNAP_MAXPTS];
+  if(gSnapWantOwn.load()) {
+    bool newSearch = (sid != ownComputedFor);
+    if(newSearch) { ownLen = 0; ownAtVisits = 0; }
+    if(newSearch || snap.visits >= ownAtVisits + ownAtVisits/4 + 8) {
+      try {
+        std::vector<double> own = s->getAverageTreeOwnership(P_WHITE, s->getRootNode(), 0);
+        ownLen = 0;
+        for(size_t i = 0; i < own.size() && ownLen < SNAP_MAXPTS; i++) ownCache[ownLen++] = (float)own[i];
+        ownComputedFor = sid; ownAtVisits = snap.visits;
+      } catch(...) { /* keep the last cached map */ }
+    }
+    snap.ownLen = ownLen;
+    for(int i = 0; i < ownLen; i++) snap.own[i] = ownCache[i];
+  }
   } catch(...) { return; }  // firewall (see top): never let an exception escape this thread
   { std::lock_guard<std::mutex> lk(gSnapMutex); gSnap = snap; }
 }
 static void analyzeCb(const Search* s) noexcept { writeSnapshot(s); }
-
-// Replay a move sequence into a fresh Board + BoardHistory (captures + ko/superko).
-// The threaded search reuses the same handicap-aware replay as the single-thread paths.
-static void replayLine(const int* moveLocs, const int* moveCols, int numMoves, double komi,
-                       Board& board, BoardHistory& hist) {
-  buildBoardHist(moveLocs, moveCols, numMoves, komi, board, hist);
-}
 
 // Instant analysis via the shared NNEvaluator. Returns PROBABILITIES (distinct from
 // the direct kgeEvalSeq, which gives logits): policyOut in [0,1] with illegal = -1
@@ -644,7 +683,7 @@ KATAEVAL_EXPORT int kgeEvalSeqKata(const int* moveLocs, const int* moveCols, int
     if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
     stopPonder();
     Board board; BoardHistory hist;
-    replayLine(moveLocs, moveCols, numMoves, komi, board, hist);
+    buildBoardHist(moveLocs, moveCols, numMoves, komi, board, hist);
     MiscNNInputParams nnInputParams;
     NNResultBuf buf;
     gNNEval->evaluate(board, hist, (Player)toPla, nnInputParams, buf,
@@ -668,6 +707,52 @@ KATAEVAL_EXPORT int kgeEvalSeqKata(const int* moveLocs, const int* moveCols, int
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 
+// Shared prologue for BOTH search entry points: engine init, tree reuse (advance via
+// makeMove when the request forward-extends the current line, else rebuild from scratch),
+// and SearchParams incl. strength limiting. ponderMode adds the unbounded pondering caps.
+// Sets gBotLine + gPollReused. Returns false (with gErr) on failure.
+static bool prepareSearch(const int* moveLocs, const int* moveCols, int numMoves,
+                          Player rootPla, double komi, int maxVisits, double maxTimeMs,
+                          int numSearchThreads, bool ponderMode) {
+  if(!ensureKataEngine()) { gErr = "engine init failed"; return false; }
+  stopPonder();
+  std::vector<std::pair<Loc,Player>> newLine;
+  for(int i = 0; i < numMoves; i++) newLine.push_back({ decodeLoc(moveLocs[i]), (Player)moveCols[i] });
+  size_t common = 0;
+  while(common < gBotLine.size() && common < newLine.size() && gBotLine[common] == newLine[common]) common++;
+  bool reused = false;
+  if(gBot->getSearch()->getRootNode() != NULL && common == gBotLine.size()) {
+    reused = true;
+    for(size_t i = common; i < newLine.size() && reused; i++)
+      if(!gBot->makeMove(newLine[i].first, newLine[i].second)) reused = false;
+  }
+  if(!reused) {
+    Board board; BoardHistory hist;
+    buildBoardHist(moveLocs, moveCols, numMoves, komi, board, hist);
+    gBot->setPosition(rootPla, board, hist);
+  }
+  gBotLine = newLine;
+  gPollReused.store(reused ? 1 : 0);
+
+  SearchParams params = SearchParams::basicDecentParams();
+  params.maxVisits = maxVisits; params.maxPlayouts = maxVisits;
+  params.maxTime = maxTimeMs / 1000.0;
+  params.numThreads = numSearchThreads > 0 ? numSearchThreads : 1;
+  if(ponderMode) { params.maxVisitsPondering = 1000000000; params.maxTimePondering = 1e20; }  // ponder till stopped
+  // Strength limiting (kgeSetStrength) — applies to BOTH entry points: visit cap, plus
+  // move-selection + root-policy temperature (see kgeSetStrength for the honest semantics).
+  int strVisits = gStrMaxVisits.load();
+  if(strVisits > 0 && (int64_t)strVisits < params.maxVisits) {
+    params.maxVisits = strVisits; params.maxPlayouts = strVisits;
+  }
+  float chosenT = gStrChosenTemp.load();
+  if(chosenT > 0.0f) { params.chosenMoveTemperature = chosenT; params.chosenMoveTemperatureEarly = chosenT; }
+  float polT = gStrPolicyTemp.load();
+  if(polT > 0.0f && polT != 1.0f) { params.rootPolicyTemperature = polT; params.rootPolicyTemperatureEarly = polT; }
+  gBot->setParamsNoClearing(params);  // keep the reused tree
+  return true;
+}
+
 KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
                                   int toPla, double komi, int maxVisits, double maxTimeMs,
                                   int numSearchThreads,
@@ -675,34 +760,10 @@ KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int 
                                   int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut) {
   if(gModelPath.empty()) { gErr = "not loaded"; return 0; }
   try {
-    if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
-    stopPonder();
     Player rootPla = (Player)toPla;
-
-    // Tree reuse: when the requested line forward-extends the bot's current line, advance
-    // via makeMove (keeps the explored subtree). Otherwise rebuild from scratch.
-    std::vector<std::pair<Loc,Player>> newLine;
-    for(int i = 0; i < numMoves; i++) newLine.push_back({ decodeLoc(moveLocs[i]), (Player)moveCols[i] });
-    size_t common = 0;
-    while(common < gBotLine.size() && common < newLine.size() && gBotLine[common] == newLine[common]) common++;
-    bool reused = false;
-    if(gBot->getSearch()->getRootNode() != NULL && common == gBotLine.size()) {
-      reused = true;
-      for(size_t i = common; i < newLine.size() && reused; i++)
-        if(!gBot->makeMove(newLine[i].first, newLine[i].second)) reused = false;
-    }
-    if(!reused) {
-      Board board; BoardHistory hist;
-      replayLine(moveLocs, moveCols, numMoves, komi, board, hist);
-      gBot->setPosition(rootPla, board, hist);
-    }
-    gBotLine = newLine;
-
-    SearchParams params = SearchParams::basicDecentParams();
-    params.maxVisits = maxVisits; params.maxPlayouts = maxVisits;
-    params.maxTime = maxTimeMs / 1000.0;
-    params.numThreads = numSearchThreads > 0 ? numSearchThreads : 1;
-    gBot->setParamsNoClearing(params);  // keep the reused tree
+    if(!prepareSearch(moveLocs, moveCols, numMoves, rootPla, komi, maxVisits, maxTimeMs,
+                      numSearchThreads, /*ponderMode*/false)) return 0;
+    bool reused = gPollReused.load();
 
     TimeControls tc;
     Loc best = gBot->genMoveSynchronous(rootPla, tc);
@@ -743,128 +804,64 @@ KATAEVAL_EXPORT int kgeSearchBegin(const int* moveLocs, const int* moveCols, int
                                    int numSearchThreads) {
   if(gModelPath.empty()) { gErr = "not loaded"; return 0; }
   try {
-    if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
-    stopPonder();
-    gPollPla = (Player)toPla;
-    std::vector<std::pair<Loc,Player>> newLine;
-    for(int i = 0; i < numMoves; i++) newLine.push_back({ decodeLoc(moveLocs[i]), (Player)moveCols[i] });
-    size_t common = 0;
-    while(common < gBotLine.size() && common < newLine.size() && gBotLine[common] == newLine[common]) common++;
-    bool reused = false;
-    if(gBot->getSearch()->getRootNode() != NULL && common == gBotLine.size()) {
-      reused = true;
-      for(size_t i = common; i < newLine.size() && reused; i++)
-        if(!gBot->makeMove(newLine[i].first, newLine[i].second)) reused = false;
-    }
-    if(!reused) {
-      Board board; BoardHistory hist;
-      replayLine(moveLocs, moveCols, numMoves, komi, board, hist);
-      gBot->setPosition(gPollPla, board, hist);
-    }
-    gBotLine = newLine;
-    gPollReused = reused ? 1 : 0;
-
-    SearchParams params = SearchParams::basicDecentParams();
-    params.maxVisits = maxVisits; params.maxPlayouts = maxVisits;
-    params.maxTime = maxTimeMs / 1000.0;
-    params.maxVisitsPondering = 1000000000; params.maxTimePondering = 1e20;  // ponder runs until stopped
-    params.numThreads = numSearchThreads > 0 ? numSearchThreads : 1;
-    // Strength limiting: cap visits and/or sample a weaker (non-best) move by temperature.
-    if(gStrMaxVisits > 0 && (int64_t)gStrMaxVisits < params.maxVisits) {
-      params.maxVisits = gStrMaxVisits; params.maxPlayouts = gStrMaxVisits;
-    }
-    if(gStrChosenTemp > 0.0f) {
-      params.chosenMoveTemperature = gStrChosenTemp;
-      params.chosenMoveTemperatureEarly = gStrChosenTemp;
-    }
-    gBot->setParamsNoClearing(params);
+    Player rootPla = (Player)toPla;
+    gPollPla.store(rootPla);
+    if(!prepareSearch(moveLocs, moveCols, numMoves, rootPla, komi, maxVisits, maxTimeMs,
+                      numSearchThreads, /*ponderMode*/true)) return 0;
 
     gSearchDone = false;
-    gSearchBestLoc = Board::NULL_LOC;
+    gSearchBestLoc.store(Board::NULL_LOC);
+    gSnapWantOwn.store(true);   // interactive search: keep the ownership heatmap fresh
+    gSnapSearchId.fetch_add(1); // new search -> writeSnapshot recomputes the once-per-search fields
     { std::lock_guard<std::mutex> lk(gSnapMutex); gSnap = Snap(); }  // clear any stale snapshot
     // genMoveAsyncAnalyze: search to the target AND fire analyzeCb periodically from a
     // safe point (writes the snapshot buffer that kgePoll/kgeCandidates read).
-    gBot->genMoveAsyncAnalyze(gPollPla, 0, TimeControls(), 1.0,
-      [](Loc loc, int, Search*) { gSearchBestLoc = loc; gSearchDone = true; },
+    gBot->genMoveAsyncAnalyze(rootPla, 0, TimeControls(), 1.0,
+      [](Loc loc, int, Search*) { gSearchBestLoc.store(loc); gSearchDone.store(true); },
       /*callbackPeriod*/0.08, /*firstCallbackAfter*/0.05, analyzeCb);
     return 1;
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 
-// Read current search/ponder stats — safe while the search threads run (KataGo's own
-// live analysis reads this way). doneOut=1 once the async move callback has fired.
-KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
-                            int* pvOut, int pvCap, int* pvLenOut, int* visitsOut,
-                            int* doneOut, int* reusedOut, int* pvVisitsOut) {
+// ONE combined reader for the whole snapshot — the JS worker polls this every ~90ms, so we
+// take the lock and copy gSnap ONCE per poll (the old kgePoll/kgeCandidates/kgeInsights/
+// kgeOwnership each took the lock and full-copied the 361-float struct separately: 4x the
+// work per cycle). Fills caller-owned buffers; no tree access, so no race with the search.
+//   scalarsOut[7] = {best, done, reused, visits, pvLen, nCand, ownLen}
+//   valuesOut[8]  = {wr, score, scoreStdev, rawWr, rawScore, surprise, searchEntropy, policyEntropy}
+//   pv/pvVisits: up to pvCap;  cand*: up to candCap (8 parallel arrays);  own: up to ownCap.
+KATAEVAL_EXPORT int kgePollAll(int* scalarsOut, float* valuesOut,
+                               int* pvOut, int* pvVisitsOut, int pvCap,
+                               int* candLocOut, int* candVisOut, float* candWrOut, float* candScOut,
+                               float* candPrOut, float* candLcbOut, float* candRadOut, float* candStdOut, int candCap,
+                               float* ownOut, int ownCap) {
   if(gBot == nullptr) { gErr = "no engine"; return 0; }
-  // Read the engine's snapshot buffer — NO tree access here, so no race with the search.
   Snap snap;
-  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
+  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }  // one lock, one copy per poll
   bool done = gSearchDone.load();
-  if(winrateOut) *winrateOut = snap.wr;
-  if(scoreOut)   *scoreOut   = snap.score;
-  if(visitsOut)  *visitsOut  = snap.visits;
   int pvLen = 0;
-  if(pvOut) for(; pvLen < snap.pvLen && pvLen < pvCap; pvLen++) {
-    pvOut[pvLen] = snap.pv[pvLen];
-    if(pvVisitsOut) pvVisitsOut[pvLen] = snap.pvVisits[pvLen];
+  for(; pvLen < snap.pvLen && pvLen < pvCap; pvLen++) { pvOut[pvLen] = snap.pv[pvLen]; pvVisitsOut[pvLen] = snap.pvVisits[pvLen]; }
+  int nc = 0;
+  for(; nc < snap.nCand && nc < candCap; nc++) {
+    candLocOut[nc] = snap.cand[nc].loc;   candVisOut[nc] = snap.cand[nc].visits;
+    candWrOut[nc]  = snap.cand[nc].wr;    candScOut[nc]  = snap.cand[nc].score;   candPrOut[nc]  = snap.cand[nc].prior;
+    candLcbOut[nc] = snap.cand[nc].lcb;   candRadOut[nc] = snap.cand[nc].radius;  candStdOut[nc] = snap.cand[nc].stdev;
   }
-  if(pvLenOut) *pvLenOut = pvLen;
-  if(bestOut)  *bestOut  = done ? locToIdx(gSearchBestLoc) : snap.best;
-  if(doneOut)  *doneOut  = done ? 1 : 0;
-  if(reusedOut) *reusedOut = gPollReused;
+  int nOwn = 0;
+  for(; nOwn < snap.ownLen && nOwn < ownCap; nOwn++) ownOut[nOwn] = snap.own[nOwn];
+  scalarsOut[0] = done ? locToIdx(gSearchBestLoc.load()) : snap.best;
+  scalarsOut[1] = done ? 1 : 0;   scalarsOut[2] = gPollReused.load();
+  scalarsOut[3] = snap.visits;    scalarsOut[4] = pvLen;   scalarsOut[5] = nc;   scalarsOut[6] = nOwn;
+  valuesOut[0] = snap.wr;         valuesOut[1] = snap.score;       valuesOut[2] = snap.scoreStdev;
+  valuesOut[3] = snap.rawWr;      valuesOut[4] = snap.rawScore;
+  valuesOut[5] = snap.surprise;   valuesOut[6] = snap.searchEntropy; valuesOut[7] = snap.policyEntropy;
   return 1;
-}
-
-// Top-N root candidate moves from the snapshot buffer (best-first) — no tree access.
-// lcb/radius are in utility units (KataGo picks its move by LCB, not raw win-rate);
-// stdev is the score stdev in points. Pass NULL for any output you don't want.
-KATAEVAL_EXPORT int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
-                                  float* winrateOut, float* scoreOut, float* priorOut,
-                                  float* lcbOut, float* radiusOut, float* stdevOut) {
-  if(gBot == nullptr) { gErr = "no engine"; return -1; }
-  Snap snap;
-  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
-  int count = 0;
-  for(; count < snap.nCand && count < maxN; count++) {
-    locsOut[count]    = snap.cand[count].loc;
-    visitsOut[count]  = snap.cand[count].visits;
-    winrateOut[count] = snap.cand[count].wr;
-    scoreOut[count]   = snap.cand[count].score;
-    priorOut[count]   = snap.cand[count].prior;
-    if(lcbOut)    lcbOut[count]    = snap.cand[count].lcb;
-    if(radiusOut) radiusOut[count] = snap.cand[count].radius;
-    if(stdevOut)  stdevOut[count]  = snap.cand[count].stdev;
-  }
-  return count;
-}
-
-// Root-level insight metrics from the snapshot (no tree access). Fills 6 floats:
-// [0]=rawWinrate [1]=rawScore (instant NN, pre-search, side-to-move)
-// [2]=scoreStdev (points) [3]=policySurprise [4]=searchEntropy [5]=policyEntropy (nats).
-KATAEVAL_EXPORT int kgeInsights(float* out6) {
-  if(gBot == nullptr || out6 == nullptr) { gErr = "no engine"; return 0; }
-  Snap snap;
-  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
-  out6[0] = snap.rawWr;   out6[1] = snap.rawScore;    out6[2] = snap.scoreStdev;
-  out6[3] = snap.surprise; out6[4] = snap.searchEntropy; out6[5] = snap.policyEntropy;
-  return 1;
-}
-
-// Tree-averaged ownership heatmap from the snapshot (white-perspective, +1 = white owns),
-// board-point indexed (y*xLen + x). Copies up to cap points; returns the count written.
-KATAEVAL_EXPORT int kgeOwnership(float* out, int cap) {
-  if(gBot == nullptr || out == nullptr) { gErr = "no engine"; return 0; }
-  Snap snap;
-  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
-  int n = 0;
-  for(; n < snap.ownLen && n < cap; n++) out[n] = snap.own[n];
-  return n;
 }
 
 KATAEVAL_EXPORT int kgePonderBegin() {  // background ponder that ALSO streams the snapshot
   if(gBot == nullptr) { gErr = "no engine"; return 0; }
-  try { gBot->analyzeAsync(gPollPla, 1.0, /*callbackPeriod*/0.15, /*firstAfter*/0.05, analyzeCb);
+  try { gSnapSearchId.fetch_add(1);  // ponder is a fresh analysis pass -> recompute once-per-search fields
+        gBot->analyzeAsync(gPollPla.load(), 1.0, /*callbackPeriod*/0.15, /*firstAfter*/0.05, analyzeCb);
         gPondering = true; return 1; }
   catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
