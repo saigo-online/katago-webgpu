@@ -26,9 +26,10 @@ async function cachedNet(url) {
   if (cache) { try { await cache.put(url, res.clone()); } catch (_) {} }
   return await res.arrayBuffer();
 }
-let mlPtr, mcPtr, bmPtr, wrPtr, scPtr, pvPtr, pvlPtr, visPtr, reusedPtr, donePtr;  // search buffers
+let mlPtr, mcPtr, bmPtr, wrPtr, scPtr, pvPtr, pvlPtr, visPtr, reusedPtr, donePtr, pvVisPtr;  // search buffers
 let bPtr, pPtr, vPtr, oPtr;                             // analysis (kgeEvalSeqKata) buffers
-let candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr;  // candidate-move buffers
+let candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr, candLcbPtr, candRadPtr, candStdPtr;  // candidate-move buffers
+let insPtr, ownPtr;                                    // insight-metrics + tree-ownership buffers
 
 async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16) {
   // The module is loaded via importScripts INTO this worker, so emscripten's
@@ -58,10 +59,13 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16) {
   mlPtr = M._malloc(MAXMV * 4); mcPtr = M._malloc(MAXMV * 4);
   bmPtr = M._malloc(4); wrPtr = M._malloc(4); scPtr = M._malloc(4); visPtr = M._malloc(4);
   pvlPtr = M._malloc(4); reusedPtr = M._malloc(4); donePtr = M._malloc(4); pvPtr = M._malloc(PVCAP * 4);
+  pvVisPtr = M._malloc(PVCAP * 4);
   const HW = N * N;
   bPtr = M._malloc(HW * 4); pPtr = M._malloc((HW + 1) * 4); vPtr = M._malloc(5 * 4); oPtr = M._malloc(HW * 4);
   candLocPtr = M._malloc(MAXCAND * 4); candVisPtr = M._malloc(MAXCAND * 4);
   candWrPtr = M._malloc(MAXCAND * 4); candScPtr = M._malloc(MAXCAND * 4); candPrPtr = M._malloc(MAXCAND * 4);
+  candLcbPtr = M._malloc(MAXCAND * 4); candRadPtr = M._malloc(MAXCAND * 4); candStdPtr = M._malloc(MAXCAND * 4);
+  insPtr = M._malloc(6 * 4); ownPtr = M._malloc(HW * 4);
   ready = true;
   const backend = M.ccall('kgeBackendIsGpu', 'number', [], []) ? 'WebGPU' : 'CPU (Eigen)';
   return { backend, version: M.ccall('kgeModelVersion', 'number', [], []) };
@@ -72,20 +76,27 @@ let pollToken = 0;  // bumped on every new request; a running stream exits when 
 
 function pollStats() {
   const ok = M.ccall('kgePoll', 'number',
-    ['number','number','number','number','number','number','number','number','number'],
-    [bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, donePtr, reusedPtr]);
+    ['number','number','number','number','number','number','number','number','number','number'],
+    [bmPtr, wrPtr, scPtr, pvPtr, PVCAP, pvlPtr, visPtr, donePtr, reusedPtr, pvVisPtr]);
   if (!ok) throw new Error('kgePoll: ' + M.ccall('kgeError', 'string', [], []));
   const plen = M.HEAP32[pvlPtr >> 2];
-  // top-N candidate moves (best-first), each with its own visits/win-rate/score/prior
+  // top-N candidate moves (best-first): visits/win-rate/score/prior + LCB/radius/stdev
   const ncand = M.ccall('kgeCandidates', 'number',
-    ['number','number','number','number','number','number'],
-    [MAXCAND, candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr]);
+    ['number','number','number','number','number','number','number','number','number'],
+    [MAXCAND, candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr, candLcbPtr, candRadPtr, candStdPtr]);
   const cand = [];
   for (let i = 0; i < ncand; i++) cand.push({
     loc: M.HEAP32[(candLocPtr >> 2) + i], visits: M.HEAP32[(candVisPtr >> 2) + i],
     wr: M.HEAPF32[(candWrPtr >> 2) + i], score: M.HEAPF32[(candScPtr >> 2) + i],
     prior: M.HEAPF32[(candPrPtr >> 2) + i],
+    lcb: M.HEAPF32[(candLcbPtr >> 2) + i], radius: M.HEAPF32[(candRadPtr >> 2) + i],
+    stdev: M.HEAPF32[(candStdPtr >> 2) + i],
   });
+  // root insight metrics: [rawWr, rawScore, scoreStdev, surprise, searchEntropy, policyEntropy]
+  M.ccall('kgeInsights', 'number', ['number'], [insPtr]);
+  const ins = M.HEAPF32.slice(insPtr >> 2, (insPtr >> 2) + 6);
+  // tree-averaged ownership heatmap (white-perspective); nOwn==0 until the root is read
+  const nOwn = M.ccall('kgeOwnership', 'number', ['number','number'], [ownPtr, N * N]);
   return {
     best: M.HEAP32[bmPtr >> 2],
     wr: M.HEAPF32[wrPtr >> 2],
@@ -94,7 +105,11 @@ function pollStats() {
     done: !!M.HEAP32[donePtr >> 2],
     reused: !!M.HEAP32[reusedPtr >> 2],
     pv: [...Array(plen)].map((_, i) => M.HEAP32[(pvPtr >> 2) + i]),
+    pvVisits: [...Array(plen)].map((_, i) => M.HEAP32[(pvVisPtr >> 2) + i]),
     cand,
+    rawWr: ins[0], rawScore: ins[1], scoreStdev: ins[2],
+    surprise: ins[3], searchEntropy: ins[4], policyEntropy: ins[5],
+    ownership: nOwn > 0 ? Array.from(M.HEAPF32.slice(ownPtr >> 2, (ownPtr >> 2) + nOwn)) : null,
     mem: M.HEAP32.buffer.byteLength,   // total wasm memory (HEAP8 isn't exported)
   };
 }

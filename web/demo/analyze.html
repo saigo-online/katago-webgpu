@@ -107,7 +107,14 @@
       <div>tree</div><div id="m_reuse">–</div>
       <div>memory</div><div id="m_mem">–</div>
     </div>
-    <div class="muted" style="margin-top:8px;">candidate moves <span style="font-weight:400;">(win% · score · visits)</span></div>
+    <div class="muted" style="margin-top:8px;">position read <span style="font-weight:400;">(what search sees)</span></div>
+    <div class="metricgrid" style="margin:4px 0;">
+      <div>raw → searched</div><div id="m_delta" title="instant NN read vs after search — what reading buys">–</div>
+      <div>score ±σ</div><div id="m_stdev" title="score uncertainty in points (expected stdev)">–</div>
+      <div>surprise</div><div id="m_surprise" title="how far search moved from the raw policy — high = tactical/tricky">–</div>
+      <div>decisiveness</div><div id="m_decis" title="1 = one clear move, 0 = many playable (from search-move entropy)">–</div>
+    </div>
+    <div class="muted" style="margin-top:8px;">candidate moves <span style="font-weight:400;">(win% · score · visits · ±σ)</span></div>
     <div id="m_cand" class="mono" style="font-size:13px; min-height:2em;"><span class="muted">play Search to rank moves</span></div>
     <div class="muted" style="margin-top:8px;">principal variation</div>
     <div class="row mono" id="m_pv" style="min-height:3.4em;">–</div>
@@ -139,7 +146,7 @@
   if (WGo.coordinates) for (const b of [board, pvBoard]) { b.setSection(-1); b.addCustomObject(WGo.coordinates); }
   // Render the engine's principal variation on the 2nd board: current stones, then the
   // PV played out as numbered, alternating moves from the side to move (its read-ahead).
-  function renderPV(pv) {
+  function renderPV(pv, pvVisits) {
     pvBoard.removeAllObjects();
     for (let y = 0; y < N; y++) for (let x = 0; x < N; x++)
       if (grid[x][y]) pvBoard.addObject({ x, y, c: grid[x][y] === 1 ? WGo.B : WGo.W });
@@ -153,7 +160,10 @@
       }
       col = col === 1 ? 2 : 1;
     }
-    $('pvtext').textContent = (pv && pv.length) ? pv.map(ptName).join(' ') : '(current position)';
+    // Annotate the PV text with per-move visit counts — confidence decays down the line.
+    $('pvtext').textContent = (pv && pv.length)
+      ? pv.map((loc, i) => ptName(loc) + ((pvVisits && pvVisits[i]) ? `(${pvVisits[i].toLocaleString()})` : '')).join(' ')
+      : '(current position)';
   }
   const grid = Array.from({ length: N }, () => new Array(N).fill(0)); // displayed board (from boardOut)
   const moves = [];            // played sequence: {loc: y*N+x or -1 pass, col: 1|2}
@@ -357,8 +367,11 @@
         if (e.data.diag) { console.log('[kata]', e.data.diag); $('searchout').textContent = 'KataGo · ' + e.data.diag; return; }
         if (e.data.progress) {   // live search/ponder stats — stream them into the panel
           renderMetrics(e.data, e.data.threads);
-          renderPV(e.data.pv);   // play the engine's current line on the 2nd board
+          renderPV(e.data.pv, e.data.pvVisits);   // play the engine's current line on the 2nd board
           lastCand = e.data.cand; renderCandidates(e.data.cand);  // live candidate moves
+          // Tree-averaged ownership is search-corrected — prefer it over the raw NN head
+          // for the live territory tint while a search is running.
+          if (e.data.ownership) lastOwner = e.data.ownership;
           setBotState(e.data.state + '…', e.data.state === 'pondering' ? 'live' : 'run');
           searchBest = e.data.best; drawOverlay();
           return;
@@ -405,15 +418,41 @@
     $('m_reuse').textContent = r.reused ? 'reused ✓' : 'fresh';
     if (r.mem) $('m_mem').textContent = (r.mem / 1048576).toFixed(0) + ' MB';
     $('m_pv').textContent = r.pv.map(ptName).join(' ') || '–';
+    renderInsights(r);
+  }
+  // Root insight metrics: the searched values vs the instant NN read, the score
+  // uncertainty, and two one-number position descriptors (surprise, decisiveness).
+  function renderInsights(r) {
+    if (r.rawWr == null) return;
+    const dW = (r.wr - r.rawWr) * 100, dS = r.score - r.rawScore;
+    const sign = v => (v >= 0 ? '+' : '') + v.toFixed(1);
+    // instant → searched, with the correction reading applied
+    $('m_delta').innerHTML = `${(r.rawWr*100).toFixed(0)}% → <b>${(r.wr*100).toFixed(0)}%</b> ` +
+      `<span class="${Math.abs(dW) < 0.5 ? 'muted' : (dW >= 0 ? '' : 'bad')}">(${sign(dW)}pt wr)</span>`;
+    $('m_stdev').textContent = '±' + (r.scoreStdev || 0).toFixed(1) + ' pt';
+    // surprise (nats): search vs raw policy. ~0 calm, >0.5 notable, >1 sharp/tactical.
+    const su = r.surprise || 0;
+    $('m_surprise').innerHTML = su.toFixed(2) + ' ' +
+      (su > 1 ? '🔥 tactical' : su > 0.5 ? '· notable' : '<span class="muted">· calm</span>');
+    // decisiveness = how peaked the search-move distribution is. Map entropy (nats) to
+    // 0..1 where high entropy (many candidates) -> low decisiveness.
+    const dec = Math.max(0, Math.min(1, 1 - (r.searchEntropy || 0) / 2.0));
+    $('m_decis').innerHTML =
+      `<span style="display:inline-block;width:46px;height:7px;border-radius:3px;vertical-align:middle;` +
+      `background:linear-gradient(90deg,#3a9c5a ${Math.round(dec*100)}%,#2a2f38 ${Math.round(dec*100)}%);"></span> ` +
+      (dec > 0.66 ? 'one move' : dec > 0.33 ? 'a few' : 'many');
   }
   function renderCandidates(cand) {
     const el = $('m_cand');
     if (!cand || !cand.length) { el.innerHTML = '<span class="muted">play Search to rank moves</span>'; return; }
+    // Rank by LCB (how KataGo actually picks) but display best-first as given. The σ is
+    // the score stdev in points — the per-move uncertainty; smaller = surer.
     el.innerHTML = cand.slice(0, 6).map((c, i) => {
       const hue = Math.round(Math.max(0, Math.min(1, c.wr)) * 120);
+      const sig = (c.stdev != null && c.stdev > 0) ? ` · <span class="muted">±${c.stdev.toFixed(1)}</span>` : '';
       return `<div style="display:flex; justify-content:space-between; gap:8px; padding:1px 0;">
         <span><span style="display:inline-block; width:9px; height:9px; border-radius:2px; background:hsl(${hue},62%,44%); margin-right:5px;"></span>${i + 1}. <b>${ptName(c.loc)}</b></span>
-        <span>${(c.wr * 100).toFixed(1)}% · ${(c.score >= 0 ? '+' : '') + c.score.toFixed(1)} · ${c.visits.toLocaleString()}v</span></div>`;
+        <span>${(c.wr * 100).toFixed(1)}% · ${(c.score >= 0 ? '+' : '') + c.score.toFixed(1)} · ${c.visits.toLocaleString()}v${sig}</span></div>`;
     }).join('');
   }
   async function kataThink() {
@@ -460,7 +499,8 @@
         const fb = rows[rows.length - 1].best;
         $('searchout').innerHTML = '<b>visit sweep</b> — move · win% · score:<br>' + rows.map(x =>
           `${String(x.v).padStart(5)} → <b>${ptName(x.best)}</b> · ${(x.wr * 100).toFixed(1)}% · ${(x.score >= 0 ? '+' : '') + x.score.toFixed(1)}${x.best !== fb ? ' ·changed' : ''}`).join('<br>');
-        renderMetrics(r, threads); renderPV(r.pv); lastCand = r.cand; renderCandidates(r.cand); searchBest = r.best; drawOverlay();
+        renderMetrics(r, threads); renderPV(r.pv, r.pvVisits); lastCand = r.cand; renderCandidates(r.cand);
+        if (r.ownership) lastOwner = r.ownership; searchBest = r.best; drawOverlay();
       }
       const fb = rows[rows.length - 1].best;
       let s = rows.length - 1; while (s > 0 && rows[s - 1].best === fb) s--;

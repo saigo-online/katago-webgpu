@@ -88,14 +88,24 @@ int kgeSearchKata(const int* moveLocs, const int* moveCols, int numMoves,
 // halts before a new request.
 int kgeSearchBegin(const int* moveLocs, const int* moveCols, int numMoves,
                    int toPla, double komi, int maxVisits, double maxTimeMs, int numSearchThreads);
+// pvVisitsOut (optional, parallel to pvOut) receives per-move visit counts down the PV.
 int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
-            int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* doneOut, int* reusedOut);
+            int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* doneOut, int* reusedOut,
+            int* pvVisitsOut);
 int kgePonderBegin(void);
 int kgeStopSearch(void);
 // Top-N root candidate moves (best-first), each with visits / side-to-move win-rate /
-// score lead / policy prior. Live-pollable during search. Returns the count (or -1).
+// score lead / policy prior, plus LCB + radius (utility units — how KataGo actually
+// ranks) and score stdev (points). Pass NULL for unwanted outputs. Returns count (-1 err).
 int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
-                  float* winrateOut, float* scoreOut, float* priorOut);
+                  float* winrateOut, float* scoreOut, float* priorOut,
+                  float* lcbOut, float* radiusOut, float* stdevOut);
+// Root insight metrics into 6 floats: [rawWinrate, rawScore, scoreStdev, policySurprise,
+// searchEntropy, policyEntropy]. raw* are the instant NN read pre-search (side-to-move).
+int kgeInsights(float* out6);
+// Tree-averaged ownership heatmap (white-perspective, +1 = white), y*xLen+x indexed.
+// Copies up to cap points; returns the count written.
+int kgeOwnership(float* out, int cap);
 
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size

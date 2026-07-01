@@ -491,6 +491,7 @@ static bool ensureKataEngine() {
     /*disableWarmup*/true, cfg);
   gNNEval->spawnServerThreads();
   gBot = new AsyncBot(SearchParams::basicDecentParams(), gNNEval, /*humanEval*/NULL, &kgeLogger(), "kge-search");
+  gBot->setAlwaysIncludeOwnerMap(true);  // so getAverageTreeOwnership (the territory heatmap) is available
   // Free the CPU LoadedModel now: the NNEvaluator loaded its OWN copy from gModelPath,
   // and the threaded worker never touches gModel again (metadata is cached in
   // gModelVersion/gXLen; the "loaded" sentinel is gModelPath). Saves the net's full
@@ -521,11 +522,15 @@ static Loc decodeLoc(int mv) {
 // search's periodic analyze callback (a safe point where reading the tree is legal —
 // this is how KataGo's kata-analyze streams). kgePoll/kgeCandidates just read this
 // buffer under a mutex, never touching the live tree — so no reader-vs-search race.
-static const int SNAP_PV = 32, SNAP_CAND = 8;
+static const int SNAP_PV = 32, SNAP_CAND = 8, SNAP_MAXPTS = 361;
 struct Snap {
   int best = -1; float wr = 0.5f, score = 0.0f; int visits = 0;
-  int pv[SNAP_PV]; int pvLen = 0;
-  struct Cand { int loc, visits; float wr, score, prior; } cand[SNAP_CAND]; int nCand = 0;
+  float rawWr = 0.5f, rawScore = 0.0f;             // instant NN read (pre-search), side-to-move
+  float scoreStdev = 0.0f;                          // root score uncertainty, points
+  float surprise = 0.0f, searchEntropy = 0.0f, policyEntropy = 0.0f;  // position descriptors (nats)
+  int pv[SNAP_PV]; int pvVisits[SNAP_PV]; int pvLen = 0;
+  struct Cand { int loc, visits; float wr, score, prior, lcb, radius, stdev; } cand[SNAP_CAND]; int nCand = 0;
+  float own[SNAP_MAXPTS]; int ownLen = 0;           // tree-averaged ownership, WHITE-perspective (+1 = white)
 };
 static Snap gSnap;
 static std::mutex gSnapMutex;
@@ -534,11 +539,26 @@ static std::mutex gSnapMutex;
 // point during the search — so getAnalysisData / appendPV are safe here.
 static void writeSnapshot(const Search* s) {
   Snap snap;
+  const bool stmWhite = (gPollPla == P_WHITE);
   ReportedSearchValues vals;
   if(s->getRootValues(vals)) {
-    snap.wr    = (float)((gPollPla == P_WHITE) ? vals.winValue : vals.lossValue);
-    snap.score = (float)((gPollPla == P_WHITE) ? vals.lead : -vals.lead);
+    snap.wr    = (float)(stmWhite ? vals.winValue : vals.lossValue);
+    snap.score = (float)(stmWhite ? vals.lead : -vals.lead);
+    snap.scoreStdev = (float)vals.expectedScoreStdev;
     snap.visits = (int)vals.visits;
+  }
+  // Instant NN read (pre-search) — the delta vs the searched values above shows what
+  // reading is buying. Same side-to-move perspective as wr/score.
+  ReportedSearchValues raw;
+  if(s->getRootRawNNValues(raw)) {
+    snap.rawWr    = (float)(stmWhite ? raw.winValue : raw.lossValue);
+    snap.rawScore = (float)(stmWhite ? raw.lead : -raw.lead);
+  } else { snap.rawWr = snap.wr; snap.rawScore = snap.score; }
+  // Position descriptors: surprise = how far search moved from the raw policy (tactical),
+  // entropy = how spread the move choice is (sharp vs calm).
+  double sp = 0.0, se = 0.0, pe = 0.0;
+  if(s->getPolicySurpriseAndEntropy(sp, se, pe)) {
+    snap.surprise = (float)sp; snap.searchEntropy = (float)se; snap.policyEntropy = (float)pe;
   }
   std::vector<AnalysisData> buf;
   s->getAnalysisData(buf, SNAP_CAND, false, 1, false);
@@ -546,14 +566,26 @@ static void writeSnapshot(const Search* s) {
     const AnalysisData& a = buf[i];
     double whiteWr = (a.winLossValue + 1.0) * 0.5;
     snap.cand[snap.nCand] = { locToIdx(a.move), (int)a.numVisits,
-      (float)((gPollPla == P_WHITE) ? whiteWr : 1.0 - whiteWr),
-      (float)((gPollPla == P_WHITE) ? a.lead : -a.lead), (float)a.policyPrior };
+      (float)(stmWhite ? whiteWr : 1.0 - whiteWr),
+      (float)(stmWhite ? a.lead : -a.lead), (float)a.policyPrior,
+      (float)(stmWhite ? a.lcb : -a.lcb), (float)a.radius, (float)a.scoreStdev };
     snap.nCand++;
   }
   snap.best = buf.empty() ? -1 : locToIdx(buf[0].move);
   std::vector<Loc> pvBuf; std::vector<int64_t> vb, eb; std::vector<Loc> sl; std::vector<double> sv;
   if(s->getRootNode() != NULL) s->appendPV(pvBuf, vb, eb, sl, sv, s->getRootNode(), SNAP_PV);
-  for(size_t i = 0; i < pvBuf.size() && snap.pvLen < SNAP_PV; i++) snap.pv[snap.pvLen++] = locToIdx(pvBuf[i]);
+  for(size_t i = 0; i < pvBuf.size() && snap.pvLen < SNAP_PV; i++) {
+    snap.pv[snap.pvLen] = locToIdx(pvBuf[i]);
+    snap.pvVisits[snap.pvLen] = (i < vb.size()) ? (int)vb[i] : 0;
+    snap.pvLen++;
+  }
+  // Tree-averaged territory heatmap (white-perspective). Throws if the root isn't
+  // evaluated yet or the owner map is off — guard so an early callback can't crash.
+  try {
+    std::vector<double> own = s->getAverageTreeOwnership(P_WHITE, s->getRootNode(), 0);
+    for(size_t i = 0; i < own.size() && snap.ownLen < SNAP_MAXPTS; i++)
+      snap.own[snap.ownLen++] = (float)own[i];
+  } catch(...) { snap.ownLen = 0; }
   { std::lock_guard<std::mutex> lk(gSnapMutex); gSnap = snap; }
 }
 static void analyzeCb(const Search* s) { writeSnapshot(s); }
@@ -728,7 +760,7 @@ KATAEVAL_EXPORT int kgeSearchBegin(const int* moveLocs, const int* moveCols, int
 // live analysis reads this way). doneOut=1 once the async move callback has fired.
 KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
                             int* pvOut, int pvCap, int* pvLenOut, int* visitsOut,
-                            int* doneOut, int* reusedOut) {
+                            int* doneOut, int* reusedOut, int* pvVisitsOut) {
   if(gBot == nullptr) { gErr = "no engine"; return 0; }
   // Read the engine's snapshot buffer — NO tree access here, so no race with the search.
   Snap snap;
@@ -738,7 +770,10 @@ KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
   if(scoreOut)   *scoreOut   = snap.score;
   if(visitsOut)  *visitsOut  = snap.visits;
   int pvLen = 0;
-  if(pvOut) for(; pvLen < snap.pvLen && pvLen < pvCap; pvLen++) pvOut[pvLen] = snap.pv[pvLen];
+  if(pvOut) for(; pvLen < snap.pvLen && pvLen < pvCap; pvLen++) {
+    pvOut[pvLen] = snap.pv[pvLen];
+    if(pvVisitsOut) pvVisitsOut[pvLen] = snap.pvVisits[pvLen];
+  }
   if(pvLenOut) *pvLenOut = pvLen;
   if(bestOut)  *bestOut  = done ? locToIdx(gSearchBestLoc) : snap.best;
   if(doneOut)  *doneOut  = done ? 1 : 0;
@@ -747,8 +782,11 @@ KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
 }
 
 // Top-N root candidate moves from the snapshot buffer (best-first) — no tree access.
+// lcb/radius are in utility units (KataGo picks its move by LCB, not raw win-rate);
+// stdev is the score stdev in points. Pass NULL for any output you don't want.
 KATAEVAL_EXPORT int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
-                                  float* winrateOut, float* scoreOut, float* priorOut) {
+                                  float* winrateOut, float* scoreOut, float* priorOut,
+                                  float* lcbOut, float* radiusOut, float* stdevOut) {
   if(gBot == nullptr) { gErr = "no engine"; return -1; }
   Snap snap;
   { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
@@ -759,8 +797,34 @@ KATAEVAL_EXPORT int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
     winrateOut[count] = snap.cand[count].wr;
     scoreOut[count]   = snap.cand[count].score;
     priorOut[count]   = snap.cand[count].prior;
+    if(lcbOut)    lcbOut[count]    = snap.cand[count].lcb;
+    if(radiusOut) radiusOut[count] = snap.cand[count].radius;
+    if(stdevOut)  stdevOut[count]  = snap.cand[count].stdev;
   }
   return count;
+}
+
+// Root-level insight metrics from the snapshot (no tree access). Fills 6 floats:
+// [0]=rawWinrate [1]=rawScore (instant NN, pre-search, side-to-move)
+// [2]=scoreStdev (points) [3]=policySurprise [4]=searchEntropy [5]=policyEntropy (nats).
+KATAEVAL_EXPORT int kgeInsights(float* out6) {
+  if(gBot == nullptr || out6 == nullptr) { gErr = "no engine"; return 0; }
+  Snap snap;
+  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
+  out6[0] = snap.rawWr;   out6[1] = snap.rawScore;    out6[2] = snap.scoreStdev;
+  out6[3] = snap.surprise; out6[4] = snap.searchEntropy; out6[5] = snap.policyEntropy;
+  return 1;
+}
+
+// Tree-averaged ownership heatmap from the snapshot (white-perspective, +1 = white owns),
+// board-point indexed (y*xLen + x). Copies up to cap points; returns the count written.
+KATAEVAL_EXPORT int kgeOwnership(float* out, int cap) {
+  if(gBot == nullptr || out == nullptr) { gErr = "no engine"; return 0; }
+  Snap snap;
+  { std::lock_guard<std::mutex> lk(gSnapMutex); snap = gSnap; }
+  int n = 0;
+  for(; n < snap.ownLen && n < cap; n++) out[n] = snap.own[n];
+  return n;
 }
 
 KATAEVAL_EXPORT int kgePonderBegin() {  // background ponder that ALSO streams the snapshot
