@@ -490,6 +490,12 @@ static bool ensureKataEngine() {
     /*disableWarmup*/true, cfg);
   gNNEval->spawnServerThreads();
   gBot = new AsyncBot(SearchParams::basicDecentParams(), gNNEval, /*humanEval*/NULL, &kgeLogger(), "kge-search");
+  // Free the CPU LoadedModel now: the NNEvaluator loaded its OWN copy from gModelPath,
+  // and the threaded worker never touches gModel again (metadata is cached in
+  // gModelVersion/gXLen; the "loaded" sentinel is gModelPath). Saves the net's full
+  // weight size in CPU RAM (~94MB for b18) — the double-load was blowing the browser's
+  // memory budget on big nets and forcing the fragile threaded-WASM growth.
+  if(gModel != nullptr) { NeuralNet::freeLoadedModel(gModel); gModel = nullptr; }
   return true;
 }
 
@@ -532,7 +538,7 @@ static void replayLine(const int* moveLocs, const int* moveCols, int numMoves, d
 KATAEVAL_EXPORT int kgeEvalSeqKata(const int* moveLocs, const int* moveCols, int numMoves,
                                    int toPla, double komi,
                                    int* boardOut, float* policyOut, float* valueOut, float* ownerOut) {
-  if(gModel == nullptr) { gErr = "not loaded"; return 0; }
+  if(gModelPath.empty()) { gErr = "not loaded"; return 0; }
   try {
     if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
     stopPonder();
@@ -566,7 +572,7 @@ KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int 
                                   int numSearchThreads,
                                   int* bestMoveOut, float* winrateOut, float* scoreOut,
                                   int* pvOut, int pvCap, int* pvLenOut, int* visitsOut, int* reusedOut) {
-  if(gModel == nullptr) { gErr = "not loaded"; return 0; }
+  if(gModelPath.empty()) { gErr = "not loaded"; return 0; }
   try {
     if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
     stopPonder();
@@ -634,7 +640,7 @@ KATAEVAL_EXPORT int kgeSearchKata(const int* moveLocs, const int* moveCols, int 
 KATAEVAL_EXPORT int kgeSearchBegin(const int* moveLocs, const int* moveCols, int numMoves,
                                    int toPla, double komi, int maxVisits, double maxTimeMs,
                                    int numSearchThreads) {
-  if(gModel == nullptr) { gErr = "not loaded"; return 0; }
+  if(gModelPath.empty()) { gErr = "not loaded"; return 0; }
   try {
     if(!ensureKataEngine()) { gErr = "engine init failed"; return 0; }
     stopPonder();
