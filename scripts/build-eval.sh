@@ -30,7 +30,7 @@ if [ "${MT:-0}" = 1 ]; then
   CFLAGS+=( -pthread -DKGE_THREADS )
   MANIFESTS+=( kataeval/sources-search.txt )
   OUTNAME=kataeval-mt
-  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePoll,_kgePonderBegin,_kgeStopSearch,_kgeCandidates,_kgeInsights,_kgeOwnership"
+  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePoll,_kgePonderBegin,_kgeStopSearch,_kgeCandidates,_kgeInsights,_kgeOwnership,_kgeSetStrength"
   # 512MB initial so big nets (b18/b20, loaded ~2x in CPU) fit WITHOUT triggering
   # threaded-WASM memory growth (a fragile path that traps with "unaligned accesses").
   LINKEXTRA=( -pthread -sPTHREAD_POOL_SIZE=33 -sINITIAL_MEMORY=512MB )  # 1 NN server + up to 32 search threads
@@ -54,11 +54,17 @@ for f in "${SRCS[@]}"; do
   OBJS+=("$o")
 done
 
+# ASSERTIONS=1 turns on emscripten's runtime checks + real abort() messages (stack
+# traces instead of a bare "Aborted()"). Opt-in for debugging a crash; off in shipped
+# builds (it's slower + larger). Usage: ASSERTIONS=1 MT=1 bash scripts/build-eval.sh
+ASSERT=( )
+if [ "${ASSERTIONS:-0}" = 1 ]; then ASSERT=( -sASSERTIONS=2 ); echo "==> ASSERTIONS on"; fi
+
 echo "==> linking -> web/demo/$OUTNAME.js"
 emcc "${OBJS[@]}" --use-port=emdawnwebgpu -sUSE_ZLIB=1 \
   -fexceptions \
   -sASYNCIFY -sALLOW_MEMORY_GROWTH=1 -sFORCE_FILESYSTEM=1 \
-  -sSTACK_SIZE=16MB "${LINKEXTRA[@]}" \
+  -sSTACK_SIZE=16MB "${LINKEXTRA[@]}" "${ASSERT[@]}" \
   -sMODULARIZE=1 -sEXPORT_NAME=createKata \
   -sEXPORTED_FUNCTIONS="$EXPORTS" \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,FS,HEAPF32,HEAP32,UTF8ToString \

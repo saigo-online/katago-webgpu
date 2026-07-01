@@ -189,7 +189,7 @@ async function evalPos(req) {
   };
 }
 
-onmessage = async (e) => {
+async function handleMessage(e) {
   const { id, type } = e.data;
   try {
     if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText, e.data.forceCpu, e.data.fp16)) });
@@ -204,8 +204,29 @@ onmessage = async (e) => {
       const r = await search(e.data, token);
       postMessage({ id, ok: true, superseded: r === null, ...(r || {}) });
     }
+    else if (type === 'strength') {      // limit playing strength for the next search
+      M.ccall('kgeSetStrength', null, ['number','number'], [e.data.visits | 0, e.data.temp || 0]);
+      postMessage({ id, ok: true });
+    }
     else throw new Error('unknown message type: ' + type);
   } catch (err) {
     postMessage({ id, ok: false, error: String((err && err.message) || err) });
   }
+}
+
+// SERIALIZE all engine access. The module is built with -sASYNCIFY, which allows only ONE
+// suspended async call at a time — two overlapping messages (e.g. an eval placed while a
+// search is mid-flight) would each enter a ccall and corrupt the asyncify stack -> a bare
+// "Aborted()". onmessage is async, so without this the JS event loop could interleave two
+// handlers. Chaining them through one promise guarantees strictly-one-at-a-time execution.
+// (The detached ponder poll-loop stays outside this, but it only makes SYNC ccalls and is
+// already gated by pollToken, which is bumped before any handler suspends.)
+let engineChain = Promise.resolve();
+onmessage = (e) => {
+  // Bump pollToken NOW (synchronously) for eval/search so a running search/ponder yields
+  // its chain link immediately — the queued handler then runs without waiting out the full
+  // search budget. Soundness (one async ccall at a time) still comes from the chain below.
+  const t = e.data.type;
+  if (t === 'eval' || t === 'search') pollToken++;
+  engineChain = engineChain.then(() => handleMessage(e));
 };

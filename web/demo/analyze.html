@@ -72,6 +72,13 @@
       visits <input id="visits" type="number" value="400" min="1" max="20000" style="width:64px">
       ms <input id="ms" type="number" value="3000" min="100" max="120000" style="width:70px">
       threads <input id="threads" type="number" value="4" min="1" max="32" style="width:46px">
+      strength <select id="strength" title="Weaken the engine: cap visits + sample a non-best move by temperature (visits^1/T)">
+        <option value="0,0">Full</option>
+        <option value="600,0.15">Strong</option>
+        <option value="80,0.35">Intermediate</option>
+        <option value="12,0.55">Casual</option>
+        <option value="1,0.8">Beginner</option>
+      </select>
       <label style="margin-left:6px;"><input type="checkbox" id="searchplay"> engine searches</label>
     </div>
     <div class="row mono" id="searchout" style="min-height:1.4em"></div>
@@ -360,6 +367,14 @@
       kataWorker.postMessage({ id, ...msg }, transfer || []);
     });
   }
+  // Push the strength selector (visits cap, move temperature) to the engine. No-op until
+  // the worker is up; re-sent after init so a page-load default takes effect.
+  async function applyStrength() {
+    if (!kataInited) return;
+    const [visits, temp] = ($('strength').value || '0,0').split(',').map(Number);
+    try { await kataCall({ type: 'strength', visits, temp }); } catch (_) {}
+  }
+  $('strength').onchange = applyStrength;
   async function ensureKataWorker() {
     if (!self.crossOriginIsolated)
       throw new Error('page is not cross-origin isolated (COOP/COEP) — wasm threads unavailable');
@@ -385,6 +400,12 @@
       kataWorker.onerror = (ev) => {
         for (const p of kataPending.values()) p.reject(new Error('worker: ' + (ev.message || 'error')));
         kataPending.clear();
+        // Reset toggle state so the NEXT click restarts cleanly. Without this, a crash
+        // mid-run leaves selfPlaying/scanning=true and the next click just toggles it off
+        // (the "first click does nothing" symptom).
+        selfPlaying = false; $('selfplay').textContent = 'Self-play ▶';
+        scanning = false; $('rscan').textContent = 'Scan 🔎';
+        setBotState('error', 'run');
       };
     }
     if (!kataInited) {
@@ -403,6 +424,7 @@
       catch (e) { throw new Error('net "' + netKey + '" not bundled — re-run build-eval.sh' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with $B20_NET / $B18_NET')); }
       kataInfo = await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText, forceCpu: qs.has('cpu'), fp16: qs.has('fp16') }, [wasmBuf]);
       kataInited = true;
+      await applyStrength();   // apply the current strength selection to the fresh engine
     }
     return kataInfo;
   }
@@ -457,8 +479,9 @@
         <span>${(c.wr * 100).toFixed(1)}% · ${(c.score >= 0 ? '+' : '') + c.score.toFixed(1)} · ${c.visits.toLocaleString()}v${sig}</span></div>`;
     }).join('');
   }
-  async function kataThink() {
+  async function kataThink(opts) {
     if (!ready) return null;
+    const noPonder = !!(opts && opts.noPonder);
     try {
       setBotState('searching…', 'run');
       $('searchout').textContent = 'KataGo: starting engine…';
@@ -467,11 +490,11 @@
       const ms = Math.max(100, parseInt($('ms').value) || 3000);
       const threads = Math.max(1, parseInt($('threads').value) || 4);
       $('searchout').textContent = 'KataGo thinking…';
-      const r = await kataCall({ type: 'search', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), visits, ms, threads });
+      const r = await kataCall({ type: 'search', moves: engineMoves().slice(0, MAXMV), toPlay, komi: komiVal(), visits, ms, threads, noPonder });
       if (r.superseded) return null;   // a newer request took over and owns the panel now
       lastSearch = r;                  // remember for training-data capture (self-play)
       renderMetrics(r, threads);
-      setBotState('pondering…', 'live');   // the engine keeps thinking in the background
+      setBotState(noPonder ? 'idle' : 'pondering…', noPonder ? '' : 'live');  // self-play: no between-move ponder
       $('searchout').innerHTML = `KataGo: <b>${ptName(r.best)}</b> · ${(r.wr * 100).toFixed(1)}% · ${r.nv} visits · ${r.nps.toLocaleString()}/s · ${threads}t${r.reused ? ' · reused' : ''}`;
       searchBest = r.best; drawOverlay();
       return r.best;
@@ -523,7 +546,7 @@
     trainRecord = [];                                // fresh game = fresh training record
     let passes = 0; const cap = N * N * 2;  // safety cap; normally ends on two passes
     while (selfPlaying && moves.length < cap) {
-      const mv = await kataThink();                 // search the current position
+      const mv = await kataThink({ noPonder: true });  // search the current position (no between-move ponder)
       if (!selfPlaying || mv === null) break;        // stopped, or error/superseded
       // capture the search as a training sample BEFORE playing: policy target = the visit
       // distribution over candidate moves; value target = the searched win-rate/score.

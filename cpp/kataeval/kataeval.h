@@ -106,6 +106,10 @@ int kgeInsights(float* out6);
 // Tree-averaged ownership heatmap (white-perspective, +1 = white), y*xLen+x indexed.
 // Copies up to cap points; returns the count written.
 int kgeOwnership(float* out, int cap);
+// Limit playing strength for the NEXT search. maxVisits<=0 keeps the per-request budget,
+// >0 caps it (fewer = weaker). chosenMoveTemp>0 samples a non-best move ~ visits^(1/T)
+// (higher = weaker, more human/varied). Both 0/off = full strength.
+void kgeSetStrength(int maxVisits, float chosenMoveTemp);
 
 const char* kgeError(void);       // last error message ("" if none)
 int kgeBoardSize(void);           // configured board size

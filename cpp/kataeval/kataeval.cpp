@@ -506,6 +506,18 @@ static std::atomic<bool> gSearchDone{true};
 static Loc gSearchBestLoc = Board::NULL_LOC;
 static Player gPollPla = P_BLACK;
 static int gPollReused = 0;
+// Strength limiting (kgeSetStrength): a visits cap and a move-selection temperature.
+// gStrMaxVisits > 0 caps the search depth; gStrChosenTemp > 0 makes the FINAL move be
+// sampled ~ visits^(1/T) instead of the max — non-best, more human/varied = weaker.
+static int gStrMaxVisits = 0;
+static float gStrChosenTemp = 0.0f;
+// Adjust playing strength. maxVisits <= 0 leaves the per-request budget alone; > 0 caps
+// it (fewer visits = weaker). chosenMoveTemp > 0 samples a non-best move ~ visits^(1/T)
+// (higher = weaker + more varied/human). Applied to the NEXT search.
+KATAEVAL_EXPORT void kgeSetStrength(int maxVisits, float chosenMoveTemp) {
+  gStrMaxVisits = maxVisits;
+  gStrChosenTemp = chosenMoveTemp > 0.0f ? chosenMoveTemp : 0.0f;
+}
 static void stopPonder() {
   if(gBot != nullptr) { gBot->stopAndWait(); gPondering = false; gSearchDone = true; }
 }
@@ -539,6 +551,12 @@ static std::mutex gSnapMutex;
 // point during the search — so getAnalysisData / appendPV are safe here.
 static void writeSnapshot(const Search* s) {
   Snap snap;
+  // EXCEPTION FIREWALL: this runs on KataGo's callbackLoopThread (asyncbot.cpp), which
+  // invokes us with NO try/catch WHILE the search worker threads mutate the tree. Any
+  // exception that escapes here unwinds out of the std::thread -> std::terminate() ->
+  // Aborted(). So we catch everything and simply skip publishing this frame — the reader
+  // keeps the last good snapshot. (This is the fix for the self-play "Aborted()" crash.)
+  try {
   const bool stmWhite = (gPollPla == P_WHITE);
   ReportedSearchValues vals;
   if(s->getRootValues(vals)) {
@@ -586,9 +604,10 @@ static void writeSnapshot(const Search* s) {
     for(size_t i = 0; i < own.size() && snap.ownLen < SNAP_MAXPTS; i++)
       snap.own[snap.ownLen++] = (float)own[i];
   } catch(...) { snap.ownLen = 0; }
+  } catch(...) { return; }  // firewall (see top): never let an exception escape this thread
   { std::lock_guard<std::mutex> lk(gSnapMutex); gSnap = snap; }
 }
-static void analyzeCb(const Search* s) { writeSnapshot(s); }
+static void analyzeCb(const Search* s) noexcept { writeSnapshot(s); }
 
 // Replay a move sequence into a fresh Board + BoardHistory (captures + ko/superko).
 static void replayLine(const int* moveLocs, const int* moveCols, int numMoves, double komi,
@@ -742,6 +761,14 @@ KATAEVAL_EXPORT int kgeSearchBegin(const int* moveLocs, const int* moveCols, int
     params.maxTime = maxTimeMs / 1000.0;
     params.maxVisitsPondering = 1000000000; params.maxTimePondering = 1e20;  // ponder runs until stopped
     params.numThreads = numSearchThreads > 0 ? numSearchThreads : 1;
+    // Strength limiting: cap visits and/or sample a weaker (non-best) move by temperature.
+    if(gStrMaxVisits > 0 && (int64_t)gStrMaxVisits < params.maxVisits) {
+      params.maxVisits = gStrMaxVisits; params.maxPlayouts = gStrMaxVisits;
+    }
+    if(gStrChosenTemp > 0.0f) {
+      params.chosenMoveTemperature = gStrChosenTemp;
+      params.chosenMoveTemperatureEarly = gStrChosenTemp;
+    }
     gBot->setParamsNoClearing(params);
 
     gSearchDone = false;
