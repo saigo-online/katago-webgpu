@@ -26,20 +26,25 @@ const char* const WGSL_KERNELS = R"WGSL(
 
 fn activate(x: f32, kind: u32) -> f32 {
   // ACTIVATION_*: 0=identity, 1=relu, 2=mish, 3=silu, 12=mish_scale8
+  // IMPORTANT: WGSL select(a,b,cond) evaluates BOTH a and b, so a "stable" branch guarded by
+  // select still computes exp(x) for large +x in the DEAD branch -> Inf. On Nvidia that
+  // discarded Inf is harmless, but Metal's fast-math (Apple GPUs) assumes no Inf/NaN and turns
+  // it into a NaN that poisons the whole activation (b18's bigger pre-activations trip this
+  // where g170 doesn't). So use overflow-FREE formulas — exp only ever sees <= 0 — which are
+  // mathematically identical for all finite inputs (no regression on any backend).
   if (kind == 1u) {
     return max(x, 0.0);
   } else if (kind == 2u) {
-    // mish(x) = x * tanh(softplus(x)); numerically-stable softplus.
-    let sp = select(log(1.0 + exp(x)), x + log(1.0 + exp(-x)), x > 20.0);
+    // mish(x) = x*tanh(softplus(x)); softplus(x) = max(x,0) + log1p(exp(-|x|)).
+    let sp = max(x, 0.0) + log(1.0 + exp(-abs(x)));
     return x * tanh(sp);
   } else if (kind == 3u) {
-    // silu(x) = x * sigmoid(x); stable two-sided sigmoid (avoids exp overflow).
-    let s = select(1.0 / (1.0 + exp(-x)), exp(x) / (1.0 + exp(x)), x < 0.0);
-    return x * s;
+    // silu(x) = x*sigmoid(x); sigmoid(x) = 0.5*(1 + tanh(0.5x)) — bounded, no exp overflow.
+    return x * 0.5 * (1.0 + tanh(0.5 * x));
   } else if (kind == 12u) {
-    // mish_scale8(x) = x * tanh(softplus(8x)) = mish(8x)/8 (fp16-stability rescale).
+    // mish_scale8(x) = x*tanh(softplus(8x)) = mish(8x)/8 (fp16-stability rescale).
     let z = 8.0 * x;
-    let sp = select(log(1.0 + exp(z)), z + log(1.0 + exp(-z)), z > 20.0);
+    let sp = max(z, 0.0) + log(1.0 + exp(-abs(z)));
     return x * tanh(sp);
   }
   return x;
@@ -993,7 +998,8 @@ fn swigluGate(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = gid.x;
   if (i >= swP.total) { return; }
   let a = f32(swA[i]);
-  let s = select(1.0 / (1.0 + exp(-a)), exp(a) / (1.0 + exp(a)), a < 0.0);
+  // SwiGLU gate = silu(a) = a*sigmoid(a); sigmoid via tanh — overflow-free on Metal (see activate()).
+  let s = 0.5 * (1.0 + tanh(0.5 * a));
   swOut[i] = STO(a * s * f32(swGate[i]));
 }
 
