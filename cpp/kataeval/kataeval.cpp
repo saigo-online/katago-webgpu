@@ -504,8 +504,13 @@ static std::atomic<bool> gSearchDone{true};
 static Loc gSearchBestLoc = Board::NULL_LOC;
 static Player gPollPla = P_BLACK;
 static int gPollReused = 0;
+// true only when the engine is STOPPED (no genMoveAsync / ponder actively mutating the
+// tree). Deep tree reads (appendPV / getAnalysisData) are only safe then — walking the
+// tree while search threads expand nodes can trap. Root values (getRootValues) stay
+// safe to poll live during search.
+static std::atomic<bool> gDeepReadOk{true};
 static void stopPonder() {
-  if(gBot != nullptr) { gBot->stopAndWait(); gPondering = false; gSearchDone = true; }
+  if(gBot != nullptr) { gBot->stopAndWait(); gPondering = false; gSearchDone = true; gDeepReadOk = true; }
 }
 
 static int locToIdx(Loc loc) {
@@ -671,9 +676,10 @@ KATAEVAL_EXPORT int kgeSearchBegin(const int* moveLocs, const int* moveCols, int
     gBot->setParamsNoClearing(params);
 
     gSearchDone = false;
+    gDeepReadOk = false;  // search threads about to mutate the tree — no deep reads
     gSearchBestLoc = Board::NULL_LOC;
     gBot->genMoveAsync(gPollPla, 0, TimeControls(), 1.0, [](Loc loc, int, Search*) {
-      gSearchBestLoc = loc; gSearchDone = true;
+      gSearchBestLoc = loc; gSearchDone = true; gDeepReadOk = true;  // search stopped: safe to read
     });
     return 1;
   } catch(const std::exception& e) { gErr = e.what(); return 0; }
@@ -696,7 +702,9 @@ KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
       if(winrateOut) *winrateOut = 0.5f; if(scoreOut) *scoreOut = 0.0f; if(visitsOut) *visitsOut = 0;
     }
     int pvLen = 0;
-    if(pvOut && pvCap > 0) {
+    // appendPV walks the tree — only safe when the engine is stopped (see gDeepReadOk).
+    // During an active search we return no PV (root values above stay live + safe).
+    if(pvOut && pvCap > 0 && gDeepReadOk.load()) {
       std::vector<Loc> pvBuf; std::vector<int64_t> vb, eb; std::vector<Loc> sl; std::vector<double> sv;
       if(s->getRootNode() != NULL) s->appendPV(pvBuf, vb, eb, sl, sv, s->getRootNode(), pvCap);
       for(size_t i = 0; i < pvBuf.size() && pvLen < pvCap; i++) pvOut[pvLen++] = locToIdx(pvBuf[i]);
@@ -716,6 +724,9 @@ KATAEVAL_EXPORT int kgePoll(int* bestOut, float* winrateOut, float* scoreOut,
 KATAEVAL_EXPORT int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
                                   float* winrateOut, float* scoreOut, float* priorOut) {
   if(gBot == nullptr) { gErr = "no engine"; return -1; }
+  // getAnalysisData walks the tree deeply — only safe when the engine is stopped.
+  // During an active search/ponder, report no candidates (return 0) rather than race.
+  if(!gDeepReadOk.load()) return 0;
   try {
     const Search* s = gBot->getSearch();
     std::vector<AnalysisData> buf;
@@ -738,13 +749,13 @@ KATAEVAL_EXPORT int kgeCandidates(int maxN, int* locsOut, int* visitsOut,
 
 KATAEVAL_EXPORT int kgePonderBegin() {  // real background ponder; poll to watch it climb
   if(gBot == nullptr) { gErr = "no engine"; return 0; }
-  try { gBot->ponder(); gPondering = true; return 1; }
+  try { gDeepReadOk = false; gBot->ponder(); gPondering = true; return 1; }  // ponder mutates the tree
   catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 
 KATAEVAL_EXPORT int kgeStopSearch() {  // stop search/ponder before a new request
   if(gBot == nullptr) return 1;
-  try { gBot->stopAndWait(); gPondering = false; gSearchDone = true; return 1; }
+  try { gBot->stopAndWait(); gPondering = false; gSearchDone = true; gDeepReadOk = true; return 1; }
   catch(const std::exception& e) { gErr = e.what(); return 0; }
 }
 #endif  // KGE_THREADS
