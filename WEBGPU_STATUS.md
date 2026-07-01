@@ -299,12 +299,43 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
      brings KataGo's actual heuristics + tree machinery (not the custom MCTS).
      Self-signed-cert worker quirks (wasm fetch, net fetch, nested `new Worker`) are
      tunneled via wasmBinary handoff / shared Cache API / `blob:` pthread spawn.
-   - *Next:* swap `Search` → **`AsyncBot`** for **tree reuse (`makeMove`) + ponder**;
-     then **Gumbel AlphaZero** selection (Danihelka 2022) for low-visit strength.
-     Consolidate the main-thread analysis engine into the same worker (one net load,
-     shared NN cache).
+   - ✅ **`AsyncBot`** swap — tree reuse (`makeMove`) + ponder + a snapshot-buffer
+     analysis stream (`kgePollAll`) are shipped; one worker hosts analysis + search
+     (one net load, shared cache). Live candidates, PV, ownership heatmap, LCB,
+     surprise/entropy, and a whole-game teaching-moment scanner ride on top.
    *(Done: conv + nested-bottleneck + the full transformer stack through v17 —
    RMSNorm, RoPE, grouped-query attention, SwiGLU, optimism/q-value policy.)*
+
+## SOTA roadmap — deferred, *validation-gated* (can't be verified in this repo's CI env)
+
+These three are the remaining "not SOTA" gaps from the code review. Each is
+**blocked on a validation environment this headless box doesn't have**, and shipping
+an *unvalidated* change to a playing engine is worse than not shipping it — so they're
+documented with a concrete plan rather than committed half-tested.
+
+1. **Gumbel-AlphaZero root selection** (Danihelka 2022) — *the* high-value item for the
+   browser's low-visit regime. Plan: at the root, **Gumbel-top-k** sample n actions from
+   the policy logits, then **sequential halving** over them against the visit budget
+   (replacing plain PUCT root selection); interior nodes keep PUCT. Not upstream in
+   KataGo, so it lands as a root controller around the `AsyncBot` search (or a
+   `SearchParams` mode). **Measure** button (visits-to-settle A/B, PUCT vs Gumbel) is the
+   metric. *Deferred:* correctness only shows up as *playing strength*, which needs an
+   in-browser A/B on real silicon — an unvalidated search can silently weaken play.
+
+2. **fp16 trunk for all nets** — fp16 **already works today for modern (mish_scale8)
+   nets** via the opt-in `kgeSetFp16` / demo toggle (the nets that matter for the browser,
+   e.g. b18nbt / the b5c192 in training). The only gap is *old g170* nets, whose trunk
+   overflows fp16's ±65504 and needs a per-handle **scale8 rescale**. *Deferred:* low
+   value (g170 is legacy) **and** any rescale must be re-validated **byte-exact vs Eigen on
+   a `shader-f16` GB10** — not reproducible on this software-Vulkan box.
+
+3. **Human-SL strength** ("play like rank X") — the real strength dial vs. the crude
+   visit-cap+temperature we ship now. The plumbing exists: `AsyncBot` already takes a
+   `humanEval` (we pass `NULL`) and `SearchParams` carries `humanSLProfile` +
+   `humanSLChosenMoveProp`. Plan: `kgeLoadHumanModel(path)` (a 2nd `NNEvaluator` as
+   `humanEval`) + `kgeSetHumanProfile("rank_5k")`. *Deferred:* needs the ~90 MB human-SL
+   net to load and can't be exercised hermetically (no net in CI, no browser) — adding
+   untestable exported engine code now would violate the "tests-with-everything" rule.
 
 ## Key source references (`cpp/`)
 
