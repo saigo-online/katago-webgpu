@@ -163,7 +163,7 @@ latency). Wins this pass (all byte-exact vs Eigen in fp32; same Dawn runs in-bro
 |--------|--------|------|
 | **single compute pass** for the whole forward pass (was one pass per op) | +9% (734 vs 674 @ t=16); also less encode CPU | `KGE_MULTIPASS` |
 | **fuse BN+act+mask into the Winograd input transform** (`winogradInputBnAct`) | 90→80 dispatches; +1.6% (also cuts encode CPU at high threads) | `KATAGO_WEBGPU_NO_FUSION` |
-| **batch+threads throughput** (`KGE_MAX_BATCH` 16→32, pool→33, demo threads → ~cores) | **t=4→t=32: 418→1814 nnEvals/s (4.3×)** — the dominant practical lever | — |
+| **batch+threads throughput** (`KGE_MAX_BATCH` 16, pool→33, demo threads → ~cores) | **t=4→t=32: 418→1814 nnEvals/s (4.3×)** — the dominant practical lever | — |
 
 Winograd re-confirmed **+80%** vs direct conv here (730 vs 405) — the FLOP cut wins
 even when launch-bound. `scripts/bench-webgpu.sh` reproduces the thread sweep; the

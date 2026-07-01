@@ -51,9 +51,12 @@ InputBuffers* gInputs = nullptr;
 int gXLen = 19, gYLen = 19, gModelVersion = 0;
 bool gUseNHWC = false;  // WebGPU wants NCHW (false); the Eigen CPU backend wants NHWC (true)
 std::string gErr = "";
-const int KGE_MAX_BATCH = 32;  // batched eval: per-batch GPU latency is ~fixed, so a
-                               // bigger batch (more search threads in flight) ~linearly
-                               // raises nnEvals/s. Validated to batch 64 natively.
+const int KGE_MAX_BATCH = 16;  // batched eval: per-batch GPU latency is ~fixed, so a
+                               // bigger batch (more in-flight search threads) raises
+                               // nnEvals/s — but the batch is thread-limited anyway, so
+                               // 16 matches 32 for <=16-core clients while halving the
+                               // intermediate buffers (big nets + batch 32 forced fragile
+                               // threaded-WASM memory growth -> "unaligned" trap on b18).
 
 // ---- Real KataGo engine (Path A): NNEvaluator + Search ---------------------
 std::string gModelPath;            // stashed by kgeLoad so the NNEvaluator can load it
@@ -474,7 +477,10 @@ static bool ensureKataEngine() {
     "kge", gModelPath, "", &kgeLogger(),
     KGE_MAX_BATCH, gXLen, gYLen,
     /*requireExactNNLen*/true, /*inputsUseNHWC*/false,  // WebGPU = NCHW
-    /*nnCacheSizePowerOfTwo*/20, /*nnMutexPoolSizePowerofTwo*/16,
+    /*nnCacheSizePowerOfTwo*/16, /*nnMutexPoolSizePowerofTwo*/14,  // 64K entries: plenty
+    // for browser searches (a few k visits), vs the desktop 1M that could reach GBs of
+    // cached NNOutputs (ownership+policy) on big nets — a prime cause of the fragile
+    // threaded-WASM memory growth that crashed b18.
     /*debugSkipNeuralNet*/false, /*homeDataDirOverride*/"",
     // fp32 by default — fp16 overflows the trunk on g170 nets (garbage); opt in via
     // kgeSetFp16 for fp16-stable (modern mish_scale8/silu) nets to get the ~2x win.
