@@ -65,6 +65,9 @@ int kgeSearch(const int* moveLocs, const int* moveCols, int numMoves,
 // kgeSearch root move selection: n<=0 = PUCT (default); n>0 = Gumbel-top-n + sequential
 // halving (Danihelka 2022), stronger at low visits. Typical n = 16. Applies to kgeSearch.
 void kgeSetGumbel(int n);
+// Policy optimism blend for modelVersion >= 12 nets. 0 = plain policy channel 0 (default);
+// >0 blends p + (pOpt - p)*optimism toward the optimistic policy. Applies to eval + search.
+void kgeSetPolicyOptimism(float v);
 
 // kgeEvalSeqKata: instant analysis through the SAME NNEvaluator that backs search (one
 // net load, shared cache). Returns probabilities: policyOut[hw+1] in [0,1] (illegal=-1,

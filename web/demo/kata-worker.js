@@ -32,7 +32,7 @@ let candLocPtr, candVisPtr, candWrPtr, candScPtr, candPrPtr, candLcbPtr, candRad
 let ownPtr;                                           // tree-ownership buffer
 let bPtr, pPtr, vPtr, oPtr;                           // analysis (kgeEvalSeqKata) buffers
 
-async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16) {
+async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16, optimism) {
   // The module is loaded via importScripts INTO this worker, so emscripten's
   // _scriptName would point at kata-worker.js — it would then spawn pthread workers
   // as new Worker('kata-worker.js') (re-running THIS file) instead of the pthread
@@ -54,6 +54,7 @@ async function init(netFile, boardSize, wasmBinary, jsText, forceCpu, fp16) {
   N = boardSize;
   if (forceCpu) M.ccall('kgeSetForceCpu', null, ['number'], [1]);  // ?cpu — Eigen fallback
   if (fp16) M.ccall('kgeSetFp16', null, ['number'], [1]);          // ?fp16 — opt-in fp16 (~2x, fp16-stable nets only)
+  if (optimism > 0) M.ccall('kgeSetPolicyOptimism', null, ['number'], [optimism]);  // ?optimism — v>=12 policy-optimism blend
   M.FS.writeFile('/model.bin.gz', new Uint8Array(await cachedNet(netFile)));
   const ok = await M.ccall('kgeLoad', 'number', ['string', 'number'], ['/model.bin.gz', N], { async: true });
   if (!ok) throw new Error('kgeLoad: ' + M.ccall('kgeError', 'string', [], []));
@@ -190,7 +191,7 @@ async function evalPos(req) {
 async function handleMessage(e) {
   const { id, type } = e.data;
   try {
-    if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText, e.data.forceCpu, e.data.fp16)) });
+    if (type === 'init') postMessage({ id, ok: true, ...(await init(e.data.netFile, e.data.boardSize, e.data.wasmBinary, e.data.jsText, e.data.forceCpu, e.data.fp16, e.data.optimism)) });
     else if (type === 'eval') {          // pollToken already bumped in onmessage (supersede)
       const r = await evalPos(e.data);
       const xfer = [r.board.buffer, r.policy.buffer, r.value.buffer]; if (r.owner) xfer.push(r.owner.buffer);

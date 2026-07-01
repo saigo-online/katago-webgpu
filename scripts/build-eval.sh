@@ -24,13 +24,13 @@ CFLAGS=( -O2 -fexceptions -DNO_GIT_REVISION -DHALF_ENABLE_CPP11_CFENV=0
 # (kataeval.js, no search sources, runs on the main thread).
 MANIFESTS=( kataeval/sources.txt )
 OUTNAME=kataeval
-EXPORTS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeSearch,_kgeSetGumbel,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_kgeSetFp16,_malloc,_free
+EXPORTS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeSearch,_kgeSetGumbel,_kgeSetPolicyOptimism,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_kgeSetFp16,_malloc,_free
 LINKEXTRA=( -sINITIAL_MEMORY=64MB )
 if [ "${MT:-0}" = 1 ]; then
   CFLAGS+=( -pthread -DKGE_THREADS )
   MANIFESTS+=( kataeval/sources-search.txt )
   OUTNAME=kataeval-mt
-  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePollAll,_kgePonderBegin,_kgeStopSearch,_kgeSetStrength"
+  EXPORTS="$EXPORTS,_kgeSearchKata,_kgeEvalSeqKata,_kgeSearchBegin,_kgePollAll,_kgePonderBegin,_kgeStopSearch,_kgeSetStrength,_kgeSetPolicyOptimism"
   # 512MB initial so big nets (b18/b20, loaded ~2x in CPU) fit WITHOUT triggering
   # threaded-WASM memory growth (a fragile path that traps with "unaligned accesses").
   LINKEXTRA=( -pthread -sPTHREAD_POOL_SIZE=33 -sINITIAL_MEMORY=512MB )  # 1 NN server + up to 32 search threads

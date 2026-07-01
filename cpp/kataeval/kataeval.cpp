@@ -65,6 +65,7 @@ std::string gModelPath;            // stashed by kgeLoad so the NNEvaluator can 
 bool gWantFp16 = false;            // opt-in fp16 (kgeSetFp16) — default off; fp16 overflows
                                    // the trunk on g170 nets, but is ~2x on fp16-stable nets
 int gGumbelN = 0;                  // kgeSearch root selection: 0 = PUCT; >0 = Gumbel-top-N + sequential halving
+float gPolicyOptimism = 0.0f;      // policy optimism blend for v>=12 nets (kgeSetPolicyOptimism); 0 = plain policy
 #ifdef KGE_THREADS
 NNEvaluator* gNNEval = nullptr;    // 1 server thread owns the WebGPU device (deferred init)
 AsyncBot* gBot = nullptr;          // KataGo's real engine: tree reuse (makeMove) + ponder
@@ -153,6 +154,10 @@ KATAEVAL_EXPORT void kgeSetFp16(int v) { gWantFp16 = (v != 0); }
 // kgeSearch root selection: n<=0 -> PUCT (default). n>0 -> Gumbel-top-n + sequential
 // halving (Danihelka 2022) — stronger at low visits. Typical n = 16.
 KATAEVAL_EXPORT void kgeSetGumbel(int n) { gGumbelN = n > 0 ? n : 0; }
+// Policy optimism blend for modelVersion >= 12 nets (an "optimism" policy channel). 0 =
+// plain policy (KataGo's default); >0 blends p + (pOpt - p)*optimism toward the optimistic
+// policy, widening move consideration. Applies to instant eval + the AsyncBot search.
+KATAEVAL_EXPORT void kgeSetPolicyOptimism(float v) { gPolicyOptimism = v > 0.0f ? v : 0.0f; }
 
 KATAEVAL_EXPORT int kgeLoad(const char* modelPath, int boardSize) {
   try {
@@ -201,7 +206,8 @@ static int evalBoardHist(const Board& board, const BoardHistory& hist, Player ne
   buf.rowGlobalBuf.resize(globalLen);
   buf.hasRowMeta = false;
   buf.symmetry = 0;
-  MiscNNInputParams nnInputParams;
+  buf.policyOptimism = gPolicyOptimism;   // the backend reads THIS for the v>=12 optimism blend
+  MiscNNInputParams nnInputParams; nnInputParams.policyOptimism = gPolicyOptimism;
   // modelVersion 8..17 -> inputs version 7 (encodes the last few moves + ko from hist)
   NNInputs::fillRowV7(board, hist, nextPla, nnInputParams, gXLen, gYLen,
                       gUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data());
@@ -238,12 +244,13 @@ static int evalBatch(const std::vector<const Board*>& boards,
   std::vector<NNResultBuf*> bufPtrs(B);
   std::vector<NNOutput> outs(B);
   std::vector<NNOutput*> outPtrs(B);
-  MiscNNInputParams nnInputParams;
+  MiscNNInputParams nnInputParams; nnInputParams.policyOptimism = gPolicyOptimism;
   for(int i = 0; i < B; i++) {
     bufs[i].rowSpatialBuf.resize(spatialLen);
     bufs[i].rowGlobalBuf.resize(globalLen);
     bufs[i].hasRowMeta = false;
     bufs[i].symmetry = 0;
+    bufs[i].policyOptimism = gPolicyOptimism;   // the backend reads THIS for the v>=12 optimism blend
     NNInputs::fillRowV7(*boards[i], *hists[i], plas[i], nnInputParams, gXLen, gYLen,
                         gUseNHWC, bufs[i].rowSpatialBuf.data(), bufs[i].rowGlobalBuf.data());
     bufPtrs[i] = &bufs[i];
@@ -790,7 +797,7 @@ KATAEVAL_EXPORT int kgeEvalSeqKata(const int* moveLocs, const int* moveCols, int
     stopPonder();
     Board board; BoardHistory hist;
     buildBoardHist(moveLocs, moveCols, numMoves, komi, board, hist);
-    MiscNNInputParams nnInputParams;
+    MiscNNInputParams nnInputParams; nnInputParams.policyOptimism = gPolicyOptimism;
     NNResultBuf buf;
     gNNEval->evaluate(board, hist, (Player)toPla, nnInputParams, buf,
                       /*skipCache*/false, /*includeOwnerMap*/ownerOut != nullptr);
@@ -855,6 +862,7 @@ static bool prepareSearch(const int* moveLocs, const int* moveCols, int numMoves
   if(chosenT > 0.0f) { params.chosenMoveTemperature = chosenT; params.chosenMoveTemperatureEarly = chosenT; }
   float polT = gStrPolicyTemp.load();
   if(polT > 0.0f && polT != 1.0f) { params.rootPolicyTemperature = polT; params.rootPolicyTemperatureEarly = polT; }
+  if(gPolicyOptimism > 0.0f) { params.policyOptimism = gPolicyOptimism; params.rootPolicyOptimism = gPolicyOptimism; }
   gBot->setParamsNoClearing(params);  // keep the reused tree
   return true;
 }

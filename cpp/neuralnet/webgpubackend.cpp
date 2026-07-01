@@ -1393,11 +1393,25 @@ void NeuralNet::getOutput(
   for(int row = 0; row < batchSize; row++) {
     NNOutput* output = outputs[row];
     const int symmetry = inputBufs[row]->symmetry;
+    // Policy channels are CHANNEL-MAJOR (NCHW): ch0 = policySrc[0..hw), ch1 (optimism,
+    // modelVersion >= 12) = policySrc[hw..2hw). Optimism blend p + (pOpt - p)·optimism —
+    // identical to eigenbackend.cpp. npc==1 nets (no optimism channel) just take ch0.
     const float* policySrc = policyHost.data() + (size_t)row*numPolicyChannels*hw;
     const float* passSrc = policyPassHost.data() + (size_t)row*numPolicyChannels;
-    SymmetryHelpers::copyOutputsWithSymmetry(policySrc, output->policyProbs, 1, nnYLen, nnXLen, symmetry);
-    output->policyProbs[nnXLen*nnYLen] = passSrc[0];
-    output->policyOptimismUsed = 0.0f;
+    const float policyOptimism = (float)inputBufs[row]->policyOptimism;
+    const bool hasOptimism = (numPolicyChannels == 2) || (numPolicyChannels == 4 && modelVersion >= 16);
+    if(hasOptimism && policyOptimism != 0.0f) {
+      std::vector<float> blended(hw);
+      const float* pCh = policySrc; const float* pOptCh = policySrc + hw;
+      for(int i = 0; i < hw; i++) blended[i] = pCh[i] + (pOptCh[i] - pCh[i]) * policyOptimism;
+      SymmetryHelpers::copyOutputsWithSymmetry(blended.data(), output->policyProbs, 1, nnYLen, nnXLen, symmetry);
+      output->policyProbs[nnXLen*nnYLen] = passSrc[0] + (passSrc[1] - passSrc[0]) * policyOptimism;
+      output->policyOptimismUsed = policyOptimism;
+    } else {
+      SymmetryHelpers::copyOutputsWithSymmetry(policySrc, output->policyProbs, 1, nnYLen, nnXLen, symmetry);
+      output->policyProbs[nnXLen*nnYLen] = passSrc[0];
+      output->policyOptimismUsed = 0.0f;
+    }
 
     const float* v = valueHost.data() + (size_t)row*numValueChannels;
     output->whiteWinProb = v[0];

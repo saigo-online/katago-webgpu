@@ -23,7 +23,7 @@ const M = await createKata();
 const need = [
   '_kgeLoad', '_kgeSetForceCpu', '_kgeSetFp16', '_kgeBackendIsGpu', '_kgeModelVersion',
   '_kgeSearchBegin', '_kgePollAll', '_kgePonderBegin', '_kgeStopSearch',
-  '_kgeSetStrength', '_kgeEvalSeqKata',
+  '_kgeSetStrength', '_kgeSetPolicyOptimism', '_kgeEvalSeqKata',
 ];
 const missing = need.filter(s => typeof M[s] !== 'function');
 if (missing.length) fail('MT build missing exports: ' + missing.join(', '));

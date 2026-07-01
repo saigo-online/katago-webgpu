@@ -424,7 +424,7 @@
       ]);
       try { await cachedNet(NETS[netKey].file, m => $('status').textContent = m); }
       catch (e) { throw new Error('net "' + netKey + '" not bundled — re-run build-eval.sh' + (netKey === 'b6c96' || netKey === 'b10c128' ? '' : ' with $B20_NET / $B18_NET')); }
-      kataInfo = await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText, forceCpu: qs.has('cpu'), fp16: qs.has('fp16') }, [wasmBuf]);
+      kataInfo = await kataCall({ type: 'init', netFile: NETS[netKey].file, boardSize: N, wasmBinary: wasmBuf, jsText, forceCpu: qs.has('cpu'), fp16: qs.has('fp16'), optimism: parseFloat(qs.get('optimism')) || 0 }, [wasmBuf]);
       kataInited = true;
       await applyStrength();   // apply the current strength selection to the fresh engine
     }
