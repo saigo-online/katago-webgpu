@@ -148,7 +148,10 @@ async function search(req, token) {
   const final = { ...s, threads, ms: Math.round(performance.now() - t0),
     nps: (performance.now() - t0) > 0 ? Math.round(s.nv / ((performance.now() - t0) / 1000)) : 0 };
 
-  // ponder phase: real background ponder, polled live (detached so search() resolves now)
+  // ponder phase: real background ponder, polled live (detached so search() resolves now).
+  // Skipped for scans (req.noPonder) — a whole-game sweep wants each position's final
+  // number, not a trailing ponder that would spam progress and burn cycles.
+  if (req.noPonder) return final;
   M.ccall('kgePonderBegin', 'number', [], []);
   (async () => {
     const pt0 = performance.now();

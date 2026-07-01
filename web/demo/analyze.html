@@ -84,8 +84,10 @@
     <div class="row">
       Review SGF: <input type="file" id="sgffile" accept=".sgf,application/x-go-sgf" style="width:150px">
       <button id="rfirst" title="first">⏮</button><button id="rprev" title="prev move">◀</button><button id="rnext" title="next move">▶</button><button id="rlast" title="last">⏭</button>
+      <button id="rscan" title="Scan the whole game — flag mistakes (win-rate swings) &amp; tricky spots (policy surprise)">Scan 🔎</button>
       <span class="muted mono" id="reviewinfo"></span>
     </div>
+    <div id="scanflags" class="mono" style="font-size:12px; margin-top:4px;"></div>
     <div class="row muted" id="adapter">adapter: –</div>
     <div class="row muted">Powered by <span class="mono">kataeval</span> (cpp/kataeval) — the clean
       KataGo-eval dependency compiled to WASM. Same forward pass that's validated byte-identical
@@ -582,6 +584,7 @@
       loc: (m.co.length === 2 && m.co !== 'tt') ? (m.co.charCodeAt(1) - 97) * N + (m.co.charCodeAt(0) - 97) : -1,
       col: m.col,
     }));
+    scanFlags = null; renderScanFlags();  // flags from a prior game no longer apply
     setReviewCursor(reviewLine.length);   // jump to the final position; use ◀ ▶ to step
   }
   $('sgffile').onchange = (e) => {
@@ -592,6 +595,69 @@
   $('rprev').onclick = () => setReviewCursor(moves.length - 1);
   $('rnext').onclick = () => setReviewCursor(moves.length + 1);
   $('rlast').onclick = () => reviewLine && setReviewCursor(reviewLine.length);
+
+  // --- auto-flag teaching moments: scan the whole game with a bounded search per
+  // position, then flag (a) mistakes = win-rate swings against the mover, and (b) tricky
+  // spots = high policy surprise (search disagreeing with the raw net). Click to jump. ---
+  const SCAN_VISITS = 120;          // per-position budget — coarse but enough to rank moves
+  const MISTAKE_WR = 0.10, BLUNDER_WR = 0.20, TRICKY_SURPRISE = 1.0;  // thresholds
+  let scanFlags = null, scanning = false;
+  const tpAfter = k => { let t = hc > 0 ? 2 : 1; for (let i = 0; i < k; i++) t = t === 1 ? 2 : 1; return t; };
+  async function scanGame() {
+    const line = reviewLine || moves.slice();
+    if (scanning) { scanning = false; return; }                 // toggle-cancel
+    if (!line.length) { $('reviewinfo').textContent = 'load an SGF (or play a game) first'; return; }
+    scanning = true; $('rscan').textContent = 'Stop ⏹';
+    try {
+      await ensureKataWorker();
+      const threads = Math.max(1, parseInt($('threads').value) || 4);
+      setBotState('scanning…', 'run');
+      const L = line.length, wrB = new Array(L + 1), sur = new Array(L + 1);
+      for (let k = 0; k <= L && scanning; k++) {
+        const seq = hcMoves.concat(line.slice(0, k)).slice(0, MAXMV);
+        const tp = tpAfter(k);
+        const r = await kataCall({ type: 'search', moves: seq, toPlay: tp, komi: komiVal(), visits: SCAN_VISITS, ms: 20000, threads, noPonder: true });
+        if (!r || r.superseded || !scanning) { setBotState('idle'); break; }
+        wrB[k] = tp === 1 ? r.wr : 1 - r.wr;   // Black's win prob at position k (absolute)
+        sur[k] = r.surprise || 0;              // surprise AT this decision point
+        $('reviewinfo').textContent = `scanning ${k}/${L}…`;
+      }
+      if (!scanning) return;
+      // Attribute each move: mover = who played move k = side to move at position k-1.
+      scanFlags = [];
+      for (let k = 1; k <= L; k++) {
+        if (wrB[k] == null || wrB[k - 1] == null) continue;
+        const mover = tpAfter(k - 1);
+        const before = mover === 1 ? wrB[k - 1] : 1 - wrB[k - 1];  // mover's winprob before their move
+        const after  = mover === 1 ? wrB[k]     : 1 - wrB[k];      // …and after
+        scanFlags.push({ k, mover, swing: before - after, surprise: sur[k - 1] || 0 });
+      }
+      renderScanFlags();
+      setBotState('idle');
+    } catch (e) {
+      setBotState('error', 'run'); $('reviewinfo').innerHTML = 'scan failed: <span class="bad">' + (e.message || e) + '</span>';
+    } finally { scanning = false; $('rscan').textContent = 'Scan 🔎'; }
+  }
+  function renderScanFlags() {
+    const el = $('scanflags'); if (!scanFlags) { el.innerHTML = ''; return; }
+    const nm = m => m === 1 ? 'B' : 'W';
+    const items = scanFlags.map(f => {
+      let kind = null, weight = 0;
+      if (f.swing >= MISTAKE_WR) { kind = f.swing >= BLUNDER_WR ? 'blunder' : 'mistake'; weight = 100 + f.swing; }
+      else if (f.surprise >= TRICKY_SURPRISE) { kind = 'tricky'; weight = f.surprise; }
+      return kind ? { ...f, kind, weight } : null;
+    }).filter(Boolean).sort((a, b) => b.weight - a.weight).slice(0, 12);
+    if (!items.length) { el.innerHTML = '<span class="muted">no notable mistakes or tricky spots — clean game</span>'; return; }
+    const color = k => k === 'blunder' ? '#e05555' : k === 'mistake' ? '#e0a020' : '#4aa3e0';
+    el.innerHTML = '<span class="muted">teaching moments (click to jump):</span><br>' + items.map(f => {
+      const label = f.kind === 'tricky'
+        ? `#${f.k} ${nm(tpAfter(f.k - 1))} tricky · surprise ${f.surprise.toFixed(1)}`
+        : `#${f.k} ${nm(f.mover)} ${f.kind} · −${(f.swing * 100).toFixed(0)}%`;
+      return `<a href="#" data-k="${f.k}" style="color:${color(f.kind)}; text-decoration:none; display:inline-block; margin:1px 8px 1px 0;">◆ ${label}</a>`;
+    }).join('');
+    el.querySelectorAll('a[data-k]').forEach(a => a.onclick = (ev) => { ev.preventDefault(); setReviewCursor(+a.dataset.k); });
+  }
+  $('rscan').onclick = scanGame;
 
   // Standard SGF from the move list (coords a–s, row a = top, matching the board).
   function gameSGF() {
