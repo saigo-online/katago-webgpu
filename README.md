@@ -16,7 +16,10 @@ The same hand-written **WGSL** kernels run two places:
 > (b18c384nbt), **and transformer** nets (attention + RoPE + SwiGLU + RMSNorm,
 > incl. grouped-query attention and optimism/q-value policy) — all **validated
 > byte-identical to KataGo's Eigen CPU reference**. A real, working backend, not a
-> mock. See [`WEBGPU_STATUS.md`](WEBGPU_STATUS.md) for the engineering log.
+> mock. The threaded WASM build (`MT=1`) additionally runs KataGo's **real Search**
+> (`NNEvaluator` + `AsyncBot` — tree reuse, ponder, batched eval) in a Web Worker, so
+> the browser gets analysis *and* play, not just single-position eval. See
+> [`WEBGPU_STATUS.md`](WEBGPU_STATUS.md) for the engineering log.
 
 ---
 
@@ -65,11 +68,18 @@ they agree.
   masked softmax, and **SwiGLU** feed-forward. All byte-identical to Eigen.
 - **Validated** — byte-identical to the Eigen CPU backend on the per-op tests
   (`runnnlayertests`) and full-net evaluation; the GPU and CPU WASM paths agree.
-- **Tuned** — 1×1 fast conv, persistent weight upload, per-handle buffer pooling,
-  one command submit per eval, and a single coalesced readback (~+31% eval
-  throughput over the first working version).
-- **fp16 storage path** — uses `shader-f16` when the adapter exposes it, else
-  falls back to fp32 (one kernel source, a storage-type alias).
+- **Tuned** — profiled on a GB10 as *latency-bound* (per-op GPU launch/barrier
+  overhead dominates, ~7ms/batch fixed): **Winograd F(2,3)** for 3×3 convs (**+80%**
+  vs direct), BN+act fused into the Winograd input transform, **one compute pass** +
+  one Submit + one coalesced readback per eval, 1×1 fast conv, persistent weights +
+  per-handle buffer pool, and **batch/thread scaling** (a bigger batch amortizes the
+  fixed latency — native t=4→32: **418→1814 nnEvals/s**; the demo auto-scales threads
+  to your cores). Profiling + numbers + ranked next wins in `WEBGPU_STATUS.md`;
+  reproduce with `scripts/bench-webgpu.sh`.
+- **fp16 storage path** — `shader-f16` when available, but **fp32 by default**: fp16
+  overflows the trunk to garbage on g170 nets (needs a scale8-style rescale, not done
+  yet). Opt in per net via `kgeSetFp16` / the demo's `fp16` toggle for fp16-stable
+  (modern mish_scale8/silu) nets to get the ~2× win.
 - **`kataeval`** — a clean, single dependency (one header, one source manifest)
   wrapping the minimal KataGo subset needed to load a model and evaluate a
   position. No search, no GTP, no `command/`.
@@ -128,11 +138,16 @@ README-KATAGO-UPSTREAM.md   the original KataGo README
   policy. Still **rejected with a clear error** (not silently mis-evaluated): the
   **SGF-metadata encoder** (`metaEncoderVersion ≠ 0` — train without it) and
   **grouped** RMSNorm (`cgroupSize ≠ 0`).
-- **Demo**: plays a real game — moves are replayed through KataGo's rules (captures,
-  ko/superko) and fed to the net as history; score is approximate; 19×19, Tromp-Taylor.
-- **Perf**: direct convs (no Winograd yet). b6c96 is fast but weak; b20c256
-  (23.5M params, ~9 dan) is strong but an 87 MB download and slower per eval —
-  pick per your hardware.
+- **Demo**: a full browser analysis/play/review app — instant policy+value+ownership,
+  KataGo's **real threaded search** (tree reuse, ponder, live candidate moves + a PV
+  "train of thought" board, streamed metrics), **self-play → SGF** + training-data
+  export, **SGF review** (step through with per-move analysis), and **9/13/19 +
+  handicap + komi**. Moves replay through KataGo's rules (captures, ko/superko); score
+  is approximate; Tromp-Taylor.
+- **Perf**: Winograd 3×3 + fused BN/act + single compute pass; profiled *latency-bound*
+  so `nnEvals/s` scales with batch/threads (auto-scaled to your cores). fp16 is opt-in
+  (fp32 default). b6c96 is fast but weak; bigger nets are stronger but larger downloads
+  and slower per eval — pick per your hardware. See `WEBGPU_STATUS.md`.
 
 ## Credits & license
 
