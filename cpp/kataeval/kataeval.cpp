@@ -279,27 +279,51 @@ KATAEVAL_EXPORT int kgeEval(const int* stones, int pla, double komi,
   }
 }
 
-// Move-sequence eval: replays moves through BoardHistory (captures + ko/superko +
-// the recent-move input features), writes the resulting board to boardOut (0 empty,
-// 1 black, 2 white, row-major), then evaluates for player toPla. moveLocs[i] is
-// y*boardSize+x, or < 0 for a pass; moveCols[i] is 1 (black) / 2 (white).
+// Build a Board + BoardHistory from a flat move list — the ONE replay used by every
+// eval/search entry, so all paths agree. Handles handicap setup: a leading run of >= 2
+// same-color stones is placed as SETUP, not as moves, because after the first stone it's
+// the other player's turn and isLegal() rejects an out-of-turn move (boardhistory.cpp) —
+// replaying them as moves would drop all but the first. Mirrors KataGo's placeFreeHandicap
+// (gtp.cpp): place the stones, then start the history with the opponent to move. moveLocs[i]
+// is y*xLen+x (or < 0 for a pass); moveCols[i] is 1 (black) / 2 (white).
+static void buildBoardHist(const int* moveLocs, const int* moveCols, int numMoves, double komi,
+                           Board& board, BoardHistory& hist) {
+  Rules rules = Rules::getTrompTaylorish();
+  rules.komi = (float)komi;
+  board = Board(gXLen, gYLen);
+  auto toLoc = [](int mv) {
+    return (mv < 0) ? Board::PASS_LOC : Location::getLoc(mv % gXLen, mv / gXLen, gXLen);
+  };
+  int setup = 0;
+  while(setup < numMoves && moveLocs[setup] >= 0 && moveCols[setup] == moveCols[0]) setup++;
+  if(setup >= 2) {
+    Player hcPla = (Player)moveCols[0];
+    for(int i = 0; i < setup; i++) board.setStone(toLoc(moveLocs[i]), (Color)hcPla);
+    Player nextPla = (numMoves > setup) ? (Player)moveCols[setup] : getOpp(hcPla);
+    hist = BoardHistory(board, nextPla, rules, 0);
+    hist.setAssumeMultipleStartingBlackMovesAreHandicap(true);  // correct komi/score for handicap
+  } else {
+    setup = 0;
+    Player firstPla = (numMoves > 0) ? (Player)moveCols[0] : P_BLACK;
+    hist = BoardHistory(board, firstPla, rules, 0);
+  }
+  for(int i = setup; i < numMoves; i++) {
+    Loc loc = toLoc(moveLocs[i]);
+    Player pla = (Player)moveCols[i];
+    if(hist.isLegal(board, loc, pla)) hist.makeBoardMoveAssumeLegal(board, loc, pla, NULL);
+  }
+}
+
+// Move-sequence eval: replays moves (captures + ko/superko + the recent-move input
+// features), writes the resulting board to boardOut (0 empty, 1 black, 2 white, row-major),
+// then evaluates for player toPla.
 KATAEVAL_EXPORT int kgeEvalSeq(const int* moveLocs, const int* moveCols, int numMoves,
                                int toPla, double komi, int* boardOut,
                                float* policyOut, float* valueOut, float* ownerOut) {
   if(gHandle == nullptr) { gErr = "not loaded"; return 0; }
   try {
-    Board board(gXLen, gYLen);
-    Rules rules = Rules::getTrompTaylorish();
-    rules.komi = (float)komi;
-    Player firstPla = (numMoves > 0) ? (Player)moveCols[0] : P_BLACK;
-    BoardHistory hist(board, firstPla, rules, 0);
-    for(int i = 0; i < numMoves; i++) {
-      Player pla = (Player)moveCols[i];
-      Loc loc = (moveLocs[i] < 0) ? Board::PASS_LOC
-                                  : Location::getLoc(moveLocs[i] % gXLen, moveLocs[i] / gXLen, gXLen);
-      if(hist.isLegal(board, loc, pla))
-        hist.makeBoardMoveAssumeLegal(board, loc, pla, NULL);
-    }
+    Board board; BoardHistory hist;
+    buildBoardHist(moveLocs, moveCols, numMoves, komi, board, hist);
     if(boardOut != nullptr)
       for(int y = 0; y < gYLen; y++)
         for(int x = 0; x < gXLen; x++)
@@ -362,16 +386,8 @@ KATAEVAL_EXPORT int kgeSearch(const int* moveLocs, const int* moveCols, int numM
     const int hw = gXLen * gYLen;
     const int topK = 32;
     const double cPUCT = 1.1;            // KataGo / AlphaZero exploration constant
-    Rules rules = Rules::getTrompTaylorish();
-    rules.komi = (float)komi;
-    Board rootBoard(gXLen, gYLen);
-    Player firstPla = (numMoves > 0) ? (Player)moveCols[0] : P_BLACK;
-    BoardHistory rootHist(rootBoard, firstPla, rules, 0);
-    for(int i = 0; i < numMoves; i++) {
-      Player pla = (Player)moveCols[i];
-      Loc loc = (moveLocs[i] < 0) ? Board::PASS_LOC : Location::getLoc(moveLocs[i] % gXLen, moveLocs[i] / gXLen, gXLen);
-      if(rootHist.isLegal(rootBoard, loc, pla)) rootHist.makeBoardMoveAssumeLegal(rootBoard, loc, pla, NULL);
-    }
+    Board rootBoard; BoardHistory rootHist;
+    buildBoardHist(moveLocs, moveCols, numMoves, komi, rootBoard, rootHist);
     Player rootPla = (Player)toPla;
 
     SNode* root = new SNode();
@@ -610,18 +626,10 @@ static void writeSnapshot(const Search* s) {
 static void analyzeCb(const Search* s) noexcept { writeSnapshot(s); }
 
 // Replay a move sequence into a fresh Board + BoardHistory (captures + ko/superko).
+// The threaded search reuses the same handicap-aware replay as the single-thread paths.
 static void replayLine(const int* moveLocs, const int* moveCols, int numMoves, double komi,
                        Board& board, BoardHistory& hist) {
-  Rules rules = Rules::getTrompTaylorish();
-  rules.komi = (float)komi;
-  board = Board(gXLen, gYLen);
-  Player firstPla = (numMoves > 0) ? (Player)moveCols[0] : P_BLACK;
-  hist = BoardHistory(board, firstPla, rules, 0);
-  for(int i = 0; i < numMoves; i++) {
-    Loc loc = decodeLoc(moveLocs[i]);
-    Player pla = (Player)moveCols[i];
-    if(hist.isLegal(board, loc, pla)) hist.makeBoardMoveAssumeLegal(board, loc, pla, NULL);
-  }
+  buildBoardHist(moveLocs, moveCols, numMoves, komi, board, hist);
 }
 
 // Instant analysis via the shared NNEvaluator. Returns PROBABILITIES (distinct from
