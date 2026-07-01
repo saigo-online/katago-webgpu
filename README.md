@@ -26,8 +26,9 @@ The same hand-written **WGSL** kernels run two places:
 ## See it
 
 A playable goban that analyzes and plays using a real KataGo net, evaluated in
-*your* browser — pick the strength from the **net selector** (b6c96 → b10c128 →
-b20c256):
+*your* browser — pick the strength from the **net selector** (default **b5c192**, our
+tiny v17 nested-bottleneck+q net that beats g170-b6 ~81% on raw policy; then the g170
+family b6c96 → b10c128 → b20c256, and b18c384nbt):
 
 ```bash
 scripts/build-eval.sh        # compile the eval to WASM (emcc + emdawnwebgpu)
@@ -38,10 +39,11 @@ scripts/serve-demo-tls.sh    # serve over HTTPS (WebGPU needs a secure context)
 - **`analyze.html`** — place stones and watch the **policy** (move probabilities),
   **win-rate**, **score**, and **ownership** update live; **"Engine plays"** makes
   KataGo take its top move. The **net selector** swaps strength (defaults to
-  b10c128; `?net=b18c384nbt` for the strongest, a modelVersion-14 nested-bottleneck
-  net). Add **`?cpu`** to the URL to force the CPU backend and compare.
-  `build-eval.sh` bundles b6c96 + b10c128 from the repo's test models; the larger
-  b20c256 / b18c384nbt are opt-in via `$B20_NET` / `$B18_NET`.
+  **b5c192**, a v17 net with the optimism/q channels — `?optimism=` works on it;
+  `?net=b18c384nbt` for the biggest). Add **`?cpu`** to force the CPU backend and
+  compare. `build-eval.sh` bundles b5c192 (newest `export_b5_s*M` checkpoint, override
+  `$B5_NET`) + the g170 b6c96/b10c128 test models; b20c256 / b18c384nbt are opt-in via
+  `$B20_NET` / `$B18_NET`.
 - **`index.html`** — a lighter demo that runs the raw `conv2dNCHW` WGSL kernel as
   a live stone-influence map (proves the GPU pipeline without the full net).
 

@@ -72,11 +72,15 @@ emcc "${OBJS[@]}" --use-port=emdawnwebgpu -sUSE_ZLIB=1 \
 
 echo "==> built:"; ls -la "$ROOT/web/demo/$OUTNAME.js" "$ROOT/web/demo/$OUTNAME.wasm"
 
-# Bundle the demo nets (web/demo/model-*.bin.gz are gitignored, so regenerate
-# here for an out-of-the-box demo). The analyze.html net selector picks among
-# them via ?net=. All are g170, modelVersion 8 (plain residual + gpool) — the
-# family this backend supports — in increasing strength.
+# Bundle the demo nets (web/demo/model-*.bin.gz are gitignored, so regenerate here for an
+# out-of-the-box demo). The analyze.html net selector picks among them via ?net=.
 bundle() { [ -f "$1" ] && { cp "$1" "$ROOT/web/demo/$2"; echo "==> bundled $(basename "$1") -> web/demo/$2"; }; }
+# DEFAULT net: b5c192nbtv17q — our v17 nested-bottleneck+q net (tiny like b6, but beats
+# g170-b6 ~81% on raw policy / ~56% at 100v MCTS). Training is ongoing, so default to the
+# NEWEST exported checkpoint (auto-picks as new ones land); override with $B5_NET.
+: "${B5_NET:=$(ls -t /srv/nfs/fleet/katago-b6-train/run/export_b5_s*M/model.bin.gz 2>/dev/null | head -1)}"
+bundle "${B5_NET:-}" model-b5c192.bin.gz
+# g170 nets (modelVersion 8, plain residual + gpool) — kept for comparison.
 bundle "$ROOT/cpp/tests/models/g170-b6c96-s175395328-d26788732.bin.gz"     model-b6c96.bin.gz
 bundle "$ROOT/cpp/tests/models/g170e-b10c128-s1141046784-d204142634.bin.gz" model-b10c128.bin.gz
 # Stronger nets, not committed: supply via $B20_NET / $B18_NET, else skipped — the
