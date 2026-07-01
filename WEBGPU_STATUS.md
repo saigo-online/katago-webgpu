@@ -325,9 +325,20 @@ documented with a concrete plan rather than committed half-tested.
 2. **fp16 trunk for all nets** — fp16 **already works today for modern (mish_scale8)
    nets** via the opt-in `kgeSetFp16` / demo toggle (the nets that matter for the browser,
    e.g. b18nbt / the b5c192 in training). The only gap is *old g170* nets, whose trunk
-   overflows fp16's ±65504 and needs a per-handle **scale8 rescale**. *Deferred:* low
-   value (g170 is legacy) **and** any rescale must be re-validated **byte-exact vs Eigen on
-   a `shader-f16` GB10** — not reproducible on this software-Vulkan box.
+   overflows fp16's ±65504 and needs KataGo's **scale8 rescale**
+   (`ModelDesc::applyScale8ToReduceActivations`: ×1/8 activations + MISH→MISH_SCALE8, which
+   the WGSL `activate()` already implements as code 12; it self-gates to standard-trunk
+   mish nets). **Investigated + attempted, then reverted** — the blocker is not the trunk
+   rescale but its ÷8 *compensation*: `applyScale8` bumps `postProcessParams.
+   outputScaleMultiplier *= 8`, and the **`NNEvaluator` caches that multiplier from the
+   model desc at construction** (`nneval.cpp:142`), *before* any compute handle exists and
+   from the desc that is **shared with the Eigen fallback** (which must stay unscaled — it
+   asserts on MISH_SCALE8). So a per-handle scale8 copy makes the backend emit ÷8 outputs
+   that nneval (multiplier=1) never restores → *silent ÷8 garbage*. A correct fix must
+   thread the ×8 into nneval's cached copy without scaling the Eigen-shared desc, then be
+   **validated byte-exact via `runnnlayertests --fp16` on a `shader-f16` GB10** — which this
+   software-Vulkan box can't run at all. Low value (g170 is legacy) for real risk; deferred
+   with the precise plan captured in the ComputeHandle ctor comment.
 
 3. **Human-SL strength** ("play like rank X") — the real strength dial vs. the crude
    visit-cap+temperature we ship now. The plumbing exists: `AsyncBot` already takes a

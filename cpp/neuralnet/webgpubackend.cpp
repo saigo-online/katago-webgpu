@@ -131,8 +131,8 @@ struct LoadedModel {
     // for fp16 numerical range; we compute in fp32, and our WGSL activate() handles
     // plain mish/silu directly. Crucially, this LoadedModel/ModelDesc is SHARED with
     // the Eigen CPU fallback in the single dual-backend binary, and Eigen asserts on
-    // scaled activations (eigenbackend.cpp: "Eigen does not use scaled mish"). When
-    // the fp16 GPU path is properly validated, apply the rescale to a per-handle copy.
+    // scaled activations (eigenbackend.cpp: "Eigen does not use scaled mish"). See the
+    // ComputeHandle ctor for why the per-handle-copy fp16 approach is deferred.
   }
   LoadedModel() = delete;
   LoadedModel(const LoadedModel&) = delete;
@@ -805,6 +805,17 @@ struct ComputeHandle {
       maxBatchSize(maxBatchSize_),
       inputsUseNHWC(inputsUseNHWC_)
   {
+    // NOTE on fp16 for g170 nets (the "scale8 rescale", still deferred): KataGo's
+    // ModelDesc::applyScale8ToReduceActivations() (×1/8 activations + MISH→MISH_SCALE8,
+    // which the WGSL activate() already implements as code 12) keeps the trunk in fp16
+    // range, and it self-gates (no-op for RMSNorm/SiLU/transformer). BUT its ÷8 is undone
+    // by postProcessParams.outputScaleMultiplier *= 8, which the NNEvaluator caches from the
+    // model desc at CONSTRUCTION (nneval.cpp: postProcessParams = desc.postProcessParams) —
+    // BEFORE this handle exists and from the SHARED desc we must keep unscaled for the Eigen
+    // fallback. So a per-handle scale8 copy makes the backend emit ÷8 outputs that nneval
+    // (multiplier=1) never restores → silent garbage. Correct fix needs the multiplier
+    // plumbed into nneval's cached copy without scaling the Eigen-shared desc, and byte-exact
+    // validation on a shader-f16 GPU (runnnlayertests --fp16). See WEBGPU_STATUS.md.
     assertSupportedArchitectureOrThrow(*modelDesc);
     pool.ctx = context;  // weights/intermediates are uploaded lazily on first getOutput
   }
