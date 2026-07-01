@@ -204,7 +204,7 @@
   // The single engine lives in a worker (threaded kataeval-mt): analysis + search both
   // go through it — one net load, shared NN cache, main thread free. Declared up here
   // so the load block below (which calls ensureKataWorker) is past their TDZ.
-  let kataWorker = null, kataReqId = 0, kataInited = false, kataInfo = null;
+  let kataWorker = null, kataReqId = 0, kataInited = false, kataInfo = null, engineDead = false;
   const kataPending = new Map();
 
   // --- net selection (all g170, modelVersion 8 = supported), increasing strength ---
@@ -371,6 +371,7 @@
   // --- the worker engine: analysis + search off the main thread (needs isolation) ---
   function kataCall(msg, transfer) {
     return new Promise((resolve, reject) => {
+      if (engineDead) return reject(new Error('engine crashed — reload to try another net'));
       const id = ++kataReqId; kataPending.set(id, { resolve, reject });
       kataWorker.postMessage({ id, ...msg }, transfer || []);
     });
@@ -384,6 +385,7 @@
   }
   $('strength').onchange = applyStrength;
   async function ensureKataWorker() {
+    if (engineDead) throw new Error('engine crashed — reload to try another net');
     if (!self.crossOriginIsolated)
       throw new Error('page is not cross-origin isolated (COOP/COEP) — wasm threads unavailable');
     if (!kataWorker) {
@@ -400,14 +402,22 @@
         e.data.ok ? p.resolve(e.data) : p.reject(new Error(e.data.error));
       };
       kataWorker.onerror = (ev) => {
-        for (const p of kataPending.values()) p.reject(new Error('worker: ' + (ev.message || 'error')));
+        // A wasm abort/trap (e.g. a net that produces NaN or trips the threaded-WASM
+        // memory trap) fires this once PER pthread as they die — an unstoppable storm.
+        // Kill the worker on the first fatal error so it can't keep firing, reject
+        // everything pending, and surface ONE clean message instead of the console flood.
+        if (engineDead) return;
+        engineDead = true;
+        try { kataWorker.terminate(); } catch (_) {}
+        for (const p of kataPending.values()) p.reject(new Error('engine crashed: ' + (ev.message || 'fatal')));
         kataPending.clear();
-        // Reset toggle state so the NEXT click restarts cleanly. Without this, a crash
-        // mid-run leaves selfPlaying/scanning=true and the next click just toggles it off
-        // (the "first click does nothing" symptom).
         selfPlaying = false; $('selfplay').textContent = 'Self-play ▶';
         scanning = false; $('rscan').textContent = 'Scan 🔎';
-        setBotState('error', 'run');
+        setBotState('crashed', 'run');
+        $('status').innerHTML = 'engine: <span class="bad">crashed on this net</span> — ' +
+          (/nonfinite|unalign|Aborted/i.test(ev.message || '') ?
+            'the net produced NaN or ran out of threaded-WASM memory (common for big nets like b18 in-browser). Try a smaller net' :
+            (ev.message || 'fatal error')) + ' · <a href="#" onclick="location.reload()">reload</a>';
       };
     }
     if (!kataInited) {
