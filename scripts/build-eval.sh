@@ -24,7 +24,7 @@ CFLAGS=( -O2 -fexceptions -DNO_GIT_REVISION -DHALF_ENABLE_CPP11_CFENV=0
 # (kataeval.js, no search sources, runs on the main thread).
 MANIFESTS=( kataeval/sources.txt )
 OUTNAME=kataeval
-EXPORTS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeSearch,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_kgeSetFp16,_malloc,_free
+EXPORTS=_kgeLoad,_kgeEval,_kgeEvalSeq,_kgeEvalBatch,_kgeSearch,_kgeSetGumbel,_kgeError,_kgeBoardSize,_kgeModelVersion,_kgeBackendIsGpu,_kgeSetForceCpu,_kgeSetFp16,_malloc,_free
 LINKEXTRA=( -sINITIAL_MEMORY=64MB )
 if [ "${MT:-0}" = 1 ]; then
   CFLAGS+=( -pthread -DKGE_THREADS )

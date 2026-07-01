@@ -62,6 +62,9 @@ int kgeSearch(const int* moveLocs, const int* moveCols, int numMoves,
               int toPla, double komi, int maxVisits, double maxTimeMs,
               int* bestMoveOut, float* winrateOut,
               int* pvOut, int pvCap, int* pvLenOut, int* visitsOut);
+// kgeSearch root move selection: n<=0 = PUCT (default); n>0 = Gumbel-top-n + sequential
+// halving (Danihelka 2022), stronger at low visits. Typical n = 16. Applies to kgeSearch.
+void kgeSetGumbel(int n);
 
 // kgeEvalSeqKata: instant analysis through the SAME NNEvaluator that backs search (one
 // net load, shared cache). Returns probabilities: policyOut[hw+1] in [0,1] (illegal=-1,

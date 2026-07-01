@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <random>
 
 #include "../core/global.h"
 #include "../game/board.h"
@@ -63,6 +64,7 @@ const int KGE_MAX_BATCH = 16;  // batched eval: per-batch GPU latency is ~fixed,
 std::string gModelPath;            // stashed by kgeLoad so the NNEvaluator can load it
 bool gWantFp16 = false;            // opt-in fp16 (kgeSetFp16) — default off; fp16 overflows
                                    // the trunk on g170 nets, but is ~2x on fp16-stable nets
+int gGumbelN = 0;                  // kgeSearch root selection: 0 = PUCT; >0 = Gumbel-top-N + sequential halving
 #ifdef KGE_THREADS
 NNEvaluator* gNNEval = nullptr;    // 1 server thread owns the WebGPU device (deferred init)
 AsyncBot* gBot = nullptr;          // KataGo's real engine: tree reuse (makeMove) + ponder
@@ -136,6 +138,7 @@ int selectChildPUCT(const SNode* node, Player pla, double cPUCT) {
   }
   return bestIdx;
 }
+
 }  // namespace
 
 extern "C" {
@@ -147,6 +150,9 @@ KATAEVAL_EXPORT int kgeModelVersion(void) { return gModelVersion; }
 // Opt into fp16 for the threaded engine (call BEFORE the first eval/search). Default
 // off; only safe on fp16-stable nets (g170 overflow to garbage). See WEBGPU_STATUS.
 KATAEVAL_EXPORT void kgeSetFp16(int v) { gWantFp16 = (v != 0); }
+// kgeSearch root selection: n<=0 -> PUCT (default). n>0 -> Gumbel-top-n + sequential
+// halving (Danihelka 2022) — stronger at low visits. Typical n = 16.
+KATAEVAL_EXPORT void kgeSetGumbel(int n) { gGumbelN = n > 0 ? n : 0; }
 
 KATAEVAL_EXPORT int kgeLoad(const char* modelPath, int boardSize) {
   try {
@@ -380,6 +386,90 @@ KATAEVAL_EXPORT int kgeEvalBatch(const int* stonesBatch, const int* plas, int nu
 // KGE_MAX_BATCH leaves per NN forward pass (virtual loss diverges them).
 // Outputs: bestMoveOut[1] (y*N+x, -1 pass), winrateOut[1] (toPla win prob 0..1),
 // pvOut[<=pvCap] principal variation moves + pvLenOut[1], visitsOut[1].
+// One simulation for the Gumbel path: descend from the root, forcing the FIRST move to be
+// root child `forceRootChild`, then PUCT below; expand + eval the leaf and back up. Batch 1
+// (Gumbel runs in the low-visit regime, so a per-sim eval is acceptable).
+static void simulateForced(SNode* root, int forceRootChild, const Board& rootBoard,
+                           const BoardHistory& rootHist, Player rootPla, int topK, double cPUCT,
+                           float* polBuf, float* valBuf) {
+  Board board = rootBoard; BoardHistory hist = rootHist; Player pla = rootPla;
+  std::vector<SNode*> path; SNode* node = root; path.push_back(node);
+  bool first = true;
+  while(node->expanded) {
+    int ci = (first && forceRootChild >= 0) ? forceRootChild : selectChildPUCT(node, pla, cPUCT);
+    first = false;
+    if(ci < 0) break;
+    int mv = node->childMoves[ci];
+    Loc loc = (mv < 0) ? Board::PASS_LOC : Location::getLoc(mv % gXLen, mv / gXLen, gXLen);
+    hist.makeBoardMoveAssumeLegal(board, loc, pla, NULL);
+    pla = getOpp(pla);
+    if(!node->children[ci]) node->children[ci] = new SNode();
+    node = node->children[ci]; path.push_back(node);
+  }
+  std::vector<const Board*> bp{&board}; std::vector<const BoardHistory*> hp{&hist}; std::vector<Player> pl{pla};
+  evalBatch(bp, hp, pl, polBuf, valBuf);
+  double wu = whiteUtil(valBuf[0], valBuf[1], valBuf[2]);
+  if(!node->expanded) expandNode(node, polBuf, board, hist, pla, topK);
+  for(SNode* n : path) { n->valueSumWhite += wu; n->visits++; }
+}
+
+// Gumbel-AlphaZero root action selection (Danihelka et al. 2022, "Policy improvement by
+// planning with Gumbel"). Sample n candidate root actions via Gumbel-top-k on the policy
+// LOGITS, then run SEQUENTIAL HALVING over them under the visit budget, ranking each round by
+// g(a) + logit(a) + sigma(q̂(a)). At low visits this is markedly stronger + better-calibrated
+// than plain PUCT (which over-commits to the policy argmax). Returns the chosen root child
+// index. rootLogits are the raw policy logits for the root's children (same order).
+static int runGumbelRoot(SNode* root, const std::vector<float>& rootLogits, int nConsider,
+                         int maxVisits, const Board& rootBoard, const BoardHistory& rootHist,
+                         Player rootPla, int topK, double cPUCT, uint32_t seed,
+                         float* polBuf, float* valBuf) {
+  const int C = (int)root->childMoves.size();
+  if(C <= 0) return -1;
+  const double sign = (rootPla == P_WHITE) ? 1.0 : -1.0;
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> U(1e-12, 1.0);
+  std::vector<double> g(C);
+  for(int i = 0; i < C; i++) g[i] = -std::log(-std::log(U(rng)));   // Gumbel(0,1) noise
+  // Candidate set = top-m root actions by (logit + Gumbel).
+  std::vector<int> cand(C);
+  for(int i = 0; i < C; i++) cand[i] = i;
+  int m = std::min(std::max(1, nConsider), C);
+  std::partial_sort(cand.begin(), cand.begin() + m, cand.end(),
+    [&](int a, int b){ return rootLogits[a] + g[a] > rootLogits[b] + g[b]; });
+  cand.resize(m);
+  if(m == 1) {  // still spend the budget deepening the single candidate
+    for(int used = 0; used < maxVisits; used++)
+      simulateForced(root, cand[0], rootBoard, rootHist, rootPla, topK, cPUCT, polBuf, valBuf);
+    return cand[0];
+  }
+  const double cVisit = 50.0, cScale = 1.0;   // Danihelka's sigma monotone transform constants
+  int numRounds = std::max(1, (int)std::ceil(std::log2((double)m)));
+  auto qhat = [&](int ci) {                    // completed Q from the ROOT player's perspective, [-1,1]
+    SNode* c = root->children[ci];
+    return (c && c->visits > 0) ? sign * (c->valueSumWhite / c->visits) : 0.0;
+  };
+  int used = 0;
+  while((int)cand.size() > 1 && used < maxVisits) {
+    int mr = (int)cand.size();
+    int per = std::max(1, (int)std::floor((double)maxVisits / (double)(numRounds * mr)));
+    for(int a : cand)
+      for(int s = 0; s < per && used < maxVisits; s++) {
+        simulateForced(root, a, rootBoard, rootHist, rootPla, topK, cPUCT, polBuf, valBuf); used++;
+      }
+    double maxN = 0; for(int a : cand) { SNode* c = root->children[a]; if(c) maxN = std::max(maxN, (double)c->visits); }
+    double sigmaScale = (cVisit + maxN) * cScale;
+    std::sort(cand.begin(), cand.end(), [&](int a, int b){
+      return g[a] + rootLogits[a] + sigmaScale * qhat(a) > g[b] + rootLogits[b] + sigmaScale * qhat(b);
+    });
+    cand.resize((mr + 1) / 2);                 // keep the top half (ceil)
+  }
+  int winner = cand[0];
+  while(used < maxVisits) {                    // leftover budget -> deepen the survivor
+    simulateForced(root, winner, rootBoard, rootHist, rootPla, topK, cPUCT, polBuf, valBuf); used++;
+  }
+  return winner;
+}
+
 KATAEVAL_EXPORT int kgeSearch(const int* moveLocs, const int* moveCols, int numMoves,
                               int toPla, double komi, int maxVisits, double maxTimeMs,
                               int* bestMoveOut, float* winrateOut,
@@ -409,8 +499,23 @@ KATAEVAL_EXPORT int kgeSearch(const int* moveLocs, const int* moveCols, int numM
       root->visits++; totalVisits++;
     }
 
+    // Gumbel-AlphaZero root selection (kgeSetGumbel) — sample n root actions + sequential
+    // halving. Much stronger than PUCT in this exact low-visit regime. The root's child
+    // policy LOGITS (captured now, before polBuf is overwritten) drive the Gumbel scores.
+    int gumbelWinner = -1;
+    if(gGumbelN > 0 && !root->childMoves.empty()) {
+      std::vector<float> rootLogits(root->childMoves.size());
+      for(size_t i = 0; i < root->childMoves.size(); i++)
+        rootLogits[i] = (root->childMoves[i] >= 0) ? polBuf[root->childMoves[i]] : polBuf[hw];
+      gumbelWinner = runGumbelRoot(root, rootLogits, gGumbelN, std::max(0, maxVisits - 1),
+                                   rootBoard, rootHist, rootPla, topK, cPUCT,
+                                   0x9E3779B9u ^ (uint32_t)numMoves ^ ((uint32_t)maxVisits << 8),
+                                   polBuf.data(), valBuf.data());
+      totalVisits = root->visits;
+    }
+
     bool timeUp = false;
-    while(totalVisits < maxVisits && !timeUp) {
+    while(gumbelWinner < 0 && totalVisits < maxVisits && !timeUp) {
       int target = std::min(KGE_MAX_BATCH, maxVisits - totalVisits);
       std::vector<SNode*> leaves;
       std::vector<std::vector<SNode*>> paths;
@@ -447,12 +552,13 @@ KATAEVAL_EXPORT int kgeSearch(const int* moveLocs, const int* moveCols, int numM
       if(el >= maxTimeMs) timeUp = true;
     }
 
-    // Best move = most-visited root child.
-    int bestIdx = -1, bestVisits = -1;
-    for(size_t i = 0; i < root->children.size(); i++) {
-      int v = root->children[i] ? root->children[i]->visits : 0;
-      if(v > bestVisits) { bestVisits = v; bestIdx = (int)i; }
-    }
+    // Best move: the Gumbel winner if Gumbel ran, else the most-visited root child (PUCT).
+    int bestIdx = gumbelWinner, bestVisits = -1;
+    if(bestIdx < 0)
+      for(size_t i = 0; i < root->children.size(); i++) {
+        int v = root->children[i] ? root->children[i]->visits : 0;
+        if(v > bestVisits) { bestVisits = v; bestIdx = (int)i; }
+      }
     if(bestMoveOut) *bestMoveOut = (bestIdx >= 0) ? root->childMoves[bestIdx] : -1;
     if(visitsOut) *visitsOut = totalVisits;
     double rootWhite = root->visits > 0 ? root->valueSumWhite / root->visits : 0.0;
