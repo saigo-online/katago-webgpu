@@ -244,6 +244,8 @@ string Version::getKataGoVersionFullInfo() {
   out << "Using Metal backend" << endl;
 #elif defined(USE_OPENCL_BACKEND)
   out << "Using OpenCL backend" << endl;
+#elif defined(USE_WEBGPU_BACKEND)
+  out << "Using WebGPU backend" << endl;
 #elif defined(USE_EIGEN_BACKEND)
   out << "Using Eigen(CPU) backend" << endl;
 #else
@@ -280,6 +282,8 @@ string Version::getGitRevisionWithBackend() {
   s += "-metal";
 #elif defined(USE_OPENCL_BACKEND)
   s += "-opencl";
+#elif defined(USE_WEBGPU_BACKEND)
+  s += "-webgpu";
 #elif defined(USE_EIGEN_BACKEND)
   s += "-eigen";
 #else

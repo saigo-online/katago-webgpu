@@ -166,13 +166,12 @@ elseif(USE_BACKEND STREQUAL "EIGEN")
     )
 elseif(USE_BACKEND STREQUAL "WEBGPU")
   # ----------------------------------------------------------------------------
-  # Native WebGPU backend (via Dawn). SCAFFOLD — see engines/katago-web/WEBGPU_STATUS.md.
+  # Native WebGPU backend (via Dawn) — see engines/katago-web/WEBGPU_STATUS.md.
   # "Native" means it runs against Dawn's webgpu-native implementation on the
-  # desktop GPU; the exact same WGSL kernels are intended to also run in-browser
-  # once compiled with Emscripten (-sUSE_WEBGPU). The kernel port is in progress;
-  # this build links and runs the plumbing, and throws loudly where kernels are
-  # not yet ported rather than returning wrong NN outputs.
-  message(STATUS "-DUSE_BACKEND=WEBGPU, using native WebGPU (Dawn) backend. [scaffold — see WEBGPU_STATUS.md]")
+  # desktop GPU; the exact same WGSL kernels also run in-browser when compiled
+  # with Emscripten (scripts/build-eval.sh). Full architecture through
+  # modelVersion 17, validated against the Eigen CPU reference.
+  message(STATUS "-DUSE_BACKEND=WEBGPU, using native WebGPU (Dawn) backend.")
   set(NEURALNET_BACKEND_SOURCES
     neuralnet/webgpubackend.cpp
     neuralnet/webgpukernels.cpp

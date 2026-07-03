@@ -617,7 +617,9 @@ static bool ensureKataEngine() {
     /*debugSkipNeuralNet*/false, /*homeDataDirOverride*/"",
     // fp32 by default — fp16 overflows the trunk on g170 nets (garbage); opt in via
     // kgeSetFp16 for fp16-stable (modern mish_scale8/silu) nets to get the ~2x win.
-    gWantFp16 ? enabled_t::Auto : enabled_t::False,
+    // True (not Auto): the backend treats Auto as fp32 until the scale8 rescale is
+    // validated; True means "use fp16 if the adapter has shader-f16, else warn+fp32".
+    gWantFp16 ? enabled_t::True : enabled_t::False,
     /*numThreads (NN server)*/1, /*gpuIdxByServerThread*/std::vector<int>{-1},
     /*randSeed*/"kge-nneval", /*doRandomize*/false, /*defaultSymmetry*/0,
     /*disableWarmup*/true, cfg);

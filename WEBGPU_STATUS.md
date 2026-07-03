@@ -60,6 +60,66 @@ Two real bugs that this validation caught and fixed:
 - Head output buffers must be `CopySrc`-capable, or `wgReadFloats` silently reads
   zeros → a degenerate uniform policy.
 
+### 2026-07 hardening pass (code review vs the mature backends)
+
+Fixed:
+- **Native input-layout bug**: `setup.cpp` had no `USE_WEBGPU_BACKEND` case, so the
+  native build fell into the default `inputsUseNHWC = true` — NHWC inputs marshaled
+  into NCHW kernels, i.e. **every native `benchmark`/`gtp`/`evalsgf` eval was
+  scrambled garbage** (b6c96: W −99.99c / best move H19 vs Eigen's −2.10c / D15;
+  perf numbers were unaffected, which is why it went unnoticed — the wasm path passes
+  NCHW correctly and was always right). Now: `backendPrefix = "webgpu"` defaults to
+  NCHW, and the backend **throws on `inputsUseNHWC = true`** like OpenCL/TensorRT.
+  Verified: `evalsgf` is byte-identical to Eigen on b6c96 / b18c384nbt / b4c256nbttf.
+- **fp16 config semantics**: `useFP16 = auto` (the native default) used to silently
+  enable the not-yet-production-ready fp16 path on any shader-f16 adapter. Now Auto
+  = fp32 until the scale8 rescale ships; `useFP16 = true` (or `KATAGO_WEBGPU_FP16=1`)
+  is the explicit opt-in, with a logged warning + fp32 fallback when the adapter
+  lacks shader-f16 (the browser toggle must not hard-fail). kataeval's `kgeSetFp16`
+  passes `True` accordingly.
+- **The Eigen fallback is now real**: `createComputeContext` probes adapter
+  availability up front, so a no-WebGPU machine/browser throws where the kataeval
+  dispatcher catches it and falls back to CPU — instead of later on the NNEvaluator
+  server thread, where an escaped exception is `std::terminate` (the `da4b5f91`
+  abort-storm failure mode).
+- **One NN server thread per model, enforced**: `numNNServerThreadsPerModel > 1`
+  used to data-race the shared context (torn device init, unlocked pipeline cache,
+  two threads pumping one Dawn instance — a core dump in practice). Init and the
+  pipeline cache are now mutex-guarded, the `wgPump` flags are `std::atomic`, and a
+  second server thread gets a clear error naming the config key.
+- **Board-size bounds**: `createComputeContext` rejects `nnXLen/nnYLen >
+  NNPos::MAX_BOARD_LEN` (matches OpenCL); score-value channel mapping now asserts
+  the modelVersion↔numSV pairing like eigen/cuda/opencl.
+- **Perf/memory**: RoPE cos/sin tables are computed + uploaded **once per handle**
+  (were re-uploaded every eval, every attention block); all `KATAGO_WEBGPU_NO_*`
+  A/B flags are snapshotted once at static init (were `getenv` per eval — and per
+  *conv* for NO_WINOGRAD); the BufferPool now reuses a ≤2× larger free slot, so
+  varying search batch sizes share one working set instead of accumulating ~80
+  buffers per distinct batch size (an order-of-magnitude VRAM saving in the browser).
+
+**Full-parity round** (KataGo-convention alignment for upstream review):
+- `katago version` reports "Using WebGPU backend" and the git revision carries a
+  `-webgpu` suffix; `benchmark` prints a backend blurb like the others;
+  `TestCommon::overrideForBackends` forces NCHW for WEBGPU (so the test commands
+  can't feed NHWC); `webgpuUseFP16` works as a config key via the standard
+  `backendPrefix` mechanism.
+- **fp16 `testEvaluate*` hooks implemented** — `runnnlayertests` now runs each
+  per-op case in fp16 storage too when the adapter has shader-f16 (14
+  configurations vs 7 on this box, all passing within the harness's fp16
+  tolerance). Hooks return false only for NHWC or a no-f16 adapter.
+- **`requireExactNNLen` honored Metal-style**: the first eval verifies the mask
+  channel is all ones and throws on a violated promise (masking itself is kept —
+  correct either way; dropping the mask multiplies on exact-size boards remains a
+  perf TODO).
+- **Optimism blend now textually mirrors the reference backends** (always blend
+  when the optimism channel exists, `assert(numPolicyChannels == 1)` otherwise;
+  `policyOptimismUsed` left to NNEvaluator like the other backends).
+
+Validated after the round: `runnnlayertests` (14/14), `evalsgf` **identical to
+Eigen** on b6c96 / b18c384nbt / b4c256nbttf, fp16 e2e within 0.01c on b18,
+`benchmark` unchanged (~1850 nnEvals/s b6c96 t=8 on this box), both wasm builds +
+the full Node test suite (incl. the new `web/test-fallback.mjs`) green.
+
 ## Architecture
 
 | Layer | What | Where |
@@ -124,7 +184,8 @@ browser/GPU):
   failures, [crbug.com/42251215](https://crbug.com/42251215)); we opt in with the
   adapter toggle `vulkan_enable_f16_on_nvidia` (in `requestAdapterSync`). fp16
   storage + fp32 compute then matches Eigen within tolerance. Enable with
-  `KATAGO_WEBGPU_FP16=1` (or the caller's `useFP16Mode`).
+  `KATAGO_WEBGPU_FP16=1` or `useFP16 = true` (explicit opt-in only — `auto` means
+  fp32 until the scale8 rescale is validated).
 - **Selective-fp32 heads** (default on under fp16) — the trunk runs fp16 for the
   bandwidth win, then a `convF16ToF32` converts its output + mask and the trunk
   tip + policy/value heads run on a parallel **fp32** kernel module (the
@@ -261,6 +322,12 @@ or `localhost`, hence the TLS server (accept the self-signed cert once).
 - **Nets**: the full architecture through modelVersion 17 is supported. Still
   rejected with a clear error: the **SGF-metadata encoder** (`metaEncoderVersion ≠ 0`
   — train without it) and **grouped** RMSNorm (`cgroupSize ≠ 0`).
+- **Threads**: one NN server thread per model (`numNNServerThreadsPerModel = 1`,
+  the default) — a second server thread is rejected with a clear error rather than
+  racing the shared WebGPU device. Inputs are NCHW only (`inputsUseNHWC` rejected).
+- **Multi-GPU**: not supported — the standard WebGPU API requests one preferred
+  adapter; `gpuIdxs`/`gpuIdxForThisThread` are ignored and `printDevices` reports
+  the single default adapter.
 - **fp16**: the WebGPU load no longer applies the scale8 mish rescale — it's an
   fp16-only trick and the desc is shared with the Eigen CPU fallback (which asserts
   on scaled mish). When the fp16 GPU path is validated, apply scale8 to a per-handle

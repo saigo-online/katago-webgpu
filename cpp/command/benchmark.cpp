@@ -264,6 +264,11 @@ int MainCmds::benchmark(const vector<string>& args) {
   cout << "If you have a strong GPU capable of FP16 tensor cores (e.g. RTX2080), "
        << "using the Cuda version of KataGo instead may give a mild performance boost." << endl;
 #endif
+#ifdef USE_WEBGPU_BACKEND
+  cout << "You are currently using the WebGPU version of KataGo." << endl;
+  cout << "If a native backend (CUDA/TensorRT/OpenCL/Metal) is available for your GPU, "
+       << "it will likely be faster; WebGPU's strength is running the same code in the browser." << endl;
+#endif
 #ifdef USE_EIGEN_BACKEND
   cout << "You are currently using the Eigen (CPU) version of KataGo. Due to having no GPU, it may be slow." << endl;
 #endif

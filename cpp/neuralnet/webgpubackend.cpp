@@ -1,26 +1,25 @@
 // ============================================================================
-// Native WebGPU (Dawn) backend for KataGo.  SCAFFOLD.
+// Native WebGPU (Dawn) backend for KataGo.
 //
 // See engines/katago-web/WEBGPU_STATUS.md for the full status and roadmap.
 //
-// What works here:
-//   - Implements the whole NeuralNet:: interface so the target links.
-//   - Acquires a real native WebGPU device via Dawn, enumerates adapters,
-//     compiles the WGSL kernel module (webgpukernels.cpp).
-//   - Loads the model via KataGo's normal ModelDesc parser and uploads layer
-//     weights to GPU buffers.
-//   - Marshals MCTS inputs (spatial/global/meta, with symmetry) exactly like
-//     the OpenCL backend.
+// A complete NeuralNet:: backend in WGSL, running the full KataGo architecture
+// through modelVersion 17 (ordinary / global-pooling / nested-bottleneck /
+// transformer blocks; BatchNorm + RMSNorm; RoPE / GQA / SwiGLU; optimism +
+// q-value policy), validated byte-identical to the Eigen CPU reference in fp32.
+// The same code compiles natively (Dawn) and in-browser (emdawnwebgpu/WASM).
 //
-// What is NOT done yet (the multi-week port — tracked in WEBGPU_STATUS.md):
-//   - The forward-pass kernel graph: residual / global-pooling / nested-
-//     bottleneck / transformer blocks and the policy & value heads.
-//   - fp16 path, Winograd/1x1 fast convs, async readback batching, tuning.
+// Layout is NCHW throughout (inputs, kernels, mask); NHWC is rejected at
+// handle creation. fp16 is *storage-only* (fp32 compute) and opt-in
+// (useFP16 = true, or KATAGO_WEBGPU_FP16=1) — Auto means fp32 until the
+// scale8 trunk rescale is implemented + validated (see WEBGPU_STATUS.md).
 //
-// To avoid silently feeding wrong evaluations into the search, getOutput()
-// THROWS until the forward pass is implemented and validated against the
-// reference backends via the testEvaluate* hooks. This is intentional: a
-// throwing-but-honest backend beats a running-but-wrong one.
+// Perf structure: one command encoder + one Submit + one coalesced readback
+// per eval (WgRecorder); persistent weight/BN/Winograd/RoPE caches on the
+// handle; a per-handle BufferPool recycles intermediates across evals;
+// Winograd F(2,3) for 3x3 convs, tiled/register-tiled GEMMs, fused
+// BN+act+mask loads, flash attention, optional subgroup pooling. Each
+// optimization has a KATAGO_WEBGPU_NO_* / KGE_* env flag for A/B testing.
 // ============================================================================
 
 #include "../neuralnet/nninterface.h"
@@ -54,6 +53,8 @@
 #include <cstring>
 #include <chrono>
 #include <atomic>
+#include <mutex>
+#include <thread>
 #include <cstdlib>
 
 #include "../external/half-2.2.0/include/half.hpp"
@@ -77,10 +78,11 @@ static wgpu::Instance gInstance = nullptr;
 // emscripten_sleep(0) unwinds and yields to it (so WebGPU callbacks can fire)
 // then resumes — requires the build to enable Asyncify or JSPI. Keeping all
 // blocking waits behind this one helper is what makes the backend browser-ready.
-// `done` is volatile: it's flipped by a callback that ProcessEvents() invokes
-// synchronously, and without volatile the compiler — which can't see that
-// callback from inside this function — would hoist the load and spin forever.
-static inline void wgPump(volatile bool& done) {
+// `done` is atomic: it's flipped by a callback that ProcessEvents() invokes —
+// usually on this thread, but when several NNEvaluator server threads pump the
+// shared instance concurrently a callback can fire on a sibling thread, and a
+// plain (or volatile) bool would be a data race there.
+static inline void wgPump(std::atomic<bool>& done) {
 #ifdef __EMSCRIPTEN__
   while(!done) emscripten_sleep(0);
 #else
@@ -161,6 +163,16 @@ struct ComputeContext {
   bool useSubgroups = false;  // adapter supports the WebGPU subgroups feature
   bool initialized = false;   // device + shaders created yet? (deferred to the handle thread)
 
+  // Guards lazy init (createComputeHandle) and pipelineCache: several NNEvaluator
+  // server threads (numNNServerThreadsPerModel > 1) share this one context.
+  std::mutex mutex;
+  // The single thread allowed to evaluate on this context (the first to create a
+  // handle). WebGPU objects + the blocking wgPump event loop are not safe to
+  // drive from several threads at once; a second server thread gets a clear
+  // error instead of a data race (see createComputeHandle).
+  std::thread::id ownerThread;
+  bool hasOwner = false;
+
 #ifdef KATAGO_HAVE_WEBGPU
   wgpu::Device device;
   wgpu::Queue queue;
@@ -171,6 +183,7 @@ struct ComputeContext {
 
   wgpu::ComputePipeline getPipeline(const char* entryPoint, bool f32 = false) {
     std::string key = f32 ? (std::string(entryPoint) + "#f32") : entryPoint;
+    std::lock_guard<std::mutex> lock(mutex);
     auto it = pipelineCache.find(key);
     if(it != pipelineCache.end())
       return it->second;
@@ -215,7 +228,7 @@ static wgpu::Adapter requestAdapterSync(Logger* logger) {
   options.nextInChain = &toggles;
 #endif
   wgpu::Adapter result = nullptr;
-  volatile bool done = false;
+  std::atomic<bool> done{false};
   gInstance.RequestAdapter(
     &options, KGE_CB_MODE,
     [&](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView message) {
@@ -242,7 +255,7 @@ static wgpu::Device requestDeviceSync(const wgpu::Adapter& adapter, Logger* logg
   devDesc.requiredFeatureCount = feats.size();
   devDesc.requiredFeatures = feats.data();
   wgpu::Device result = nullptr;
-  volatile bool done = false;
+  std::atomic<bool> done{false};
   adapter.RequestDevice(
     &devDesc, KGE_CB_MODE,
     [&](wgpu::RequestDeviceStatus status, wgpu::Device device, wgpu::StringView message) {
@@ -275,10 +288,15 @@ static wgpu::Device acquireDevice(Logger* logger, bool wantFP16, bool& gotFP16, 
 static void initContextGpu(ComputeContext* context, Logger* logger) {
   if(!gInstance)
     NeuralNet::globalInitialize();
-  // fp16 storage (fp32 compute) when the caller asks, or KATAGO_WEBGPU_FP16=1 forces
-  // it for A/B testing. Needs an adapter exposing shader-f16 (see the NVIDIA toggle
-  // in requestAdapterSync); falls back to fp32 otherwise.
-  bool wantFP16 = (context->useFP16Mode != enabled_t::False) || (std::getenv("KATAGO_WEBGPU_FP16") != nullptr);
+  // fp16 storage (fp32 compute) only on EXPLICIT opt-in: useFP16Mode == True, or
+  // KATAGO_WEBGPU_FP16=1 (the A/B debug override). Auto deliberately means fp32 for
+  // now — the per-net scale8 rescale isn't implemented, so fp16 overflows g170 trunks
+  // to garbage and is a few centipoints off even on modern nets (see WEBGPU_STATUS.md);
+  // a silent Auto->fp16 default would degrade every net on a shader-f16 adapter.
+  // Needs an adapter exposing shader-f16 (see the NVIDIA toggle in requestAdapterSync);
+  // logs and falls back to fp32 otherwise (the browser demo's opt-in toggle must not
+  // hard-fail on adapters without f16).
+  bool wantFP16 = (context->useFP16Mode == enabled_t::True) || (std::getenv("KATAGO_WEBGPU_FP16") != nullptr);
   bool gotFP16 = false, gotSubgroups = false;
   context->device = acquireDevice(logger, wantFP16, gotFP16, gotSubgroups);
   context->useFP16 = gotFP16;
@@ -343,7 +361,7 @@ static void initContextGpu(ComputeContext* context, Logger* logger) {
     if(gotFP16)
       logger->write("WebGPU backend: fp16 storage ENABLED (shader-f16)");
     else if(wantFP16)
-      logger->write("WebGPU backend: fp16 requested but this adapter lacks shader-f16; using fp32");
+      logger->write("WebGPU backend: WARNING: useFP16=true but this adapter lacks shader-f16; using fp32");
     else
       logger->write("WebGPU backend: using fp32");
   }
@@ -363,6 +381,11 @@ ComputeContext* NeuralNet::createComputeContext(
 ) {
   (void)gpuIdxs; (void)homeDataDirOverride; (void)loadedModel; (void)cfg;
 
+  if(nnXLen > NNPos::MAX_BOARD_LEN || nnYLen > NNPos::MAX_BOARD_LEN)
+    throw StringError(
+      "WebGPU backend: nnXLen and nnYLen must be <= " + Global::intToString(NNPos::MAX_BOARD_LEN)
+      + ", got " + Global::intToString(nnXLen) + "x" + Global::intToString(nnYLen));
+
   ComputeContext* context = new ComputeContext(nnXLen, nnYLen, useFP16Mode);
 
 #ifdef KATAGO_HAVE_WEBGPU
@@ -370,7 +393,19 @@ ComputeContext* NeuralNet::createComputeContext(
   // NNEvaluator constructs the context on one thread but evaluates on its server
   // thread. Defer device+shader init to createComputeHandle, which the server thread
   // calls. For the single-thread path both run on the same thread (no change).
-  (void)logger;
+  //
+  // DO probe adapter availability now, though: on a machine/browser without WebGPU
+  // this makes createComputeContext throw HERE — where the kataeval dual-backend
+  // dispatcher catches it and falls back to Eigen — instead of later on the
+  // NNEvaluator server thread, where an escaped exception is fatal (std::terminate).
+  try {
+    if(!gInstance)
+      NeuralNet::globalInitialize();
+    (void)requestAdapterSync(logger);  // probe only; the handle thread re-requests
+  } catch(...) {
+    delete context;
+    throw;
+  }
 #else
   (void)logger;
   delete context;
@@ -478,6 +513,15 @@ static inline uint64_t wgPaddedBytes(ComputeContext* ctx, size_t count, bool for
 // new one. Avoids allocating ~80 fresh buffers per eval. A single eval's buffers
 // all stay live until its one Submit completes (getOutput blocks on readback),
 // so reuse only ever happens across evals — safe, and single-threaded per handle.
+//
+// A slightly LARGER free slot (up to 2x) is also an acceptable match: kernels
+// bound their work by the uniform params (never arrayLength), and readbacks
+// copy a prefix, so extra tail bytes are inert. Without this, every distinct
+// batch size the search produces (1..maxBatchSize — every intermediate scales
+// with batch) accumulates its own full ~80-buffer working set; with it, a big
+// batch's buffers serve nearby smaller batches too, keeping pool growth small
+// in the memory-fragile browser build. The 2x cap stops a tiny request from
+// pinning a huge buffer.
 struct BufferPool {
   ComputeContext* ctx = nullptr;
   struct Slot { uint64_t bytes; uint32_t usage; wgpu::Buffer buf; bool inUse; };
@@ -485,7 +529,12 @@ struct BufferPool {
   void reset() { for(auto& s : slots) s.inUse = false; }
   wgpu::Buffer get(uint64_t bytes, wgpu::BufferUsage usage) {
     uint32_t u = (uint32_t)usage;
-    for(auto& s : slots) if(!s.inUse && s.bytes == bytes && s.usage == u) { s.inUse = true; return s.buf; }
+    Slot* best = nullptr;
+    for(auto& s : slots)
+      if(!s.inUse && s.usage == u && s.bytes >= bytes && s.bytes <= bytes * 2
+         && (best == nullptr || s.bytes < best->bytes))
+        best = &s;
+    if(best != nullptr) { best->inUse = true; return best->buf; }
     wgpu::BufferDescriptor d{}; d.size = bytes; d.usage = usage;
     wgpu::Buffer b = ctx->device.CreateBuffer(&d);
     slots.push_back({bytes, u, b, true});
@@ -604,7 +653,7 @@ void wgReadFloats(ComputeContext* ctx, const wgpu::Buffer& src, size_t count, st
   wgpu::CommandBuffer commands = encoder.Finish();
   ctx->queue.Submit(1, &commands);
 
-  volatile bool done = false;
+  std::atomic<bool> done{false};
   bool ok = false;
   readback.MapAsync(
     wgpu::MapMode::Read, 0, (size_t)bytes, KGE_CB_MODE,
@@ -632,6 +681,13 @@ void wgReadFloats(ComputeContext* ctx, const wgpu::Buffer& src, size_t count, st
 // Gated on KGE_MULTIPASS for an A/B fallback.
 static const bool kgeMultipass = std::getenv("KGE_MULTIPASS") != nullptr;
 static const bool kgeTimingHist = std::getenv("KATAGO_WEBGPU_TIMING") != nullptr;
+// A/B env flags, read once (they never change mid-process; getOutput is hot).
+static const bool kgeNoWinograd = std::getenv("KATAGO_WEBGPU_NO_WINOGRAD") != nullptr;
+static const bool kgeUseTiledGemm = std::getenv("KATAGO_WEBGPU_NO_TILEDGEMM") == nullptr;
+static const char* const kgeGemmKernel = std::getenv("KATAGO_WEBGPU_NO_REGTILE") ? "tiledGemm" : "tiledGemmRT";
+static const bool kgeNoFusion = std::getenv("KATAGO_WEBGPU_NO_FUSION") != nullptr;
+static const bool kgeUseFlashAttn = std::getenv("KATAGO_WEBGPU_NO_FLASHATTN") == nullptr;
+static const bool kgeNoFp32Heads = std::getenv("KATAGO_WEBGPU_NO_FP32HEADS") != nullptr;
 static std::unordered_map<std::string,int> gDispatchHist;
 static int gHistFrames = 0;
 struct WgRecorder {
@@ -703,7 +759,7 @@ struct WgRecorder {
     static const bool _tm = std::getenv("KATAGO_WEBGPU_TIMING") != nullptr;
     if(_tm) {
       auto _ts = std::chrono::steady_clock::now();
-      volatile bool _g = false;
+      std::atomic<bool> _g{false};
       ctx->queue.OnSubmittedWorkDone(KGE_CB_MODE, [&_g](wgpu::QueueWorkDoneStatus, wgpu::StringView){ _g = true; });
       wgPump(_g);
       static std::atomic<int64_t> sG{0}, sN{0};
@@ -712,7 +768,7 @@ struct WgRecorder {
       if(n % 100 == 0) fprintf(stderr, "[wgpu-gpu] avg GPU-execute us = %lld (n=%lld)\n", (long long)(sG/n), (long long)n);
     }
 
-    volatile bool done = false; bool ok = false;
+    std::atomic<bool> done{false}; bool ok = false;
     staging.MapAsync(wgpu::MapMode::Read, 0, (size_t)totalBytes, KGE_CB_MODE,
       [&done,&ok](wgpu::MapAsyncStatus st, wgpu::StringView){ ok = (st==wgpu::MapAsyncStatus::Success); done = true; });
     wgPump(done);
@@ -783,6 +839,11 @@ struct ComputeHandle {
   int nnYLen;
   int maxBatchSize;
   bool inputsUseNHWC;
+  // Caller promises every position fills the full nnXLen x nnYLen board. We keep
+  // masking (correct either way) but verify the promise on the first eval, like
+  // the Metal backend — a violated promise means the caller's config is wrong.
+  bool requireExactNNLen;
+  bool verifiedExactNNLen = false;
 
 #ifdef KATAGO_HAVE_WEBGPU
   // Persistent weight buffers, uploaded once and reused across every eval.
@@ -792,18 +853,23 @@ struct ComputeHandle {
   std::unordered_map<const void*, wgpu::Buffer> weightCache;
   std::unordered_map<const void*, std::pair<wgpu::Buffer, wgpu::Buffer>> bnCache;
   std::unordered_map<const void*, wgpu::Buffer> winogradCache;  // Winograd-transformed 3x3 filters
+  // RoPE cos/sin tables, computed once per attention desc (board size is fixed
+  // per handle) instead of recomputed + re-uploaded on every eval.
+  std::unordered_map<const void*, std::pair<wgpu::Buffer, wgpu::Buffer>> ropeCache;
   BufferPool pool;  // reused intermediate/uniform buffers across evals
 #endif
 
   ComputeHandle(
-    ComputeContext* context_, const LoadedModel* loadedModel, int maxBatchSize_, bool inputsUseNHWC_
+    ComputeContext* context_, const LoadedModel* loadedModel, int maxBatchSize_, bool inputsUseNHWC_,
+    bool requireExactNNLen_
   )
     : context(context_),
       modelDesc(&loadedModel->modelDesc),
       nnXLen(context_->nnXLen),
       nnYLen(context_->nnYLen),
       maxBatchSize(maxBatchSize_),
-      inputsUseNHWC(inputsUseNHWC_)
+      inputsUseNHWC(inputsUseNHWC_),
+      requireExactNNLen(requireExactNNLen_)
   {
     // NOTE on fp16 for g170 nets (the "scale8 rescale", still deferred): KataGo's
     // ModelDesc::applyScale8ToReduceActivations() (×1/8 activations + MISH→MISH_SCALE8,
@@ -831,13 +897,33 @@ ComputeHandle* NeuralNet::createComputeHandle(
   int gpuIdxForThisThread,
   int serverThreadIdx
 ) {
-  (void)requireExactNNLen; (void)gpuIdxForThisThread;
+  (void)gpuIdxForThisThread;
+  // The kernels and input marshaling are NCHW; NHWC would silently scramble the
+  // inputs (mask extraction + conv layouts). Refuse loudly, like OpenCL/TensorRT.
+  if(inputsUseNHWC)
+    throw StringError("WebGPU backend: inputsUseNHWC = true is not supported (NCHW only).");
 #ifdef KATAGO_HAVE_WEBGPU
   // Lazily create the device + shaders on THIS thread (the server thread under
   // NNEvaluator) the first time a handle is made. Thread-local WebGPU objects then
   // live where they're used. Single-threaded callers init here on their own thread.
-  if(!context->initialized)
-    initContextGpu(context, logger);
+  // Serialized: with numNNServerThreadsPerModel > 1 several server threads reach
+  // this concurrently; only one may run initContextGpu (the others share its device
+  // — Dawn native entry points are thread-safe).
+  {
+    std::lock_guard<std::mutex> lock(context->mutex);
+    // One evaluating thread per context: concurrent server threads would pump the
+    // shared Dawn instance/queue from two threads at once (a crash in practice).
+    // Refuse loudly, like the other single-device backends refuse bad configs.
+    if(!context->hasOwner) {
+      context->ownerThread = std::this_thread::get_id();
+      context->hasOwner = true;
+    } else if(context->ownerThread != std::this_thread::get_id())
+      throw StringError(
+        "WebGPU backend: only one NN server thread per model is supported "
+        "(WebGPU objects live on the evaluating thread). Set numNNServerThreadsPerModel = 1.");
+    if(!context->initialized)
+      initContextGpu(context, logger);
+  }
 #endif
   if(logger != NULL)
     logger->write(
@@ -845,7 +931,7 @@ ComputeHandle* NeuralNet::createComputeHandle(
       " Model version " + Global::intToString(loadedModel->modelDesc.modelVersion) +
       " name: " + loadedModel->modelDesc.name +
       " (" + loadedModel->modelDesc.getShortInfoString() + ")");
-  return new ComputeHandle(context, loadedModel, maxBatchSize, inputsUseNHWC);
+  return new ComputeHandle(context, loadedModel, maxBatchSize, inputsUseNHWC, requireExactNNLen);
 }
 
 void NeuralNet::freeComputeHandle(ComputeHandle* computeHandle) {
@@ -977,6 +1063,17 @@ void NeuralNet::getOutput(
   for(int n = 0; n < batchSize; n++)
     for(size_t xy = 0; xy < hw; xy++)
       maskHost[n*hw + xy] = inputBuffers->userInputBuffer[((size_t)n*numSpatialFeatures + 0)*hw + xy];
+  // requireExactNNLen contract check (first eval, like the Metal backend): the
+  // caller promised full-board positions, so the mask channel must be all ones.
+  if(gpuHandle->requireExactNNLen && !gpuHandle->verifiedExactNNLen) {
+    for(size_t i = 0; i < maskHost.size(); i++)
+      if(maskHost[i] != 1.0f)
+        throw StringError(
+          "WebGPU backend: requireExactNNLen is true but the input mask has zeros — "
+          "the position does not fill the full " + Global::intToString(nnXLen) + "x" +
+          Global::intToString(nnYLen) + " nn buffer.");
+    gpuHandle->verifiedExactNNLen = true;
+  }
   wgpu::Buffer maskBuf = wgMakeStorage(ctx, maskHost.data(), maskHost.size(), false);
 
   // ---- Op helpers (upload weights from desc, dispatch, return new buffer) ----
@@ -996,9 +1093,9 @@ void NeuralNet::getOutput(
   };
   // Shared-memory tiled GEMM for 1x1 conv / projections (into a caller buffer).
   // KATAGO_WEBGPU_NO_TILEDGEMM=1 forces the naive per-output kernels (A/B).
-  const bool useTiledGemm = (std::getenv("KATAGO_WEBGPU_NO_TILEDGEMM") == nullptr);
+  const bool useTiledGemm = kgeUseTiledGemm;
   // Register tiling (2x2 micro-tile/thread) on top of shared-memory tiling.
-  const char* gemmKernel = std::getenv("KATAGO_WEBGPU_NO_REGTILE") ? "tiledGemm" : "tiledGemmRT";
+  const char* gemmKernel = kgeGemmKernel;
   auto tgemmInto = [&](wgpu::Buffer in, wgpu::Buffer out, int inC, int outC, wgpu::Buffer W, bool wInMajor) {
     TGParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw, wInMajor?1u:0u, 0u,0u,0u};
     rec.dispatch(gemmKernel, {wgMakeUniform(ctx,p), in, W, out},
@@ -1039,7 +1136,7 @@ void NeuralNet::getOutput(
         Conv1x1ParamsHost p{(uint32_t)batchSize, (uint32_t)inC, (uint32_t)outC, (uint32_t)hw};
         rec.dispatch("conv1x1NCHW", {wgMakeUniform(ctx,p), in, wbuf(cd.weights), out}, (uint32_t)((outElts+63)/64));
       }
-    } else if(!std::getenv("KATAGO_WEBGPU_NO_WINOGRAD")
+    } else if(!kgeNoWinograd
               && cd.convXSize == 3 && cd.convYSize == 3 && cd.dilationX == 1 && cd.dilationY == 1) {
       // Winograd F(2,3): 4 mults/output vs 9 (validated by testEvaluateConv).
       // KATAGO_WEBGPU_NO_WINOGRAD=1 forces the direct conv (for A/B benchmarking).
@@ -1070,7 +1167,7 @@ void NeuralNet::getOutput(
   };
   // Fused bnAct -> 1x1 conv (pre-activation block pattern): one dispatch, no
   // intermediate. KATAGO_WEBGPU_NO_FUSION=1 falls back to separate bnAct + conv.
-  const bool useFusion = useTiledGemm && (std::getenv("KATAGO_WEBGPU_NO_FUSION") == nullptr);
+  const bool useFusion = useTiledGemm && !kgeNoFusion;
   auto convBnAct1x1 = [&](wgpu::Buffer in, int inC, int outC, const ConvLayerDesc& cd, const BatchNormLayerDesc& bn, int actCode) {
     auto sb = bnbuf(bn);
     TGBParamsHost p{(uint32_t)batchSize,(uint32_t)inC,(uint32_t)outC,(uint32_t)hw,(uint32_t)actCode,0u,0u,0u};
@@ -1083,10 +1180,10 @@ void NeuralNet::getOutput(
   // (one fewer scaleBiasMaskAct dispatch per such conv). Falls back to bnAct+conv for
   // non-3x3 / NO_WINOGRAD / NO_FUSION. The matmul+output reuse the same params (they
   // ignore the xi field, which here carries the activation kind).
-  const bool useWinoFuse = std::getenv("KATAGO_WEBGPU_NO_FUSION") == nullptr;
+  const bool useWinoFuse = !kgeNoFusion;
   auto convBnAct3x3 = [&](wgpu::Buffer in, int inC, int outC, const BatchNormLayerDesc& bn, int actCode,
                           const ConvLayerDesc& cd) -> wgpu::Buffer {
-    bool wino = useWinoFuse && std::getenv("KATAGO_WEBGPU_NO_WINOGRAD") == nullptr
+    bool wino = useWinoFuse && !kgeNoWinograd
                 && cd.convXSize == 3 && cd.convYSize == 3 && cd.dilationX == 1 && cd.dilationY == 1;
     if(!wino) return conv(bnAct(in, inC, bn, actCode), inC, outC, cd);
     auto sb = bnbuf(bn);
@@ -1181,7 +1278,7 @@ void NeuralNet::getOutput(
   };
   // Flash Attention: fused single-kernel attention (online softmax), no [seq x seq]
   // score matrix. KATAGO_WEBGPU_NO_FLASHATTN=1 forces the 3-kernel path (A/B).
-  const bool useFlashAttn = (std::getenv("KATAGO_WEBGPU_NO_FLASHATTN") == nullptr);
+  const bool useFlashAttn = kgeUseFlashAttn;
   auto flashAttn = [&](wgpu::Buffer q, wgpu::Buffer k, wgpu::Buffer v, int nH, int nKV, int qHD, int vHD, int kvGroup, float scale) {
     FlashParamsHost p{(uint32_t)batchSize,(uint32_t)nH,(uint32_t)nKV,(uint32_t)qHD,(uint32_t)vHD,(uint32_t)hw,(uint32_t)kvGroup, scale};
     wgpu::Buffer out = wgMakeStorage(ctx, nullptr, (size_t)batchSize*nH*vHD*hw, true);
@@ -1265,13 +1362,18 @@ void NeuralNet::getOutput(
         wgpu::Buffer k = proj(normed, C, kTot, a->kProj.weights);
         wgpu::Buffer v = proj(normed, C, vTot, a->vProj.weights);
         if(a->useRope) {
-          std::vector<float> cosT, sinT;
-          a->computeRopeCosSin(nnXLen, nnYLen, hw, cosT, sinT);
-          wgpu::Buffer cosB = wgMakeStorage(ctx, cosT.data(), cosT.size(), false, /*pooled=*/false);
-          wgpu::Buffer sinB = wgMakeStorage(ctx, sinT.data(), sinT.size(), false, /*pooled=*/false);
+          auto& cache = gpuHandle->ropeCache;
+          auto it = cache.find(a);
+          if(it == cache.end()) {
+            std::vector<float> cosT, sinT;
+            a->computeRopeCosSin(nnXLen, nnYLen, (int)hw, cosT, sinT);
+            it = cache.emplace(a, std::make_pair(
+              wgMakeStorage(ctx, cosT.data(), cosT.size(), false, /*pooled=*/false),
+              wgMakeStorage(ctx, sinT.data(), sinT.size(), false, /*pooled=*/false))).first;
+          }
           int numPairs = qHD/2;
-          rope(q, nH, qHD, numPairs, nKV, a->learnableRope, cosB, sinB);
-          rope(k, nKV, qHD, numPairs, nKV, a->learnableRope, cosB, sinB);
+          rope(q, nH, qHD, numPairs, nKV, a->learnableRope, it->second.first, it->second.second);
+          rope(k, nKV, qHD, numPairs, nKV, a->learnableRope, it->second.first, it->second.second);
         }
         int kvGroup = nH / nKV;
         float scale = 1.0f/std::sqrt((float)qHD);
@@ -1306,7 +1408,7 @@ void NeuralNet::getOutput(
   // and run the trunk tip + policy/value heads in fp32 (the numerically sensitive
   // part — norm reductions, pooling, head matmuls). The trunk (the bulk) keeps
   // fp16's bandwidth win. KATAGO_WEBGPU_NO_FP32HEADS=1 stays full-fp16 (A/B).
-  const bool selectiveF32 = ctx->useFP16 && (std::getenv("KATAGO_WEBGPU_NO_FP32HEADS") == nullptr);
+  const bool selectiveF32 = ctx->useFP16 && !kgeNoFp32Heads;
   if(selectiveF32) {
     // Convert the fp16 trunk output AND the shared mask to fp32 (both read by the
     // fp32 head kernels). Do this before tlForceF32 — convF16ToF32 is f16-module.
@@ -1399,26 +1501,34 @@ void NeuralNet::getOutput(
     const float* policySrc = policyHost.data() + (size_t)row*numPolicyChannels*hw;
     const float* passSrc = policyPassHost.data() + (size_t)row*numPolicyChannels;
     const float policyOptimism = (float)inputBufs[row]->policyOptimism;
-    const bool hasOptimism = (numPolicyChannels == 2) || (numPolicyChannels == 4 && modelVersion >= 16);
-    if(hasOptimism && policyOptimism != 0.0f) {
+    // Same condition and blend as the reference backends (eigen/cuda/opencl/trt):
+    // blend whenever the net has the optimism channel; else assert single-channel.
+    if(numPolicyChannels == 2 || (numPolicyChannels == 4 && modelVersion >= 16)) {
       std::vector<float> blended(hw);
       const float* pCh = policySrc; const float* pOptCh = policySrc + hw;
-      for(int i = 0; i < hw; i++) blended[i] = pCh[i] + (pOptCh[i] - pCh[i]) * policyOptimism;
+      for(size_t i = 0; i < hw; i++) blended[i] = pCh[i] + (pOptCh[i] - pCh[i]) * policyOptimism;
       SymmetryHelpers::copyOutputsWithSymmetry(blended.data(), output->policyProbs, 1, nnYLen, nnXLen, symmetry);
       output->policyProbs[nnXLen*nnYLen] = passSrc[0] + (passSrc[1] - passSrc[0]) * policyOptimism;
-      output->policyOptimismUsed = policyOptimism;
     } else {
+      assert(numPolicyChannels == 1);
       SymmetryHelpers::copyOutputsWithSymmetry(policySrc, output->policyProbs, 1, nnYLen, nnXLen, symmetry);
       output->policyProbs[nnXLen*nnYLen] = passSrc[0];
-      output->policyOptimismUsed = 0.0f;
     }
+    // (policyOptimismUsed is filled in by NNEvaluator, as with the other backends.)
 
     const float* v = valueHost.data() + (size_t)row*numValueChannels;
     output->whiteWinProb = v[0];
     output->whiteLossProb = v[1];
     output->whiteNoResultProb = v[2];
 
+    // Score-value channel mapping, keyed like the reference backends (eigen/opencl/
+    // cuda) with the same modelVersion<->numSV asserts so a malformed desc fails
+    // loudly instead of silently mis-mapping channels.
     const float* sv = svHost.data() + (size_t)row*numSV;
+    if(modelVersion >= 9)      assert(numSV == 6);
+    else if(modelVersion >= 8) assert(numSV == 4);
+    else if(modelVersion >= 4) assert(numSV == 2);
+    else if(modelVersion >= 3) assert(numSV == 1);
     if(numSV >= 6) {
       output->whiteScoreMean = sv[0]; output->whiteScoreMeanSq = sv[1]; output->whiteLead = sv[2];
       output->varTimeLeft = sv[3]; output->shorttermWinlossError = sv[4]; output->shorttermScoreError = sv[5];
@@ -1445,9 +1555,10 @@ void NeuralNet::getOutput(
 }
 
 // ----------------------------------------------------------------------------
-// Testing hooks — return false until the corresponding kernels are validated.
-// These are the intended *first* things to implement: each maps onto one WGSL
-// entry point and gives a direct numeric check against the reference backends.
+// Testing hooks (runnnlayertests): per-op numeric checks against the CPU
+// reference. Implemented for the fp32/NCHW path (fp16 and NHWC return false,
+// like OpenCL's hooks); the 3x3 conv case routes through the Winograd kernels
+// so they are covered too.
 // ----------------------------------------------------------------------------
 
 bool NeuralNet::testEvaluateConv(
@@ -1455,10 +1566,10 @@ bool NeuralNet::testEvaluateConv(
   bool useFP16, bool useNHWC,
   const std::vector<float>& inputBuffer, std::vector<float>& outputBuffer) {
 #ifdef KATAGO_HAVE_WEBGPU
-  // Scaffold supports the NCHW fp32 path only (mirrors OpenCL's test hook, which
-  // skips NHWC/fp16). The harness uploads input+weights, dispatches conv2dNCHW,
-  // and reads back; the test compares against its own CPU reference.
-  if(useFP16 || useNHWC)
+  // NCHW only (like OpenCL's hook). fp16 runs when the adapter has shader-f16:
+  // the context is created in fp16-storage mode and the uploads/readbacks
+  // convert automatically (the harness compares with fp16 tolerance).
+  if(useNHWC)
     return false;
 
   const size_t hw = (size_t)nnXLen * nnYLen;
@@ -1467,8 +1578,10 @@ bool NeuralNet::testEvaluateConv(
   if(inputBuffer.size() != inElts)
     throw StringError("WebGPU testEvaluateConv: unexpected input buffer size");
 
-  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, enabled_t::False));
+  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, useFP16 ? enabled_t::True : enabled_t::False));
   initContextGpu(ctx.get(), NULL);
+  if(useFP16 && !ctx->useFP16)
+    return false;  // adapter lacks shader-f16
 
   // 3x3 stride-1 dil-1 -> Winograd F(2,3). Validates the 3-stage winograd kernels
   // against the CPU reference (the layer test's 3x3 conv case routes through here).
@@ -1527,7 +1640,7 @@ bool NeuralNet::testEvaluateBatchNorm(
   const std::vector<float>& inputBuffer, const std::vector<float>& maskBuffer,
   std::vector<float>& outputBuffer) {
 #ifdef KATAGO_HAVE_WEBGPU
-  if(useFP16 || useNHWC)
+  if(useNHWC)
     return false;
 
   const int C = desc->numChannels;
@@ -1541,8 +1654,10 @@ bool NeuralNet::testEvaluateBatchNorm(
   std::vector<float> mergedScale, mergedBias;
   foldBatchNorm(desc, mergedScale, mergedBias);
 
-  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, enabled_t::False));
+  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, useFP16 ? enabled_t::True : enabled_t::False));
   initContextGpu(ctx.get(), NULL);
+  if(useFP16 && !ctx->useFP16)
+    return false;  // adapter lacks shader-f16
 
   SBMAParamsHost p{};
   p.n = (uint32_t)batchSize;
@@ -1574,7 +1689,7 @@ bool NeuralNet::testEvaluateResidualBlock(
   const std::vector<float>& inputBuffer, const std::vector<float>& maskBuffer,
   std::vector<float>& outputBuffer) {
 #ifdef KATAGO_HAVE_WEBGPU
-  if(useFP16 || useNHWC)
+  if(useNHWC)
     return false;
 
   // Pre-activation ResNet block, mirroring NormActConv + NormActConv in the
@@ -1596,8 +1711,10 @@ bool NeuralNet::testEvaluateResidualBlock(
   foldBatchNorm(&desc->preBN, preScale, preBias);
   foldBatchNorm(&desc->midBN, midScale, midBias);
 
-  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, enabled_t::False));
+  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, useFP16 ? enabled_t::True : enabled_t::False));
   initContextGpu(ctx.get(), NULL);
+  if(useFP16 && !ctx->useFP16)
+    return false;  // adapter lacks shader-f16
 
   // trunkBuf holds the input and, after the final add, the output.
   wgpu::Buffer trunkBuf = wgMakeStorage(ctx.get(), inputBuffer.data(), trunkElts, true);
@@ -1664,7 +1781,7 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   const std::vector<float>& inputBuffer, const std::vector<float>& maskBuffer,
   std::vector<float>& outputBuffer) {
 #ifdef KATAGO_HAVE_WEBGPU
-  if(useFP16 || useNHWC)
+  if(useNHWC)
     return false;
 
   // Global-pooling residual block, mirroring the reference:
@@ -1693,8 +1810,10 @@ bool NeuralNet::testEvaluateGlobalPoolingResidualBlock(
   foldBatchNorm(&desc->gpoolBN, gpScale, gpBias);
   foldBatchNorm(&desc->midBN, midScale, midBias);
 
-  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, enabled_t::False));
+  std::unique_ptr<ComputeContext> ctx(new ComputeContext(nnXLen, nnYLen, useFP16 ? enabled_t::True : enabled_t::False));
   initContextGpu(ctx.get(), NULL);
+  if(useFP16 && !ctx->useFP16)
+    return false;  // adapter lacks shader-f16
 
   wgpu::Buffer trunkBuf = wgMakeStorage(ctx.get(), inputBuffer.data(), trunkElts, true);
   wgpu::Buffer maskBuf = wgMakeStorage(ctx.get(), maskBuffer.data(), maskBuffer.size(), false);

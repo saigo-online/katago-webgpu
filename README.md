@@ -54,10 +54,11 @@ scripts/serve-demo-tls.sh    # serve over HTTPS (WebGPU needs a secure context)
 ## One WASM, automatic fallback
 
 `kataeval.wasm` ships **both** backends — WebGPU and Eigen (CPU) — in a single
-binary. At load it tries WebGPU and **transparently falls back to the Eigen CPU
-backend** if there's no adapter. Same correct net everywhere; GPU speed when you
-have it, universal compatibility when you don't. Both paths are validated, and
-they agree.
+binary. At load it probes for a WebGPU adapter and **transparently falls back to
+the Eigen CPU backend** if there's none. Same correct net everywhere; GPU speed
+when you have it, universal compatibility when you don't. Both paths are
+validated, they agree, and the automatic fallback itself is tested end-to-end
+(`web/test-fallback.mjs` runs the no-GPU path under Node).
 
 ## Highlights
 
@@ -69,7 +70,14 @@ they agree.
   multi-head attention with **learnable/fixed RoPE**, **grouped-query attention**,
   masked softmax, and **SwiGLU** feed-forward. All byte-identical to Eigen.
 - **Validated** — byte-identical to the Eigen CPU backend on the per-op tests
-  (`runnnlayertests`) and full-net evaluation; the GPU and CPU WASM paths agree.
+  (`runnnlayertests`, fp32 **and** fp16-storage variants on a `shader-f16`
+  adapter) and full-net evaluation (`evalsgf` search trees identical on conv /
+  nbt / transformer nets); the GPU and CPU WASM paths agree.
+- **KataGo-native conventions** — registered like the other backends: `katago
+  version` reports the WebGPU backend, `webgpuUseFP16` works as a config key,
+  the test harness forces NCHW, and misuse fails loudly (NHWC inputs, a second
+  NN server thread, oversized boards, or a violated `requireExactNNLen` promise
+  all get clear errors instead of silent wrong evals).
 - **Tuned** — profiled on a GB10 as *latency-bound* (per-op GPU launch/barrier
   overhead dominates, ~7ms/batch fixed): **Winograd F(2,3)** for 3×3 convs (**+80%**
   vs direct), BN+act fused into the Winograd input transform, **one compute pass** +
@@ -114,6 +122,17 @@ scripts/build-webgpu.sh                 # fetches + builds Dawn, then KataGo
 
 ```bash
 scripts/build-eval.sh                   # -> web/demo/kataeval.{js,wasm}
+MT=1 scripts/build-eval.sh              # threaded build with KataGo's real Search
+```
+
+**Tests** (hermetic, no GPU needed under Node):
+
+```bash
+./cpp/build-webgpu/katago runnnlayertests   # per-op vs CPU reference (fp32 + fp16)
+node web/test-fallback.mjs              # automatic WebGPU -> Eigen fallback
+node web/test-eval.mjs                  # eval smoke test (CPU backend)
+node web/test-handicap.mjs && node web/test-optimism.mjs && node web/test-gumbel.mjs
+node web/test-search-mt.mjs             # MT build ABI smoke test
 ```
 
 Requires an [emsdk](https://emscripten.org) (emcc ≥ 6) for the WASM builds; CMake
@@ -140,6 +159,9 @@ README-KATAGO-UPSTREAM.md   the original KataGo README
   policy. Still **rejected with a clear error** (not silently mis-evaluated): the
   **SGF-metadata encoder** (`metaEncoderVersion ≠ 0` — train without it) and
   **grouped** RMSNorm (`cgroupSize ≠ 0`).
+- **Threads / GPUs**: one NN server thread per model (`numNNServerThreadsPerModel
+  = 1`, the default; more is rejected with a clear error) and a single adapter —
+  the standard WebGPU API has no multi-GPU enumeration. Inputs are NCHW only.
 - **Demo**: a full browser analysis/play/review app — instant policy+value+ownership,
   KataGo's **real threaded search** (tree reuse, ponder, live candidate moves + a PV
   "train of thought" board, streamed metrics), **self-play → SGF** + training-data
