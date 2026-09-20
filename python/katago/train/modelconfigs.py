@@ -1838,6 +1838,17 @@ base_config_of_name = {
     "b6c96": b6c96,          # Historic katago architecture
     "b6c96v17": {**b6c96, "version": 17},  # saigo: g170 b6 arch, modelVersion 17 (q-values off -> 2 policy ch), for katago-web wasm
     "b6c96v17q": {**b6c96, "version": 17, "predict_q_values": True},  # saigo: v17 with q-values on (-> 4 policy ch); needs webgpu guard relaxed
+    # saigo: v17q + experiment arm — temperature(2.0) + Decoupled-KD(alpha=1,beta=4) on the
+    # MAIN policy loss (Hinton arXiv:1503.02531, Zhao DKD arXiv:2203.08679). Same exported net
+    # shape as b6c96v17q; only the training loss differs.
+    "b6c96v17q-dkd": {**b6c96, "version": 17, "predict_q_values": True,
+                      "policy_kd_temperature": 2.0, "policy_dkd_alpha": 1.0, "policy_dkd_beta": 4.0},
+    # saigo: the chosen architecture for beating g170-b6 — small nested-bottleneck (nbt),
+    # modelVersion 17, q-values on (4 policy ch), proven 'fixup' norm. nbt is KataGo's
+    # per-compute upgrade over plain b6c96 and is now WebGPU-loadable.
+    "b5c192nbtv17q": {**b5c192nbt, "version": 17, "predict_q_values": True},
+    "b5c192nbtv17q-dkd": {**b5c192nbt, "version": 17, "predict_q_values": True,
+                          "policy_kd_temperature": 2.0, "policy_dkd_alpha": 1.0, "policy_dkd_beta": 4.0},
 
     # Tiny convnets
     "b10c128": b10c128,      # Historic katago architecture

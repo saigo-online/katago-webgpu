@@ -10,6 +10,64 @@ import torch.nn.functional
 def cross_entropy(pred_logits, target_probs, dim):
     return -torch.sum(target_probs * torch.nn.functional.log_softmax(pred_logits, dim=dim), dim=dim)
 
+def policy_distill_loss(pred_logits, target_probs, temperature, dkd_alpha, dkd_beta, dim=1):
+    """Soft-target policy distillation for the MAIN policy head, generalizing the plain
+    cross-entropy used at temperature 1.
+
+    KataGo's policy target is already a soft teacher distribution (the b40 teacher's
+    MCTS visit counts), so training on it is offline knowledge distillation. This adds
+    two arxiv-grounded refinements, both strictly opt-in:
+
+    - temperature (T): Hinton-style KD temperature (arXiv:1503.02531) applied to BOTH the
+      student logits and the (already-distributional) teacher target. The T^2 factor keeps
+      the gradient magnitude comparable. T == 1 with DKD off recovers cross_entropy exactly.
+    - dkd_alpha / dkd_beta: if dkd_beta is not None, use Decoupled KD (Zhao et al. 2022,
+      arXiv:2203.08679). The policy target has no one-hot ground truth, so the "target class"
+      is taken as the teacher's argmax (most-visited move). Classic KD is the special case
+      (alpha=1, beta=teacher_non_target_mass); freeing beta amplifies the non-target
+      ("dark knowledge") term, which is where DKD's gains come from.
+
+    Returns a per-sample loss vector (same leading shape as cross_entropy).
+    """
+    # Exact baseline fast-path: identical to cross_entropy(pred_logits, target_probs).
+    if temperature == 1.0 and dkd_beta is None:
+        return cross_entropy(pred_logits, target_probs, dim=dim)
+
+    eps = 1.0e-30
+    T = temperature
+    # Temperature-softened teacher distribution: softmax(log p / T). At T==1 this is the
+    # original distribution (target sums to 1), so it degrades gracefully to plain KD.
+    teacher_T = torch.softmax(torch.log(target_probs.clamp_min(eps)) / T, dim=dim)
+
+    if dkd_beta is None:
+        # Hinton soft-target KD.
+        return (T * T) * cross_entropy(pred_logits / T, teacher_T, dim=dim)
+
+    # ---- Decoupled KD ----
+    student_T = torch.log_softmax(pred_logits / T, dim=dim).exp()
+    tclass = torch.argmax(target_probs, dim=dim, keepdim=True)  # teacher's top move
+
+    # TCKD: binary "target vs rest" KL(teacher || student).
+    pt_teacher = teacher_T.gather(dim, tclass).clamp(eps, 1.0 - eps)
+    pt_student = student_T.gather(dim, tclass).clamp(eps, 1.0 - eps)
+    tckd = (
+        pt_teacher * (torch.log(pt_teacher) - torch.log(pt_student))
+        + (1.0 - pt_teacher) * (torch.log1p(-pt_teacher) - torch.log1p(-pt_student))
+    ).squeeze(dim)
+
+    # NCKD: KL over non-target classes, each side renormalized to exclude the target.
+    neg_inf = torch.finfo(pred_logits.dtype).min
+    nt_mask = torch.ones_like(target_probs, dtype=torch.bool).scatter_(dim, tclass, False)
+    s_nc_logprob = torch.log_softmax((pred_logits / T).masked_fill(~nt_mask, neg_inf), dim=dim)
+    t_nc = teacher_T.masked_fill(~nt_mask, 0.0)
+    t_nc = t_nc / t_nc.sum(dim=dim, keepdim=True).clamp_min(eps)
+    nckd = torch.sum(
+        torch.where(nt_mask, t_nc * (torch.log(t_nc.clamp_min(eps)) - s_nc_logprob), torch.zeros_like(t_nc)),
+        dim=dim,
+    )
+
+    return (T * T) * (dkd_alpha * tckd + dkd_beta * nckd)
+
 def huber_loss(x, y, delta):
     abs_diff = torch.abs(x - y)
     return torch.where(
@@ -39,6 +97,12 @@ class Metrics:
         self.moving_unowned_proportion_sum = 0.0
         self.moving_unowned_proportion_weight = 0.0
 
+        # Opt-in policy distillation knobs (default: exact cross-entropy baseline).
+        # See policy_distill_loss(). Only the MAIN policy head consults these.
+        self.policy_kd_temperature = float(raw_model.config.get("policy_kd_temperature", 1.0))
+        self.policy_dkd_alpha = raw_model.config.get("policy_dkd_alpha", None)
+        self.policy_dkd_beta = raw_model.config.get("policy_dkd_beta", None)
+
     def state_dict(self):
         return dict(
             moving_unowned_proportion_sum = self.moving_unowned_proportion_sum,
@@ -51,10 +115,18 @@ class Metrics:
             self.moving_unowned_proportion_sum = state_dict["moving_unowned_proportion_sum"]
         self.moving_unowned_proportion_weight = state_dict["moving_unowned_proportion_weight"]
 
-    def loss_policy_player_samplewise(self, pred_logits, target_probs, weight, global_weight):
+    def loss_policy_player_samplewise(self, pred_logits, target_probs, weight, global_weight, distill=False):
         assert pred_logits.shape[1:] == (self.policy_len,)
         assert target_probs.shape == pred_logits.shape
-        loss = cross_entropy(pred_logits, target_probs, dim=1)
+        # distill=True (main policy head only) applies the opt-in temperature/DKD; with the
+        # default config knobs it is byte-identical to the plain cross-entropy below.
+        if distill:
+            loss = policy_distill_loss(
+                pred_logits, target_probs,
+                self.policy_kd_temperature, self.policy_dkd_alpha, self.policy_dkd_beta, dim=1,
+            )
+        else:
+            loss = cross_entropy(pred_logits, target_probs, dim=1)
         return global_weight * weight * loss
 
     def loss_policy_opponent_samplewise(self, pred_logits, target_probs, weight, global_weight):
@@ -570,6 +642,7 @@ class Metrics:
             target_policy_player,
             target_weight_policy_player,
             global_weight,
+            distill=True,
         ).sum()
         loss_policy_opponent = self.loss_policy_opponent_samplewise(
             policy_logits[:, 1, :],

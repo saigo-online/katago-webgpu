@@ -63,21 +63,32 @@ def read_npz_training_data(
     if not npz_files:
         return
 
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(load_npz_file, npz_files[0])
+    # Parallel multi-file prefetch: keep `prefetch+1` npz files decoding concurrently so a fast
+    # GPU never stalls on the single-threaded npz decode (unpackbits + astype). Opt-in via env;
+    # defaults (prefetch=1, workers=1) reproduce the original one-file-ahead behavior exactly.
+    import collections
+    prefetch = max(0, int(os.environ.get("KATAGO_DATA_PREFETCH", "1")))
+    workers = max(1, int(os.environ.get("KATAGO_DATA_WORKERS", str(prefetch))))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        pending = collections.deque()
+        next_idx = 0
+        def _submit_next():
+            nonlocal next_idx
+            if next_idx < len(npz_files):
+                pending.append(executor.submit(load_npz_file, npz_files[next_idx]))
+                next_idx += 1
+        for _ in range(prefetch + 1):
+            _submit_next()
 
-        for next_file in (npz_files[1:] + [None]):
-            (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, scoreDistrN, valueTargetsNCHW, metadataInputNC, qValueTargetsNCMove) = future.result()
+        while pending:
+            (npz_file, binaryInputNCHW, globalInputNC, policyTargetsNCMove, globalTargetsNC, scoreDistrN, valueTargetsNCHW, metadataInputNC, qValueTargetsNCMove) = pending.popleft().result()
+            _submit_next()  # keep the prefetch pipeline full
 
             num_samples = binaryInputNCHW.shape[0]
             # Just discard stuff that doesn't divide evenly
             num_whole_steps = num_samples // (batch_size * world_size)
 
             logging.info(f"Beginning {npz_file} with {num_whole_steps * world_size} usable batches, my rank is {rank}")
-
-            if next_file is not None:
-                logging.info(f"Preloading {next_file} while processing this file")
-                future = executor.submit(load_npz_file, next_file)
 
             for n in range(num_whole_steps):
                 start = (n * world_size + rank) * batch_size
